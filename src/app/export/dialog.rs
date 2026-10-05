@@ -1,6 +1,8 @@
 //! Lightroom's Export dialog, and the question it asks when the file exists.
-use super::super::widgets::{confirm_modal, form_row, modal_frame, pretty_path, primary_button};
-use super::{Conflict, Editor};
+use super::super::widgets::{
+    confirm_modal, form_row, modal_frame, plural, pretty_path, primary_button,
+};
+use super::{Batch, Conflict, Editor};
 use crate::app::theme;
 use crate::export::{Destination, Existing, Format, Include, Replace, settings::unique};
 use eframe::egui::{self, Color32, Sense, Stroke, Vec2};
@@ -31,6 +33,7 @@ fn existing_label(e: Existing) -> &'static str {
 impl Editor {
     pub(in crate::app) fn export_windows(&mut self, ctx: &egui::Context) {
         self.conflict_window(ctx);
+        self.batch_conflict_window(ctx);
         if self.exports.dialog {
             self.export_dialog(ctx);
         }
@@ -118,7 +121,7 @@ impl Editor {
                 self.exports.dialog = false;
                 self.export(self.exports.draft.clone());
             }
-            Some(false) => self.exports.dialog = false,
+            Some(false) => self.cancel_export_dialog(),
             None => {}
         }
     }
@@ -400,6 +403,40 @@ impl Editor {
             }
             _ => self.status = "Export skipped".into(),
         }
+    }
+
+    /// The existing-files question for a whole batch, asked once rather than
+    /// once per photo.
+    fn batch_conflict_window(&mut self, ctx: &egui::Context) {
+        let Some(plan) = self.exports.batch.as_ref().and_then(|b| b.plan.clone()) else {
+            return;
+        };
+        let n = super::batch::clashing(&plan);
+        let Some(choice) = confirm_modal(
+            ctx,
+            "export-batch-conflict",
+            &format!(
+                "{} with these names already exist",
+                plural(n, "file", "files")
+            ),
+            "The answer applies to all of them.",
+            false,
+            &[
+                ("Skip", Existing::Skip),
+                ("Use Unique Names", Existing::Unique),
+                ("Overwrite", Existing::Overwrite),
+            ],
+            Existing::Skip,
+        ) else {
+            return;
+        };
+        let Batch {
+            settings,
+            unusable,
+            problem,
+            ..
+        } = self.exports.batch.take().expect("checked above");
+        self.start_batch(settings, plan, choice, unusable, problem);
     }
 }
 

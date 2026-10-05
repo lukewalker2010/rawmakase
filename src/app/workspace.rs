@@ -121,6 +121,9 @@ impl Editor {
         if let Some(ids) = self.library.as_mut().and_then(|l| l.take_read_request()) {
             self.read_metadata = Some(ids);
         }
+        if let Some(ids) = self.library.as_mut().and_then(|l| l.take_export_request()) {
+            self.open_export_of(&ids);
+        }
         if let Some(library) = &mut self.library
             && library.take_reread_finished()
         {

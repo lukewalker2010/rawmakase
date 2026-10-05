@@ -226,6 +226,16 @@ impl Library {
                 };
                 self.read_request = Some(ids);
             }
+            PhotoAction::Export => {
+                // One photo exports as it does from Develop; more than one
+                // exports the selection, as it does in Lightroom.
+                let ids = if whole_selection && self.selection.selected.contains(&photo.id) {
+                    self.selected_ids()
+                } else {
+                    vec![photo.id]
+                };
+                self.export_request = Some(ids);
+            }
         }
         None
     }

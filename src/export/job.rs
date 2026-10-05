@@ -22,7 +22,9 @@ use std::{
 /// The photo as it was when Export was chosen.
 #[derive(Clone)]
 pub struct Photo {
-    pub image: Arc<CameraImage>,
+    /// The image, when the photo is open in Develop. `None` for a photo exported
+    /// from the Library, which is decoded here.
+    pub image: Option<Arc<CameraImage>>,
     pub source: PathBuf,
     pub recipe: Recipe,
     /// Its catalog metadata: rating, label, keywords and descriptive fields.
@@ -73,7 +75,7 @@ pub fn run(
         Some(w) => Some(w.ready()?),
         None => None,
     };
-    let image = full_size(photo.image.clone(), &photo.source, cancel)?;
+    let image = full_size(photo.image.as_ref(), &photo.source, cancel)?;
     cancelled()?;
     progress(0.4);
     let options = settings.options();
@@ -117,20 +119,31 @@ pub fn run(
 }
 
 /// The full-resolution image: the open one, the decode cache's, or a new decode.
+///
+/// `image` is the Develop viewport's image, which is `None` for a photo exported
+/// from the Library. Opening the file reads its metadata without decoding any
+/// pixels, so a photo that is not open still costs one open, not two.
 fn full_size(
-    image: Arc<CameraImage>,
+    image: Option<&Arc<CameraImage>>,
     source: &Path,
     cancel: &AtomicBool,
 ) -> Result<Arc<CameraImage>> {
-    if !image.fast {
-        return Ok(image);
+    if let Some(image) = image
+        && !image.fast
+    {
+        return Ok(image.clone());
     }
+    let raw = Raw::open(source)?;
+    let metadata = match image {
+        Some(image) => &image.metadata,
+        None => &raw.metadata,
+    };
     let cached = DecodeCache::key(source)
         .ok()
-        .and_then(|key| DecodeCache::default().load(&key, &image.metadata));
+        .and_then(|key| DecodeCache::default().load(&key, metadata));
     Ok(Arc::new(match cached {
         Some(full) => full,
-        None => Raw::open(source)?.develop(false, cancel)?,
+        None => raw.develop(false, cancel)?,
     }))
 }
 

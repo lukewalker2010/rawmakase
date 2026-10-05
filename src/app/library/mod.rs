@@ -34,7 +34,6 @@ pub(in crate::app) use cell::copy_suffix;
 pub use descriptive::{DescriptiveCommand, DescriptiveEdit};
 pub use filmstrip::{DraggedPhoto, Module, Pick};
 pub use metadata::{Metadata, MetadataCommand};
-pub(in crate::app) use previews::EditSource;
 pub use quick::CollectionCommand;
 /// Lightroom's virtual copy commands, carried out by the editor so the open
 /// edit is saved first.
@@ -137,6 +136,8 @@ pub struct Library {
     message_detail: (String, String),
     /// Photos to Read Metadata from Files for, once confirmed.
     read_request: Option<Vec<i64>>,
+    /// Photos to export, taken by the Editor when the menu chooses Export.
+    export_request: Option<Vec<i64>>,
     /// Read Metadata from Files while it reads.
     reread: Option<descriptive::Reread>,
     /// Read Metadata from Files finished since the editor last asked.
@@ -212,6 +213,7 @@ impl Library {
             message: String::new(),
             message_detail: Default::default(),
             read_request: None,
+            export_request: None,
             reread: None,
             reread_finished: false,
         };
@@ -311,7 +313,7 @@ impl Library {
             self.availability.start(&self.photos, &self.ctx);
         }
     }
-    fn is_available(&self, path: &std::path::Path) -> bool {
+    pub(in crate::app) fn is_available(&self, path: &std::path::Path) -> bool {
         self.availability.is_available(path)
     }
     pub fn available_count(&self) -> usize {
@@ -476,6 +478,17 @@ impl Library {
     /// confirm.
     pub(in crate::app) fn take_read_request(&mut self) -> Option<Vec<i64>> {
         self.read_request.take()
+    }
+    /// The photos the thumbnail menu asked to export.
+    pub(in crate::app) fn take_export_request(&mut self) -> Option<Vec<i64>> {
+        self.export_request.take()
+    }
+    /// The edit a photo is rendered with when it is exported rather than opened:
+    /// its saved RAWmakase recipe, else its Lightroom settings, else the
+    /// defaults Develop would open it with. The recipe is resolved on the export
+    /// thread, which has the file open.
+    pub(in crate::app) fn edit_of(&self, id: i64) -> EditSource {
+        edit_source(&self.catalog, id).unwrap_or(EditSource::Defaults(self.defaults.clone()))
     }
     /// A virtual copy command chosen from a thumbnail menu since last asked.
     pub(super) fn take_copy_request(&mut self) -> Option<CopyAction> {
@@ -691,6 +704,10 @@ pub(in crate::app) fn develop_refusal(photo: &Photo, available: bool) -> Option<
         None
     }
 }
+/// The edit a photo is rendered with when it is exported rather than opened:
+/// its saved RAWmakase recipe, else its Lightroom settings, else the defaults
+/// Develop would open it with. The recipe itself is resolved on the export
+/// thread, which has the file open.
 /// The edit a photo's previews are rendered with: its RAWmakase recipe, or
 /// else its Lightroom settings.
 fn edit_source(catalog: &Catalog, id: i64) -> Option<previews::EditSource> {
@@ -721,6 +738,7 @@ mod metadata;
 mod metadata_fields;
 mod photo_info;
 mod previews;
+pub(in crate::app) use previews::EditSource;
 mod quick;
 mod rows;
 mod screen;

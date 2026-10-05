@@ -323,6 +323,9 @@ pub(in crate::app) enum PhotoAction {
     ReadMetadata,
     /// Develop's Set as Reference Photo.
     SetReference,
+    /// Export… — the open photo, or every selected photo when more than one is
+    /// selected.
+    Export,
 }
 /// Create Virtual Copy's shortcut, as Lightroom shows it.
 pub(in crate::app) const VIRTUAL_COPY_SHORTCUT: &str = if cfg!(target_os = "macos") {
@@ -330,6 +333,15 @@ pub(in crate::app) const VIRTUAL_COPY_SHORTCUT: &str = if cfg!(target_os = "maco
 } else {
     "Ctrl+'"
 };
+/// Export…'s shortcut, as the toolbar shows it.
+fn export_shortcut() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "\u{21e7}\u{2318}E"
+    } else {
+        "Ctrl+Shift+E"
+    }
+}
+
 /// The right-click menu shared by grid cells and the Develop filmstrip.
 /// Open in Develop is greyed out for a photo Develop cannot open, e.g. one
 /// not `available`, with the reason in place of its shortcut. In Develop's
@@ -398,6 +410,10 @@ pub(in crate::app) fn photo_menu(
         menu_separator(ui);
         if menu_item(ui, "Read Metadata from Files…", "", true, false) {
             action = Some(PhotoAction::ReadMetadata);
+            ui.close();
+        }
+        if menu_item(ui, "Export…", export_shortcut(), true, false) {
+            action = Some(PhotoAction::Export);
             ui.close();
         }
         menu_separator(ui);

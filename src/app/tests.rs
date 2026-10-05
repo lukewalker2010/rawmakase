@@ -4103,3 +4103,57 @@ fn b_and_w_opens_and_closes_with_the_color_mixer_in_solo_mode() {
     draw("B&W", click_at(mixer, egui::PointerButton::Primary), 4.);
     assert_eq!(collapsed(), ["Tone Curve".to_string()].into());
 }
+
+#[test]
+fn a_cancelled_batch_does_not_hijack_the_next_export() -> anyhow::Result<()> {
+    let (_d, mut editor, ids) = editor_with_catalog(&["a.ARW", "b.ARW", "c.ARW"])?;
+    assert_eq!(ids.len(), 3);
+    editor.library_mode = true;
+
+    // Choosing Export for a selection arms a batch, as the menu does.
+    editor.open_export_of(&ids);
+    assert!(editor.export_armed(), "a multi-photo export is a batch");
+    assert!(
+        editor.export_dialog_open(),
+        "the Export dialog opens over it"
+    );
+
+    assert!(
+        editor.export_armed(),
+        "the selection is armed until the dialog closes"
+    );
+
+    // Closing the dialog without exporting must disarm it.
+    editor.cancel_export_dialog();
+    assert!(
+        !editor.export_armed(),
+        "a cancelled dialog leaves nothing armed"
+    );
+
+    // And Export from Develop is a single export regardless.
+    editor.open_export_dialog();
+    assert!(
+        !editor.export_armed(),
+        "Export from Develop is never the leftover selection"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_selection_carries_the_photos_it_can_export_and_leaves_out_the_rest() -> anyhow::Result<()> {
+    let (_d, mut editor, ids) = editor_with_catalog(&["a.ARW", "b.ARW", "c.jpg"])?;
+    editor.library_mode = true;
+    assert_eq!(ids.len(), 3, "two RAW files and a JPEG are all indexed");
+    // A JPEG is browsable in the Library but Develop cannot edit it, so it is
+    // not exportable either: it must be left out of the batch, not queued.
+    let (files, unusable) = editor.export_selection(&ids);
+    assert_eq!(files.len(), 2, "the batch carries the RAW files: {files:?}");
+    assert!(
+        files
+            .iter()
+            .all(|p| p.extension().is_some_and(|e| e == "ARW")),
+        "no non-RAW is queued: {files:?}"
+    );
+    assert_eq!(unusable, 1, "the JPEG is counted as left out");
+    Ok(())
+}
