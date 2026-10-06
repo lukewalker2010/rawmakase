@@ -21,10 +21,58 @@ pub struct Lut3d {
     size: usize,
     domain_min: [f32; 3],
     domain_max: [f32; 3],
-    /// `LUT_3D_OUTPUT_RANGE`: where the table's own answers sit, brought back to 0–1.
-    output_range: [f32; 2],
+    /// The 1D table the input goes through first, when the file carries one.
+    shaper: Option<Shaper>,
     /// `size * size * size` output colours, red index fastest.
     data: Vec<[f32; 3]>,
+}
+
+/// A 1D table a file puts in front of its 3D one: a per-channel curve the input goes
+/// through before the lookup. Resolving calls these "shaper" LUTs, and they are why a
+/// file may carry both sizes. Reading the 3D table and dropping this one renders
+/// plausible, wrong colours rather than failing.
+#[derive(Clone, Debug, PartialEq)]
+struct Shaper {
+    /// Entries per channel.
+    size: usize,
+    /// `LUT_1D_INPUT_RANGE`, which the input is read over. 0-1 by default.
+    input_range: [f32; 2],
+    /// One triple per entry; each of its three channels is that channel's curve.
+    table: Vec<[f32; 3]>,
+}
+
+impl Shaper {
+    /// The colour the curves give for `rgb`, each channel interpolated on its own.
+    fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let [low, high] = self.input_range;
+        std::array::from_fn(|c| {
+            let unit = ((rgb[c] - low) / (high - low)).clamp(0.0, 1.0);
+            let at = unit * (self.size - 1) as f32;
+            // Clamped so the last entry, whose position is exactly one, still has a
+            // pair of entries to be interpolated between.
+            let index = (at as usize).min(self.size - 2);
+            let within = at - index as f32;
+            self.table[index][c] + within * (self.table[index + 1][c] - self.table[index][c])
+        })
+    }
+}
+
+/// The largest side a cube may declare.
+const MAX_SIDE: usize = 256;
+/// The most colours a cube of that size needs, and so the most that may be collected
+/// before anything is checked: bounded here so a file claiming a huge size is refused
+/// rather than collected in full.
+const MAX_ENTRIES: usize = MAX_SIDE * MAX_SIDE * MAX_SIDE;
+
+/// A number a cube may hold. `f32::from_str` takes "inf" and "NaN", and
+/// `DOMAIN_MAX inf` would put every colour at one end of the table, so the whole image
+/// would come out one flat value rather than failing.
+fn finite(value: f32, line: usize) -> Result<f32> {
+    ensure!(
+        value.is_finite(),
+        "line {line}: {value} is not a number a cube can hold"
+    );
+    Ok(value)
 }
 
 /// The `TITLE` a cube names itself with, kept for a browser to show.
@@ -45,7 +93,7 @@ impl Lut3d {
         let mut domain_min: Option<[f32; 3]> = None;
         let mut domain_max: Option<[f32; 3]> = None;
         let mut input_range: Option<[f32; 2]> = None;
-        let mut output_range: Option<[f32; 2]> = None;
+        let mut input_range_1d: Option<[f32; 2]> = None;
         let mut data: Vec<[f32; 3]> = Vec::new();
         let mut size_1d: Option<usize> = None;
         for (number, line) in text.lines().enumerate() {
@@ -59,12 +107,27 @@ impl Lut3d {
                 "TITLE" => {}
                 "LUT_3D_SIZE" => size = Some(one_usize(rest, at)?),
                 "LUT_1D_SIZE" => size_1d = Some(one_usize(rest, at)?),
-                "DOMAIN_MIN" => domain_min = Some(domain_f32(rest, at)?),
-                "DOMAIN_MAX" => domain_max = Some(domain_f32(rest, at)?),
+                "LUT_1D_INPUT_RANGE" => input_range_1d = Some(two_f32(rest, at)?),
+                "DOMAIN_MIN" => domain_min = Some(three_f32(rest, at)?),
+                "DOMAIN_MAX" => domain_max = Some(three_f32(rest, at)?),
                 "LUT_3D_INPUT_RANGE" => input_range = Some(two_f32(rest, at)?),
-                "LUT_3D_OUTPUT_RANGE" => output_range = Some(two_f32(rest, at)?),
+                // Not honoured: no tool has been named that writes it, and guessing at
+                // a range would be worse than declining.
+                "LUT_3D_OUTPUT_RANGE" => bail!(
+                    "line {at}: LUT_3D_OUTPUT_RANGE is not supported; the table's \
+         answers are read as they are"
+                ),
                 // Anything else is a data line: three floats, in the order written.
-                _ => data.push(three_f32(rest, at)?),
+                _ => {
+                    // Bounded before anything else looks at it, so a file claiming a
+                    // huge size is refused rather than collected in full.
+                    ensure!(
+                        data.len() < MAX_ENTRIES,
+                        "the cube has more than {MAX_ENTRIES} colours, which is more \
+         than a size of {MAX_SIDE} can need"
+                    );
+                    data.push(three_f32(rest, at)?);
+                }
             }
         }
 
@@ -101,28 +164,45 @@ impl Lut3d {
             size >= 2,
             "LUT_3D_SIZE of {size} is too small to interpolate between"
         );
-        ensure!(size <= 256, "LUT_3D_SIZE of {size} is larger than 256");
+        ensure!(
+            size <= MAX_SIDE,
+            "LUT_3D_SIZE of {size} is larger than {MAX_SIDE}"
+        );
         let expected = size
             .checked_mul(size)
             .and_then(|n| n.checked_mul(size))
             .ok_or_else(|| anyhow::anyhow!("LUT_3D_SIZE of {size} overflows"))?;
-        // A file may carry a 1D table as well as a 3D one, the 3D being the usable
-        // of the two. Where the data is longer than the 3D needs by exactly a 1D
-        // table's worth, that is what is going on, and the 3D data is the tail.
-        match size_1d {
-            Some(one) if data.len() > expected => {
-                // A 1D table of N entries is N lines of three numbers each, not 3N.
-                let extra = data.len() - expected;
+        // A file may carry a 1D table in front of the 3D one, its shaper. Its data
+        // comes first, one line per entry, and is kept rather than dropped: dropping it
+        // would render wrong colours that look plausible.
+        let shaper = match size_1d {
+            None => None,
+            Some(one) => {
                 ensure!(
-                    extra == one,
-                    "the cube has {extra} colours before its {expected} 3D ones, \
-         which is neither nothing nor the {one} of a 1D table"
+                    one >= 2,
+                    "LUT_1D_SIZE of {one} is too small to interpolate between"
                 );
-                data.drain(..extra);
+                ensure!(
+                    data.len() == one + expected,
+                    "a cube of size {size} with a {one}-entry shaper needs {} colours, \
+         but this one has {}",
+                    one + expected,
+                    data.len()
+                );
+                let table = data.drain(..one).collect();
+                let range = input_range_1d.unwrap_or([0.0, 1.0]);
+                ensure!(
+                    range[1] > range[0],
+                    "LUT_1D_INPUT_RANGE of {:?} is not a range",
+                    range
+                );
+                Some(Shaper {
+                    size: one,
+                    input_range: range,
+                    table,
+                })
             }
-            // A 3D table on its own, or the counts already agreeing.
-            _ => {}
-        }
+        };
         ensure!(
             data.len() == expected,
             "a cube of size {size} needs {expected} colours, but this one has {}",
@@ -134,17 +214,11 @@ impl Lut3d {
                 "DOMAIN_MAX {domain_max:?} is not above DOMAIN_MIN {domain_min:?}"
             );
         }
-        let output_range = output_range.unwrap_or([0.0, 1.0]);
-        ensure!(
-            output_range[1] > output_range[0],
-            "LUT_3D_OUTPUT_RANGE of {:?} is not a range",
-            output_range
-        );
         Ok(Self {
             size,
             domain_min,
             domain_max,
-            output_range,
+            shaper,
             data,
         })
     }
@@ -159,11 +233,6 @@ impl Lut3d {
         (self.domain_min, self.domain_max)
     }
 
-    /// Where the table's own answers sat before being brought back to 0–1.
-    pub fn output_range(&self) -> [f32; 2] {
-        self.output_range
-    }
-
     /// The colour at a grid node, red index fastest.
     pub fn node(&self, r: usize, g: usize, b: usize) -> [f32; 3] {
         self.data[r + g * self.size + b * self.size * self.size]
@@ -172,6 +241,7 @@ impl Lut3d {
     /// The looked-up colour, without a strength: `rgb` mapped through the domain,
     /// clamped into it, and interpolated tetrahedrally.
     pub fn lookup(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let rgb = self.shaper.as_ref().map_or(rgb, |s| s.apply(rgb));
         let n = self.size;
         let last = n - 1;
         let edge = last as f32;
@@ -184,14 +254,10 @@ impl Lut3d {
         // fraction is 1, still has a cell to be interpolated in.
         let base: [usize; 3] = std::array::from_fn(|c| (fraction[c] as usize).min(last - 1));
         let within: [f32; 3] = std::array::from_fn(|c| fraction[c] - base[c] as f32);
-        let looked = tetrahedral(
+        tetrahedral(
             |r, g, b| self.node(base[0] + r, base[1] + g, base[2] + b),
             within,
-        );
-        // The table's answers sit in its own output range; bring them back to 0–1 so a
-        // strength blend against the input means what it says.
-        let [low, high] = self.output_range;
-        std::array::from_fn(|c| (looked[c] - low) / (high - low))
+        )
     }
 
     /// The colour `rgb` comes out as with `strength`, where 0 leaves it alone and 1 is
@@ -237,10 +303,11 @@ fn split_keyword(line: &str) -> (&str, &str) {
 }
 
 /// The keywords `split_keyword` recognises.
-const KEYWORDS: [&str; 7] = [
+const KEYWORDS: [&str; 8] = [
     "TITLE",
     "LUT_3D_SIZE",
     "LUT_1D_SIZE",
+    "LUT_1D_INPUT_RANGE",
     "DOMAIN_MIN",
     "DOMAIN_MAX",
     "LUT_3D_INPUT_RANGE",
@@ -274,32 +341,18 @@ fn three_f32(rest: &str, line: usize) -> Result<[f32; 3]> {
     for slot in &mut parsed {
         let value = values.next();
         ensure!(value.is_some(), "line {line}: expected three numbers");
-        *slot = value
-            .unwrap_or_default()
-            .parse()
-            .map_err(|e| anyhow::anyhow!("line {line}: {value:?} is not a number: {e}"))?;
+        *slot = finite(
+            value
+                .unwrap_or_default()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("line {line}: {value:?} is not a number: {e}"))?,
+            line,
+        )?;
     }
     ensure!(
         values.next().is_none(),
         "line {line}: expected three numbers, got more"
     );
-    Ok(parsed)
-}
-
-/// A domain as three numbers, or as one written to stand for all three, which some
-/// tools do.
-fn domain_f32(rest: &str, line: usize) -> Result<[f32; 3]> {
-    let mut values = rest.split_whitespace();
-    let first = values.next();
-    ensure!(first.is_some(), "line {line}: expected a number");
-    let value: f32 = first
-        .unwrap_or_default()
-        .parse()
-        .map_err(|e| anyhow::anyhow!("line {line}: {first:?} is not a number: {e}"))?;
-    let mut parsed = [value; 3];
-    if values.next().is_some() {
-        parsed = three_f32(rest, line)?;
-    }
     Ok(parsed)
 }
 
@@ -309,10 +362,13 @@ fn two_f32(rest: &str, line: usize) -> Result<[f32; 2]> {
     for slot in &mut parsed {
         let value = values.next();
         ensure!(value.is_some(), "line {line}: expected two numbers");
-        *slot = value
-            .unwrap_or_default()
-            .parse()
-            .map_err(|e| anyhow::anyhow!("line {line}: {value:?} is not a number: {e}"))?;
+        *slot = finite(
+            value
+                .unwrap_or_default()
+                .parse()
+                .map_err(|e| anyhow::anyhow!("line {line}: {value:?} is not a number: {e}"))?,
+            line,
+        )?;
     }
     ensure!(
         values.next().is_none(),
@@ -593,36 +649,9 @@ mod tests {
     /// back to 0–1 so a strength blend means what it says. A table written over 0–1023
     /// answers in 0–1 like any other.
     #[test]
-    fn an_output_range_is_brought_back_to_zero_and_one() {
-        let size = 3;
-        let mut text = format!("LUT_3D_SIZE {size}\nLUT_3D_OUTPUT_RANGE 0 1023\n");
-        for _b in 0..size {
-            for _g in 0..size {
-                for r in 0..size {
-                    let n = r as f32 / (size - 1) as f32;
-                    text += &format!("{} 0 0\n", n * 1023.);
-                }
-            }
-        }
-        let lut = Lut3d::parse(&text).unwrap();
-        assert_eq!(lut.output_range(), [0.0, 1023.0]);
-        // The top of the table is 1023 in its own units and 1 once rescaled.
-        assert_eq!(lut.lookup([1.0, 0.0, 0.0]), [1.0, 0.0, 0.0]);
-        assert_eq!(lut.lookup([0.0, 0.0, 0.0]), [0.0, 0.0, 0.0]);
-        let middle = lut.lookup([0.5, 0.0, 0.0])[0];
-        assert!((middle - 0.5).abs() < 1e-4, "{middle}");
-    }
-
-    /// An output range the wrong way round would divide by a negative span and quietly
-    /// turn the table inside out.
-    #[test]
-    fn an_output_range_that_is_not_a_range_is_refused() {
-        let size = 2;
-        let text = format!(
-            "LUT_3D_SIZE {size}\nLUT_3D_OUTPUT_RANGE 1 0\n\
-             0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n"
-        );
-        let error = Lut3d::parse(&text).unwrap_err().to_string();
+    fn an_output_range_is_refused_by_name() {
+        let error = Lut3d::parse("LUT_3D_SIZE 2\nLUT_3D_OUTPUT_RANGE 0 1\n0 0 0\n").unwrap_err();
+        let error = error.to_string();
         assert!(error.contains("LUT_3D_OUTPUT_RANGE"), "{error}");
     }
 
@@ -684,43 +713,98 @@ mod real_files {
 
     /// Some tools write the domain as one number, meaning all three channels.
     #[test]
-    fn a_domain_may_be_one_number_for_all_three() {
-        let mut text = String::from("LUT_3D_SIZE 2\nDOMAIN_MIN 0\nDOMAIN_MAX 1\n");
-        for _b in 0..2 {
-            for _g in 0..2 {
-                for r in 0..2 {
-                    text += &format!("{} 0 0\n", r as f32);
+    fn a_domain_of_one_number_is_refused() {
+        let error = Lut3d::parse("LUT_3D_SIZE 2\nDOMAIN_MIN 0\nDOMAIN_MAX 1\n").unwrap_err();
+        assert!(error.to_string().contains("three numbers"), "{error}");
+    }
+
+    #[test]
+    fn a_1d_table_in_front_of_the_3d_one_is_applied_as_a_shaper() {
+        let size = 3;
+        let mut text = format!("LUT_1D_SIZE 2\nLUT_3D_SIZE {size}\n");
+        // A shaper that sends every input to zero, so where the colour ends up cannot
+        // depend on what the 3D table would have said.
+        text += "0 0 0\n0 0 0\n";
+        for _b in 0..size {
+            for _g in 0..size {
+                for r in 0..size {
+                    let n = r as f32 / (size - 1) as f32;
+                    text += &format!("{n} 0 0\n");
                 }
             }
         }
         let lut = Lut3d::parse(&text).unwrap();
-        assert_eq!(lut.domain(), ([0.0; 3], [1.0; 3]));
-        assert_eq!(lut.lookup([1.0, 0.0, 0.0]), [1.0, 0.0, 0.0]);
+        // The shaper was applied, so even white lands on the 3D table's first node.
+        // Dropping it would have sent white to the last, which is the plausible wrong
+        // colour rather than an obvious failure.
+        assert_eq!(lut.lookup([1.0, 1.0, 1.0]), [0.0, 0.0, 0.0]);
+        assert_eq!(lut.lookup([0.0, 0.0, 0.0]), [0.0, 0.0, 0.0]);
     }
 
-    /// A file may carry a 1D table as well as a 3D one. The 3D is the usable of the
-    /// two, and the counts say whether a 1D table is sitting in front of it.
     #[test]
-    fn a_3d_table_is_read_out_of_a_file_that_also_has_a_1d_one() {
-        let text = format!("LUT_1D_SIZE 2\n0 0 0\n1 1 1\n{}", cube(2));
+    fn an_identity_shaper_leaves_the_3d_table_in_charge() {
+        let size = 3;
+        let mut text = format!("LUT_1D_SIZE 2\nLUT_3D_SIZE {size}\n");
+        text += "0 0 0\n1 1 1\n";
+        for _b in 0..size {
+            for _g in 0..size {
+                for r in 0..size {
+                    let n = r as f32 / (size - 1) as f32;
+                    text += &format!("{n} 0 0\n");
+                }
+            }
+        }
         let lut = Lut3d::parse(&text).unwrap();
-        assert_eq!(lut.size(), 2);
-        // The 3D data was the tail, so this is the 3D table's answer, not the 1D one's.
         assert_eq!(lut.lookup([1.0, 0.0, 0.0]), [1.0, 0.0, 0.0]);
-        assert_eq!(lut.node(0, 0, 0), [0.0, 0.0, 0.0]);
+        assert_eq!(lut.lookup([0.0, 0.0, 0.0]), [0.0, 0.0, 0.0]);
     }
 
-    /// Data that is longer than the 3D table needs by some amount other than a 1D
-    /// table's is a file this has not understood, and says so rather than guessing
-    /// which lines were meant.
     #[test]
-    fn unaccounted_extra_data_is_refused() {
-        let text = format!("LUT_1D_SIZE 5\n0 0 0\n1 1 1\n{}", cube(2));
-        let error = Lut3d::parse(&text).unwrap_err().to_string();
-        assert!(error.contains("neither nothing nor the 5"), "{error}");
+    fn a_shapers_own_input_range_is_honoured() {
+        let size = 3;
+        let mut text = format!("LUT_1D_SIZE 2\nLUT_1D_INPUT_RANGE 0 2\nLUT_3D_SIZE {size}\n");
+        text += "0 0 0\n1 1 1\n";
+        for _b in 0..size {
+            for _g in 0..size {
+                for r in 0..size {
+                    let n = r as f32 / (size - 1) as f32;
+                    text += &format!("{n} 0 0\n");
+                }
+            }
+        }
+        let lut = Lut3d::parse(&text).unwrap();
+        // 1.0 is halfway up a 0-2 range, so the shaper puts it at the middle.
+        assert_eq!(lut.lookup([1.0, 1.0, 1.0]), [0.5, 0.0, 0.0]);
     }
 
-    /// Only a 1D table is still refused: there is no grid to interpolate in.
+    #[test]
+    fn a_shaper_of_the_wrong_length_is_refused() {
+        let text = "LUT_1D_SIZE 5\nLUT_3D_SIZE 2\n0 0 0\n1 1 1\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+        let error = Lut3d::parse(text).unwrap_err().to_string();
+        assert!(error.contains("shaper"), "{error}");
+    }
+
+    #[test]
+    fn values_that_are_not_finite_are_refused() {
+        for bad in ["inf", "-inf", "NaN", "infinity"] {
+            let data = format!(
+                "LUT_3D_SIZE 2\n0 0 0\n{bad} 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n"
+            );
+            let error = Lut3d::parse(&data).unwrap_err().to_string();
+            assert!(error.contains("not a number"), "data {bad}: {error}");
+            let domain = format!("LUT_3D_SIZE 2\nDOMAIN_MAX {bad} {bad} {bad}\n");
+            let error = Lut3d::parse(&domain).unwrap_err().to_string();
+            assert!(error.contains("not a number"), "domain {bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn data_that_does_not_add_up_is_refused() {
+        let text = "LUT_1D_SIZE 2\nLUT_3D_SIZE 2\n0 0 0\n1 1 1\n1 1 1\n";
+        let error = Lut3d::parse(text).unwrap_err().to_string();
+        assert!(error.contains("needs"), "{error}");
+    }
+
     #[test]
     fn a_1d_cube_alone_is_refused_by_name() {
         let error = Lut3d::parse("LUT_1D_SIZE 2\n0 0 0\n1 1 1\n").unwrap_err();
