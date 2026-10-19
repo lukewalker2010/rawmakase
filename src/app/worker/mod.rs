@@ -65,6 +65,7 @@ pub enum Event {
     /// A folder change waiting for the user's answer.
     FolderQuestion(Box<crate::app::folder_locations::FolderQuestion>),
     Monitor(PathBuf),
+    CubeLut(PathBuf),
     /// Files and folders chosen to import profiles or presets from.
     Import(crate::app::bulk_import::ImportKind, Vec<PathBuf>),
     Imported(Box<crate::app::bulk_import::Summary>),

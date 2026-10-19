@@ -452,6 +452,8 @@ impl Editor {
         let mut import_lens = false;
         let mut import_folder = None;
         let mut import_adobe = false;
+        let mut load_lut = false;
+        let mut clear_lut = false;
         // Cached per camera: this scans Adobe's profile folders.
         let adobe_key = self
             .document
@@ -631,6 +633,30 @@ impl Editor {
             {
                 r.profile_changed(m);
                 profile_changed_from = Some(old_profile);
+            }
+            // A user-supplied 3D LUT (.cube), applied after the master curve.
+            ui.add_space(8.);
+            ui.horizontal(|ui| {
+                ui.add_space(88.);
+                if ui.button("Load LUT…").clicked() {
+                    load_lut = true;
+                }
+                if r.lut_3d.is_some() && ui.button("Clear").clicked() {
+                    clear_lut = true;
+                }
+            });
+            if r.lut_3d.is_some() {
+                ui.push_id("lut-strength", |ui| {
+                    slider_with(
+                        ui,
+                        "LUT strength",
+                        &mut r.lut_3d_strength,
+                        0. ..=1.,
+                        1.,
+                        Some((100., 0)),
+                        None,
+                    );
+                });
             }
             // White balance is its own group below the profile, as in Lightroom.
             ui.add_space(12.);
@@ -1660,6 +1686,16 @@ impl Editor {
         }
         if import_profiles {
             self.dialog(FileDialog::CameraProfile, &ui.ctx().clone());
+        }
+        if load_lut {
+            self.dialog(FileDialog::CubeLut, &ui.ctx().clone());
+        }
+        if clear_lut {
+            let old_recipe = self.document.recipe.clone();
+            self.document.recipe.lut_3d = None;
+            self.document.recipe.lut_3d_strength = 1.0;
+            self.history(old_recipe);
+            self.schedule();
         }
         if import_lens {
             self.dialog(FileDialog::LensProfile, &ui.ctx().clone());

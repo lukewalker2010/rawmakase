@@ -33,6 +33,28 @@ impl Editor {
                     let _ = self.save_session();
                     self.schedule();
                 }
+                Event::CubeLut(p) => {
+                    self.activity.finish_dialog();
+                    match std::fs::read_to_string(&p) {
+                        Ok(text) => match crate::develop::lut3d::Lut3d::parse(&text) {
+                            Ok(lut) => {
+                                let title = crate::develop::lut3d::title_of(&text);
+                                let old_recipe = self.document.recipe.clone();
+                                self.document.recipe.lut_3d = Some(lut);
+                                self.document.recipe.lut_3d_strength = 1.0;
+                                self.history(old_recipe);
+                                self.status = format!(
+                                    "LUT loaded: {}",
+                                    title.unwrap_or_else(|| p.file_name().unwrap_or_default().to_string_lossy().to_string())
+                                );
+                                self.ensure_upright();
+                                self.schedule();
+                            }
+                            Err(e) => self.status = format!("LUT not loaded: {e}"),
+                        },
+                        Err(e) => self.status = format!("LUT not loaded: {e}"),
+                    }
+                }
                 Event::PresetLoad(p) => {
                     self.activity.finish_dialog();
                     match crate::presets::load_preset(&p) {

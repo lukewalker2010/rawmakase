@@ -5,6 +5,7 @@ use eframe::egui;
 #[derive(Clone, Copy)]
 pub(super) enum FileDialog {
     MonitorProfile,
+    CubeLut,
     LoadPreset,
     SavePreset,
     CameraProfile,
@@ -66,6 +67,9 @@ impl Editor {
                     FileDialog::MonitorProfile => rfd::FileDialog::new()
                         .add_filter("ICC profile", &["icc", "icm"])
                         .pick_file(),
+                    FileDialog::CubeLut => rfd::FileDialog::new()
+                        .add_filter("Cube LUT", &["cube"])
+                        .pick_file(),
                     FileDialog::CameraProfile
                     | FileDialog::LensProfile
                     | FileDialog::ImportXmp
@@ -80,6 +84,7 @@ impl Editor {
                 let event = selected
                     .map(|p| match kind {
                         FileDialog::MonitorProfile => Event::Monitor(p),
+                        FileDialog::CubeLut => Event::CubeLut(p),
                         FileDialog::CameraProfile
                         | FileDialog::LensProfile
                         | FileDialog::ImportXmp
