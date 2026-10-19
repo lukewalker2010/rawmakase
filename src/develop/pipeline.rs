@@ -428,6 +428,15 @@ fn finish_color(mut lab: [f32; 3], r: &Recipe, lut: &CurveSet) -> [f32; 3] {
         lab_to_srgb(lab)
     };
     let rgb = r.gamut_model.into_srgb(rgb, lab[0]);
+    // A user-supplied 3D LUT (.cube) is applied in gamma-encoded sRGB, after the
+    // master curve and before the final per-channel clip, as #202 specifies.
+    let rgb = if let Some(cube) = &lut.lut_3d {
+        let encoded = [srgb_encode(rgb[0]), srgb_encode(rgb[1]), srgb_encode(rgb[2])];
+        let looked = cube.apply(encoded, r.lut_3d_strength);
+        [srgb_decode(looked[0]), srgb_decode(looked[1]), srgb_decode(looked[2])]
+    } else {
+        rgb
+    };
     std::array::from_fn(|c| {
         let encoded = srgb_encode(rgb[c]);
         if r.wide_gamut_curves || r.reference_curves {
@@ -517,6 +526,9 @@ struct CurveSet {
     color_adjustments: bool,
     /// The profile look's RGB table, at the recipe's Profile Amount.
     rgb_table: Option<crate::camera_profiles::RgbLook>,
+    /// A user-supplied 3D LUT (.cube), applied in gamma-encoded sRGB after
+    /// the master curve and before the final per-channel clip.
+    lut_3d: Option<crate::develop::lut3d::Lut3d>,
     calibration: crate::develop::calibration::Calibration,
     /// What Contrast and Whites follow of the photo, for the global sliders and the
     /// masks' (engine 4).
@@ -622,6 +634,7 @@ impl CurveSet {
                 .as_ref()
                 .filter(|_| r.engine >= 3)
                 .and_then(|p| p.enhanced.as_ref()?.rgb().cloned()),
+            lut_3d: r.lut_3d.clone(),
             color_adjustments: r.vibrance != 0.
                 || r.saturation != 0.
                 || r.hsl != [[0.; 3]; 8]

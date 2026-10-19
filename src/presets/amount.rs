@@ -445,6 +445,8 @@ fn blend(a: &Recipe, b: &Recipe, t: f32, m: &Metadata) -> Recipe {
         masks,
         panels,
         unknown,
+        lut_3d: _,
+        lut_3d_strength: _,
     } = b;
     // Settings that aren't numbers are the preset's: this runs for Amounts above 0
     // only. A look with a Profile Amount the photo didn't have fades in from 0.

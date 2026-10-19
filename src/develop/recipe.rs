@@ -74,6 +74,13 @@ pub struct Recipe {
     pub preset_name: String,
     pub preset_settings: std::collections::BTreeMap<String, String>,
     pub profile: Option<std::sync::Arc<crate::camera_profiles::CameraProfile>>,
+    /// A user-supplied 3D LUT (.cube), applied in gamma-encoded sRGB after the
+    /// master curve and before the final per-channel clip. None means no LUT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lut_3d: Option<crate::develop::lut3d::Lut3d>,
+    /// Strength of the LUT, 0 = off, 1 = full. Omitted at 1.
+    #[serde(default = "one", skip_serializing_if = "is_one")]
+    pub lut_3d_strength: f32,
     /// Lightroom's Profile Amount (`crs:Look` `Amount`, 0–2, 1 = 100%): the strength of
     /// a look that supports it. Other profiles render at 100% whatever it is. Omitted
     /// at 1, so releases that predate it read the recipe.
@@ -311,6 +318,8 @@ impl Default for Recipe {
             preset_name: String::new(),
             preset_settings: Default::default(),
             profile: None,
+            lut_3d: None,
+            lut_3d_strength: 1.,
             sharpening_model: Default::default(),
             sharpening_radius: 0.8,
             sharpening_detail: 0.25,

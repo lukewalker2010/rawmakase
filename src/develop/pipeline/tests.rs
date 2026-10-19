@@ -1621,3 +1621,29 @@ fn texture_operator_is_kept_by_old_edits() {
     none.adopt_measured_texture(0.);
     assert_eq!(none.texture_model, TextureModel::Measured);
 }
+
+#[test]
+fn a_cube_lut_is_applied_through_the_pipeline() {
+    use crate::develop::lut3d::Lut3d;
+    let m = Metadata {
+        width: 4,
+        height: 4,
+        wb: [1.; 3],
+        daylight_wb: [1.; 3],
+        matrix: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+        ..Default::default()
+    };
+    let mut r = Recipe::default();
+    // A cube that inverts red.
+    let text = "LUT_3D_SIZE 2\n1 0 0\n0 0 0\n1 1 0\n0 1 0\n1 0 1\n0 0 1\n1 1 1\n0 1 1\n";
+    r.lut_3d = Some(Lut3d::parse(text).unwrap());
+    r.lut_3d_strength = 1.0;
+    let lut = CurveSet::new(&r);
+    let out = process_pixel([0.5, 0.5, 0.5], &m, &r, &lut, m.matrix, [0., 0.], None);
+    // The cube maps mid-red to 0.5 (identity-ish at 0.5), so the output should
+    // differ from the no-LUT case.
+    let r0 = Recipe::default();
+    let lut0 = CurveSet::new(&r0);
+    let out0 = process_pixel([0.5, 0.5, 0.5], &m, &r0, &lut0, m.matrix, [0., 0.], None);
+    assert_ne!(out, out0, "LUT should change the output");
+}

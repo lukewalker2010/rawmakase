@@ -205,6 +205,8 @@ fn stage_recipes(r: &Recipe) -> StageRecipes {
         preset_name: _,
         preset_settings: _,
         unknown: _,
+        lut_3d: _,
+        lut_3d_strength: _,
     } = r;
     let Effects {
         luma_detail,

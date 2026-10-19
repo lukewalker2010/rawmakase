@@ -16,7 +16,7 @@ use anyhow::{Result, bail, ensure};
 
 /// A `.cube` 3D lookup table: a regular grid of `size` divisions per side over
 /// `domain_min` to `domain_max`, tetrahedrally interpolated.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Lut3d {
     size: usize,
     domain_min: [f32; 3],
@@ -31,7 +31,7 @@ pub struct Lut3d {
 /// through before the lookup. Resolving calls these "shaper" LUTs, and they are why a
 /// file may carry both sizes. Reading the 3D table and dropping this one renders
 /// plausible, wrong colours rather than failing.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct Shaper {
     /// Entries per channel.
     size: usize,
