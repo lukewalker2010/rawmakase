@@ -6,7 +6,7 @@ use super::previews::EditSource;
 use super::screen::Shown;
 use crate::app::photo_metadata::{flag_icon, label_color};
 use crate::app::theme;
-use crate::catalog::Photo;
+use crate::catalog::{Photo, PhotoId};
 use eframe::egui::{self, Color32, Rect, Vec2};
 use std::collections::HashMap;
 
@@ -22,7 +22,7 @@ const STAMP_AGE: f64 = 0.5;
 
 /// Edit stamps by photo, with when each was read.
 #[derive(Debug, Default)]
-pub(super) struct Stamps(HashMap<i64, (u64, f64)>);
+pub(super) struct Stamps(HashMap<PhotoId, (u64, f64)>);
 
 impl Library {
     /// Draws `photo` fitted to `rect`, outlined when `active`, with its
@@ -36,6 +36,7 @@ impl Library {
         role: Option<&str>,
         active: bool,
     ) -> Option<Rect> {
+        let palette = theme::palette(ui.ctx());
         // A tile too small for a caption shows the photo alone.
         let captioned = rect.height() > CAPTION * 3.;
         let image_area = if captioned {
@@ -54,7 +55,7 @@ impl Library {
                 ui.painter().rect_stroke(
                     at.expand(3.),
                     1.,
-                    egui::Stroke::new(1.5, theme::gray(225)),
+                    egui::Stroke::new(1.5, palette.gray(225)),
                     egui::StrokeKind::Outside,
                 );
             }
@@ -66,7 +67,7 @@ impl Library {
                 egui::Align2::CENTER_BOTTOM,
                 note,
                 egui::FontId::proportional(11.),
-                theme::gray(170),
+                palette.gray(170),
             );
         }
         if captioned {
@@ -94,13 +95,14 @@ impl Library {
             return (stand_in, Some(note.into()));
         }
         let edge = (area.width().max(area.height()) * ctx.pixels_per_point()) as u32;
-        // A JPEG, TIFF or PNG has no edit to render: the grid's preview of
-        // it will do. A RAW is rendered, so its current edit always shows.
-        if edge <= GRID_EDGE && !crate::storage::is_raw(&photo.path) && stand_in.is_some() {
+        // A JPEG, TIFF or PNG without an edit looks as its file does: the grid's
+        // preview of it will do. A photo developed is rendered, so its current
+        // edit always shows.
+        if edge <= GRID_EDGE && stand_in.is_some() && !self.develops(photo) {
             return (stand_in, None);
         }
         let stamp = self.edit_stamp(ctx, photo.id);
-        let (catalog, defaults) = (&self.catalog, &self.defaults);
+        let (catalog, defaults) = (&self.session.catalog, &self.defaults);
         let edit = || {
             super::edit_source(catalog, photo.id)
                 .or_else(|| Some(EditSource::Defaults(defaults.clone())))
@@ -114,13 +116,13 @@ impl Library {
     /// The photo's edit stamp (see `Catalog::edit_stamp`), read again at
     /// most every `STAMP_AGE` seconds, so an edit saved elsewhere shows soon
     /// without reading the edit every frame.
-    fn edit_stamp(&mut self, ctx: &egui::Context, id: i64) -> u64 {
+    fn edit_stamp(&mut self, ctx: &egui::Context, id: PhotoId) -> u64 {
         let now = ctx.input(|i| i.time);
         let stamps = &mut self.stamps.0;
         match stamps.get(&id) {
             Some((stamp, read)) if now - read < STAMP_AGE => *stamp,
             _ => {
-                let stamp = self.catalog.edit_stamp(id).unwrap_or_default();
+                let stamp = self.session.catalog.edit_stamp(id).unwrap_or_default();
                 stamps.retain(|_, (_, read)| now - *read < STAMP_AGE);
                 stamps.insert(id, (stamp, now));
                 stamp
@@ -137,6 +139,7 @@ fn caption_strip(
     photo: &Photo,
     active: bool,
 ) {
+    let palette = theme::palette(painter.ctx());
     let y = rect.center().y;
     let mut x = rect.left();
     if let Some(role) = role {
@@ -145,7 +148,7 @@ fn caption_strip(
             egui::Align2::LEFT_CENTER,
             role.to_uppercase(),
             egui::FontId::proportional(10.5),
-            theme::gray(if active { 200 } else { 125 }),
+            palette.gray(if active { 200 } else { 125 }),
         );
         x = shown.right() + 10.;
     }
@@ -154,7 +157,7 @@ fn caption_strip(
         egui::Align2::LEFT_CENTER,
         format!("{}{}", photo.filename, super::cell::copy_suffix(photo)),
         egui::FontId::proportional(12.),
-        theme::gray(if active { 235 } else { 175 }),
+        palette.gray(if active { 235 } else { 175 }),
     );
     let mut x = name.right() + 12.;
     if photo.rating > 0 {
@@ -163,15 +166,15 @@ fn caption_strip(
             egui::Align2::LEFT_CENTER,
             "★".repeat(photo.rating.clamp(0, 5) as usize),
             egui::FontId::proportional(11.),
-            theme::gray(210),
+            palette.gray(210),
         );
         x = stars.right() + 10.;
     }
     if photo.flag != 0 {
-        flag_icon(painter, egui::pos2(x + 6., y), photo.flag, true);
+        flag_icon(painter, &palette, egui::pos2(x + 6., y), photo.flag, true);
         x += 20.;
     }
-    if let Some(color) = label_color(&photo.label) {
+    if let Some(color) = label_color(&palette, &photo.label) {
         let chip = Rect::from_center_size(egui::pos2(x + 5., y), Vec2::splat(10.));
         painter.rect_filled(chip, 1., color);
     }

@@ -8,6 +8,7 @@
 //! Loupe goes back to Fit. In flight: one region at a time, the latest asked
 //! for. Retained: one region texture, no larger than the view.
 use crate::app::worker::Latest;
+use crate::catalog::PhotoId;
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::{
@@ -19,6 +20,9 @@ use std::sync::{
 pub(super) struct RegionJob {
     ticket: u64,
     path: PathBuf,
+    /// For an offline RAW: the identity of its stored 1:1 preview, read in
+    /// place of the file.
+    stored: Option<String>,
     /// The view's centre, as a fraction of the photo's width and height.
     center: [f32; 2],
     /// The view, in pixels.
@@ -43,13 +47,14 @@ struct Done {
 /// The photo the worker keeps decoded at full resolution.
 struct Held {
     path: PathBuf,
+    stored: Option<String>,
     image: image::RgbImage,
 }
 
 /// The image pixels in view, read from the full decode in the background.
 pub(super) struct Regions {
     /// The photo the region and size below belong to.
-    pub photo: Option<i64>,
+    pub photo: Option<PhotoId>,
     pub full: Option<[u32; 2]>,
     pub region: Option<(egui::TextureHandle, [f32; 4])>,
     /// Asked for and not in yet.
@@ -57,7 +62,7 @@ pub(super) struct Regions {
     worker: Latest<Option<RegionJob>>,
     results: Receiver<Done>,
     ticket: u64,
-    requested: Option<(i64, [i32; 2], [u32; 2], u32)>,
+    requested: Option<(PhotoId, [i32; 2], [u32; 2], u32)>,
     cancel: Arc<AtomicBool>,
     pub error: Option<String>,
 }
@@ -66,6 +71,7 @@ impl Regions {
         let (tx, results) = channel();
         let ctx = ctx.clone();
         let mut held: Option<Held> = None;
+        let cache = crate::catalog::preview_cache::PreviewCache::path();
         let worker = Latest::new(move |job: Option<RegionJob>| {
             // None lets the full decode go.
             let Some(job) = job else {
@@ -75,9 +81,10 @@ impl Regions {
             if job.cancel.load(Ordering::Relaxed) {
                 return;
             }
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| region(&job, &mut held)))
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("The zoomed view could not be built")));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                region(&job, &mut held, &cache)
+            }))
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("The zoomed view could not be built")));
             if job.cancel.load(Ordering::Relaxed) {
                 return;
             }
@@ -111,11 +118,13 @@ impl Regions {
         self.worker.submit(None);
     }
     /// Asks for the `size` image pixels of `photo` around `center` (fractions
-    /// of the photo), unless they are already on their way.
+    /// of the photo), unless they are already on their way; from its stored 1:1
+    /// preview with identity `stored`, for an offline RAW.
     pub(super) fn request(
         &mut self,
-        photo: i64,
+        photo: PhotoId,
         path: &std::path::Path,
+        stored: Option<&str>,
         center: [f32; 2],
         size: [u32; 2],
         scale: f32,
@@ -142,6 +151,7 @@ impl Regions {
         self.worker.submit(Some(RegionJob {
             ticket: self.ticket,
             path: path.into(),
+            stored: stored.map(Into::into),
             center,
             size,
             scale: scale.min(1.),
@@ -184,14 +194,34 @@ impl Regions {
 }
 
 /// Renders the part of the photo `job` asks for, decoding it at full
-/// resolution first unless `held` already has it.
-fn region(job: &RegionJob, held: &mut Option<Held>) -> anyhow::Result<Region> {
-    if !held.as_ref().is_some_and(|h| h.path == job.path) {
+/// resolution first (or reading its 1:1 preview from the cache at `cache`)
+/// unless `held` already has it.
+fn region(
+    job: &RegionJob,
+    held: &mut Option<Held>,
+    cache: &std::path::Path,
+) -> anyhow::Result<Region> {
+    if !held
+        .as_ref()
+        .is_some_and(|h| h.path == job.path && h.stored == job.stored)
+    {
         // The previous photo's decode goes before the next is made.
         *held = None;
+        let image = match &job.stored {
+            Some(identity) => {
+                use crate::catalog::preview_cache::{PreviewCache, PreviewKind};
+                PreviewCache::open(cache)?
+                    .load_sized(&job.path, identity, PreviewKind::OneToOne)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no 1:1 preview; build one while the photo is online")
+                    })?
+            }
+            None => crate::raster::decode(&job.path)?,
+        };
         *held = Some(Held {
             path: job.path.clone(),
-            image: super::thumbnails::raster(&job.path)?,
+            stored: job.stored.clone(),
+            image,
         });
     }
     let image = &held.as_ref().unwrap().image;
@@ -221,4 +251,49 @@ fn region(job: &RegionJob, held: &mut Option<Held>) -> anyhow::Result<Region> {
         ],
         full: [width, height],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::preview_cache::{PreviewCache, PreviewKind, Stamp};
+
+    #[test]
+    fn an_offline_raw_zooms_into_its_stored_one_to_one_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("photo.ARW");
+        std::fs::write(&path, b"raw").unwrap();
+        let cache = dir.path().join("previews.sqlite3");
+        let full = image::RgbImage::from_fn(400, 300, |x, _| image::Rgb([(x % 256) as u8, 0, 0]));
+        PreviewCache::open(&cache)
+            .unwrap()
+            .store_sized(
+                &path,
+                "edit",
+                PreviewKind::OneToOne,
+                &Stamp::read(&path).unwrap(),
+                0,
+                &full,
+            )
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let job = |stored: &str| RegionJob {
+            ticket: 1,
+            path: path.clone(),
+            stored: Some(stored.into()),
+            center: [0.5, 0.5],
+            size: [100, 50],
+            scale: 1.,
+            cancel: Default::default(),
+        };
+        let mut held = None;
+        let region = region(&job("edit"), &mut held, &cache).unwrap();
+        assert_eq!(region.full, [400, 300]);
+        assert_eq!(region.image.dimensions(), (100, 50));
+        // Another edit has no 1:1 preview, and says so.
+        let error = super::region(&job("other"), &mut held, &cache)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("1:1"));
+    }
 }

@@ -1,5 +1,6 @@
 //! The Crop tool's guide overlays, Straighten ruler and aspect swap, as in Lightroom's
 //! Crop & Straighten (docs/transform.md#crop-and-straighten).
+use crate::model::recipe::Recipe;
 use eframe::egui::{self, Pos2, Vec2};
 
 /// Lightroom's crop guide overlays, in the order O cycles them.
@@ -123,7 +124,7 @@ impl CropGuides {
             GuideShow::Never => false,
         }
     }
-    pub(super) fn from_session(s: &crate::storage::CropGuideLayout) -> Self {
+    pub(super) fn from_session(s: &crate::app::session::CropGuideLayout) -> Self {
         let guide = Guide::ALL
             .into_iter()
             .find(|g| g.key() == s.guide)
@@ -138,8 +139,8 @@ impl CropGuides {
             show,
         }
     }
-    pub(super) fn to_session(self) -> crate::storage::CropGuideLayout {
-        crate::storage::CropGuideLayout {
+    pub(super) fn to_session(self) -> crate::app::session::CropGuideLayout {
+        crate::app::session::CropGuideLayout {
             guide: self.guide.key().into(),
             orientation: self.orientation.into(),
             show: self.show.key().into(),
@@ -345,10 +346,10 @@ impl super::Editor {
     /// The straightened photo's width and height, which the crop's 0–1 coordinates span.
     fn crop_frame(&self) -> Option<Vec2> {
         let im = self.document.full()?;
-        let r = crate::develop::Recipe {
+        let r = Recipe {
             crop: [0., 0., 1., 1.],
             constrain_crop: false,
-            ..self.document.recipe.clone()
+            ..self.document.edit.recipe().clone()
         };
         let g = crate::develop::Geometry::new(im, &r, 0);
         Some(Vec2::new(g.oriented_width, g.oriented_height))
@@ -358,7 +359,7 @@ impl super::Editor {
         let Some(photo) = self.crop_frame() else {
             return;
         };
-        let r = &mut self.document.recipe;
+        let r = self.document.edit.recipe_mut();
         r.crop = swap_orientation(r.crop, photo);
         self.view.aspect = swapped_aspect(self.view.aspect, photo);
     }
@@ -415,7 +416,7 @@ impl super::Editor {
         };
         let (generation, _) = self.document.straighten.start();
         let id = self.load.id();
-        let base = self.document.recipe.clone();
+        let base = self.document.edit.recipe().clone();
         let tx = self.tx.clone();
         let ctx = self.context.clone();
         std::thread::spawn(move || {
@@ -439,14 +440,14 @@ impl super::Editor {
     pub(super) fn auto_straighten_ready(
         &mut self,
         generation: u64,
-        analysed: &crate::develop::Recipe,
+        analysed: &Recipe,
         result: Result<Option<f32>, String>,
     ) {
         if generation != self.document.straighten.id() {
             return;
         }
         self.document.straighten.finish(generation);
-        if super::upright::inputs(analysed) != super::upright::inputs(&self.document.recipe) {
+        if super::upright::inputs(analysed) != super::upright::inputs(self.document.edit.recipe()) {
             self.start_auto_straighten();
             return;
         }
@@ -462,17 +463,12 @@ impl super::Editor {
             }
         };
         // A drag still under way is recorded first, so undoing it keeps the angle.
-        if self.document.history.in_gesture() {
-            self.document.history.finish_gesture(&self.document.recipe);
-            self.document.save.mark_changed();
+        if self.document.edit.history().in_gesture() {
+            self.document.edit.finish_gesture();
         }
-        let old = self.document.recipe.clone();
-        self.document.recipe.straighten = angle;
-        self.document
-            .history
-            .label(super::history::Step::new("Straighten", "Auto"));
-        self.history(old);
-        self.schedule();
+        self.change_edit(Some(super::history::Step::new("Straighten", "Auto")), |r| {
+            r.straighten = angle;
+        });
     }
 }
 
@@ -663,7 +659,7 @@ mod tests {
         };
         assert_eq!(CropGuides::from_session(&g.to_session()), g);
         // Names it does not know read as the defaults.
-        let unknown = crate::storage::CropGuideLayout {
+        let unknown = crate::app::session::CropGuideLayout {
             guide: "aspect-ratios".into(),
             orientation: 7,
             show: "sometimes".into(),

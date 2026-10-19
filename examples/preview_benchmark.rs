@@ -3,10 +3,8 @@
 //! Times what the desktop does: the first Fit after opening, Fit renders while a
 //! slider moves, a 100% region, and the full-resolution render used for export.
 use anyhow::{Context, Result};
-use rawmakase::{
-    develop::{self, Recipe},
-    raw,
-};
+use rawmakase::model::recipe::Recipe;
+use rawmakase::{camera_data, develop};
 use std::{sync::atomic::AtomicBool, time::Instant};
 
 /// Fit size of a 1600-pixel viewport, the size used by earlier measurements.
@@ -15,7 +13,7 @@ const FIT: u32 = 1600;
 fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.
 }
-fn mean_error(a: &develop::Rendered, b: &develop::Rendered) -> f32 {
+fn mean_error(a: &rawmakase::rendered::Rendered, b: &rawmakase::rendered::Rendered) -> f32 {
     assert_eq!((a.width, a.height), (b.width, b.height));
     let d: f32 = a
         .pixels
@@ -29,7 +27,7 @@ fn mean_error(a: &develop::Rendered, b: &develop::Rendered) -> f32 {
 /// What the desktop does with a CPU-side render before it can be drawn: 8-bit
 /// conversion and histogram on the render worker, then on the UI thread the texture
 /// image and, for whole-photo views, the Navigator thumbnail.
-fn cpu_display(out: &develop::Rendered, navigator: bool) -> usize {
+fn cpu_display(out: &rawmakase::rendered::Rendered, navigator: bool) -> usize {
     let rgb = out.rgb8();
     let histogram = out.histogram();
     let image = eframe::egui::ColorImage::from_rgb([out.width as usize, out.height as usize], &rgb);
@@ -53,8 +51,8 @@ fn main() -> Result<()> {
     anyhow::ensure!((1..=100).contains(&iterations), "Use 1–100 iterations");
     let cancel = AtomicBool::new(false);
     let start = Instant::now();
-    let image =
-        raw::Raw::open(std::path::Path::new(path))?.develop(raw::Decode::full(), &cancel)?;
+    let image = rawmakase::photo::open(std::path::Path::new(path))?
+        .develop(camera_data::Decode::full(Default::default()), &cancel)?;
     println!(
         "Decode {}x{}: {:.1} ms",
         image.width,
@@ -117,7 +115,8 @@ fn main() -> Result<()> {
         }
         recipe.exposure = iterations as f32 * 0.1;
         let t = Instant::now();
-        let full = develop::quality::render_cancellable(&image, &recipe, 0, None, &cancel)?;
+        let full =
+            develop::quality::render_cancellable(&image, &recipe.checked()?, 0, None, &cancel)?;
         println!("Export resolution, local={local}: {:.1} ms", ms(t));
         let reference = develop::quality::resize(full, FIT);
         let modes: &[&str] = if local {
@@ -154,7 +153,7 @@ fn main() -> Result<()> {
                 };
                 let display = develop::gpu::Display {
                     slot,
-                    clipping: develop::ClipOverlay::NONE,
+                    clipping: rawmakase::rendered::ClipOverlay::NONE,
                     monitor: None,
                     navigator: None,
                     thumbnail: None,
@@ -195,9 +194,9 @@ fn main() -> Result<()> {
                     "cpu-fit" => cpu.render(&image, &recipe, FIT, None, &cancel)?,
                     "gpu-fit" | "clarity-fit" => gpu.render(&image, &recipe, FIT, None, &cancel)?,
                     // The reduced 100% view shown while dragging, before the full region.
-                    "region-preview" | "clarity-region-preview" => gpu
-                        .render_region_preview(&image, &recipe, region, &cancel)?
-                        .context("No region preview")?,
+                    "region-preview" | "clarity-region-preview" => {
+                        gpu.render_region_preview(&image, &recipe, region, &cancel)?
+                    }
                     _ => gpu.render(&image, &recipe, 0, Some(region), &cancel)?,
                 };
                 let rendered = ms(t);
@@ -220,7 +219,7 @@ fn main() -> Result<()> {
                 };
                 let display = develop::gpu::Display {
                     slot,
-                    clipping: develop::ClipOverlay::NONE,
+                    clipping: rawmakase::rendered::ClipOverlay::NONE,
                     monitor: None,
                     navigator: (slot == develop::gpu::Slot::Whole).then_some(360),
                     thumbnail: None,
@@ -242,8 +241,7 @@ fn main() -> Result<()> {
                                 region,
                                 &cancel,
                                 Some(&display),
-                            )?
-                            .context("No region preview")?,
+                            )?,
                         "gpu-region" | "clarity-region" => gpu.render_to(
                             &image,
                             &recipe,

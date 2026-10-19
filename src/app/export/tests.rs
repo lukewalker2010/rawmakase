@@ -1,8 +1,10 @@
 use super::*;
-use crate::export::{Destination, Format};
+use crate::app::Module;
+use crate::catalog::PhotoId;
+use crate::export_settings::{Destination, Format};
 
 /// An editor on a catalog of two copies of the synthetic chart DNG and a JPEG.
-fn editor() -> anyhow::Result<(tempfile::TempDir, Editor, Vec<i64>, egui::Context)> {
+fn editor() -> anyhow::Result<(tempfile::TempDir, Editor, Vec<PhotoId>, egui::Context)> {
     let dir = tempfile::tempdir()?;
     let photos = dir.path().join("photos");
     std::fs::create_dir(&photos)?;
@@ -15,15 +17,15 @@ fn editor() -> anyhow::Result<(tempfile::TempDir, Editor, Vec<i64>, egui::Contex
     let catalog = dir.path().join("test.rawmakase");
     crate::catalog::Catalog::create(&catalog)?.add_folder(&photos)?;
     let ctx = egui::Context::default();
-    let mut e = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
-    e.raw_defaults = Arc::new(crate::develop::defaults::DevelopDefaults::with_presets(
+    let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
+    e.raw_defaults = Arc::new(crate::raw_defaults::DevelopDefaults::with_presets(
         Default::default(),
         |_| None,
     ));
     let library = crate::app::library::Library::load(&catalog, ctx.clone())?;
-    let ids = library.photos.iter().map(|p| p.id).collect();
+    let ids = library.session.photos.iter().map(|p| p.id).collect();
     e.library = Some(Box::new(library));
-    e.library_mode = true;
+    e.module = Module::Library;
     Ok((dir, e, ids, ctx))
 }
 /// Small TIFFs in `folder`.
@@ -80,6 +82,9 @@ fn export_acts_on_the_selection_and_reports_what_it_left_out() -> anyhow::Result
     let library = e.library.as_mut().unwrap();
     library.select(Some(ids[0]));
     library.select_range_to(ids[2]);
+    // The second RAW goes offline; the JPEG is exported like the first.
+    let offline = library.photo(ids[1]).unwrap().path.clone();
+    std::fs::remove_file(&offline)?;
     let scope = e.export_scope().expect("photos to export");
     assert_eq!(
         scope
@@ -87,16 +92,16 @@ fn export_acts_on_the_selection_and_reports_what_it_left_out() -> anyhow::Result
             .iter()
             .map(|p| p.name.as_str())
             .collect::<Vec<_>>(),
-        ["a.dng", "b.dng"]
+        ["a.dng", "c.jpg"]
     );
     assert_eq!(scope.left_out.len(), 1, "{:?}", scope.left_out);
-    assert_eq!(scope.left_out[0].0, "c.jpg");
+    assert_eq!(scope.left_out[0].0, "b.dng");
     let out = dir.path().join("out");
     export(&mut e, scope.clone(), settings(&out))?;
     wait(&mut e, &ctx);
-    assert_eq!(listing(&out), ["a.tif", "b.tif"]);
+    assert_eq!(listing(&out), ["a.tif", "c.tif"]);
     assert_eq!(e.status, "Exported 2 of 3 · 1 not exported");
-    // Kept in the top bar until read: the JPEG, and why.
+    // Kept in the top bar until read: the offline RAW, and why.
     let summary = e.exports.summary.clone().expect("a report");
     assert_eq!(summary.problems.len(), 1);
     assert!(summary.problems[0].1.contains("can't be exported"));
@@ -104,14 +109,14 @@ fn export_acts_on_the_selection_and_reports_what_it_left_out() -> anyhow::Result
     // Again into the same folder: Ask asks once for both files.
     export(&mut e, scope, settings(&out))?;
     let pending = e.exports.pending.take().expect("the question");
-    assert_eq!(pending.conflicts, [out.join("a.tif"), out.join("b.tif")]);
+    assert_eq!(pending.conflicts, [out.join("a.tif"), out.join("c.tif")]);
     e.plan_export(pending, Some(Existing::Unique));
     wait(&mut e, &ctx);
-    assert_eq!(listing(&out), ["a-2.tif", "a.tif", "b-2.tif", "b.tif"]);
+    assert_eq!(listing(&out), ["a-2.tif", "a.tif", "c-2.tif", "c.tif"]);
     // That export went well, but the first one's report is unread: it stays, and
     // the two add up until it is dismissed.
     let summary = e.exports.summary.clone().expect("the unread report");
-    // The JPEG was left out of both.
+    // The offline RAW was left out of both.
     assert_eq!(summary.line(), "Exported 4 of 6 · 2 not exported");
     Ok(())
 }
@@ -131,18 +136,19 @@ fn an_open_photo_whose_edit_isnt_final_holds_back_only_its_own_export() -> anyho
     e.document.catalog_photo = Some(ids[0]);
     e.document.path = Some(path);
     e.document.metadata = Some(Default::default());
-    e.document.set_image(Arc::new(crate::raw::CameraImage {
-        recovered: Default::default(),
-        width: 1,
-        height: 1,
-        pixels: vec![[0.1; 3]],
-        metadata: Default::default(),
-        fast: false,
-        scale_factor: 1.,
-        scale_clipped: 0,
-    }));
+    e.document
+        .set_image(Arc::new(crate::camera_data::CameraImage {
+            recovered: Default::default(),
+            width: 1,
+            height: 1,
+            pixels: vec![[0.1; 3]],
+            metadata: Default::default(),
+            fast: false,
+            scale_factor: 1.,
+            scale_clipped: 0,
+        }));
     e.document.pending_lightroom = Some("s = {}".into());
-    e.library_mode = false;
+    e.module = Module::Develop;
     let library = e.library.as_mut().unwrap();
     library.select(Some(ids[0]));
     assert!(e.export_scope().is_none());
@@ -152,14 +158,14 @@ fn an_open_photo_whose_edit_isnt_final_holds_back_only_its_own_export() -> anyho
         e.status
     );
     // A Library selection without it goes ahead.
-    e.library_mode = true;
+    e.module = Module::Library;
     e.library.as_mut().unwrap().select(Some(ids[1]));
     let scope = e.export_scope().expect("the other photo");
     assert_eq!(scope.photos.len(), 1);
     assert!(!scope.photos[0].open);
     // Once final, the open photo is exported as shown.
     e.document.pending_lightroom = None;
-    e.library_mode = false;
+    e.module = Module::Develop;
     e.library.as_mut().unwrap().select(Some(ids[0]));
     let scope = e.export_scope().expect("the open photo");
     assert!(scope.photos[0].open);
@@ -184,19 +190,20 @@ fn a_photo_opened_without_a_catalog_is_exported_only_while_its_file_is_there() -
         &path,
     )?;
     let ctx = egui::Context::default();
-    let mut e = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+    let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
     e.document.path = Some(path.clone());
     e.document.metadata = Some(Default::default());
-    e.document.set_image(Arc::new(crate::raw::CameraImage {
-        recovered: Default::default(),
-        width: 1,
-        height: 1,
-        pixels: vec![[0.1; 3]],
-        metadata: Default::default(),
-        fast: false,
-        scale_factor: 1.,
-        scale_clipped: 0,
-    }));
+    e.document
+        .set_image(Arc::new(crate::camera_data::CameraImage {
+            recovered: Default::default(),
+            width: 1,
+            height: 1,
+            pixels: vec![[0.1; 3]],
+            metadata: Default::default(),
+            fast: false,
+            scale_factor: 1.,
+            scale_clipped: 0,
+        }));
     let scope = e.export_scope().expect("the open photo");
     assert!(scope.photos[0].open && scope.photos[0].id.is_none());
     std::fs::remove_file(&path)?;
@@ -221,4 +228,34 @@ fn show_in_finder_opens_one_window_for_each_folder_exported_to() {
         .collect();
     assert_eq!(to_show(&many).len(), 5);
     assert_eq!(folders(&many), 20);
+}
+
+/// Choosing what to export reads no file: a JPEG Develop can't edit is chosen,
+/// and fails as its export, with the reason.
+#[test]
+fn a_cmyk_jpeg_is_exported_and_fails_with_why() -> anyhow::Result<()> {
+    use image::ImageEncoder;
+    let (dir, mut e, ids, ctx) = editor()?;
+    let library = e.library.as_mut().unwrap();
+    let jpeg = library.photo(ids[2]).unwrap().path.clone();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new(std::fs::File::create(&jpeg)?);
+    encoder.set_icc_profile(crate::app::worker::cmyk_profile())?;
+    encoder.write_image(&[10; 8 * 8 * 3], 8, 8, image::ExtendedColorType::Rgb8)?;
+    library.select(Some(ids[2]));
+    let scope = e.export_scope().expect("photos to export");
+    assert_eq!(scope.photos.len(), 1);
+    assert!(scope.left_out.is_empty(), "{:?}", scope.left_out);
+    let out = dir.path().join("out");
+    export(&mut e, scope, settings(&out))?;
+    wait(&mut e, &ctx);
+    assert!(listing(&out).is_empty());
+    let summary = e.exports.summary.clone().expect("a report");
+    assert_eq!(summary.problems.len(), 1);
+    assert_eq!(summary.problems[0].0, "c.jpg");
+    assert!(
+        summary.problems[0].1.contains("CMYK"),
+        "{:?}",
+        summary.problems
+    );
+    Ok(())
 }

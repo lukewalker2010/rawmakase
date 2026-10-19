@@ -41,28 +41,12 @@ pub(super) fn available_paths(photos: &[Photo]) -> HashSet<PathBuf> {
 
 pub(super) fn thumbnail(path: &std::path::Path) -> Result<image::RgbImage> {
     let image = if crate::storage::is_raw(path) {
-        let mut raw = crate::raw::Raw::open(path)?;
+        let mut raw = crate::photo::open(path)?;
         crate::raw::thumbnail(&mut raw)?
     } else {
-        raster(path)?
+        crate::raster::decode(path)?
     };
     Ok(downscale(&image, 640))
-}
-/// A JPEG, TIFF or PNG decoded and turned upright; refused above 150 MP.
-pub(super) fn raster(path: &std::path::Path) -> Result<image::RgbImage> {
-    use image::ImageDecoder;
-    let mut decoder = image::ImageReader::open(path)?
-        .with_guessed_format()?
-        .into_decoder()?;
-    let (w, h) = decoder.dimensions();
-    anyhow::ensure!(
-        (w as u64) * (h as u64) <= 150_000_000,
-        "Image too large to preview"
-    );
-    let orientation = decoder.orientation()?;
-    let mut image = image::DynamicImage::from_decoder(decoder)?;
-    image.apply_orientation(orientation);
-    Ok(image.to_rgb8())
 }
 /// `image` within `edge`×`edge`; never enlarged.
 pub(super) fn downscale(image: &image::RgbImage, edge: u32) -> image::RgbImage {

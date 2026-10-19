@@ -1,7 +1,8 @@
+use crate::model::recipe::Recipe;
 use crate::{
-    develop::{Recipe, Rendered},
-    export::ExportOptions,
-    raw::{CameraImage, Metadata},
+    camera_data::{CameraImage, Metadata},
+    export_settings::ExportOptions,
+    rendered::Rendered,
 };
 use eframe::egui;
 use std::{
@@ -10,17 +11,16 @@ use std::{
 };
 
 /// A loaded header can be installed as a unit before pixel development finishes.
-pub struct LoadedHeader {
+pub(crate) struct LoadedHeader {
     pub id: u64,
     pub path: PathBuf,
     pub metadata: Metadata,
     pub recipe: Recipe,
     pub export: ExportOptions,
-    pub protected: bool,
     pub status: String,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RenderStage {
+pub(crate) enum RenderStage {
     Draft,
     Fit,
     Region,
@@ -35,7 +35,7 @@ impl RenderStage {
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TaskKind {
+pub(crate) enum TaskKind {
     Load,
     Render(Pane),
 }
@@ -43,7 +43,7 @@ pub enum TaskKind {
 /// in Lightroom's Before/After views. Each has its own render lane and caches, so an
 /// edit renders only the After.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Pane {
+pub(crate) enum Pane {
     #[default]
     After,
     Before,
@@ -51,17 +51,31 @@ pub enum Pane {
 
 /// What an Auto request sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AutoKind {
+pub(crate) enum AutoKind {
     /// The six Tone sliders, as Lightroom's Auto button; white balance is kept.
     Settings,
     /// White balance alone, the WB menu's Auto.
     WhiteBalance,
 }
-pub enum Event {
+pub(crate) enum Event {
     DialogClosed,
+    /// A Subject or Background selection finished (or failed).
+    Selection(Box<crate::app::subject_mask::Done>),
+    /// The selection model finished installing, or why not.
+    ModelInstalled(Result<(), String>),
+    ModelRemoved(Result<(), String>),
+    /// A catalog upgrade for raster masks finished: the backup it made, or why not.
+    CatalogUpgraded {
+        generation: u64,
+        result: Result<Option<PathBuf>, String>,
+    },
     /// A catalog import or open is under way, as a status line.
     CatalogWorking(String),
     CatalogReady(Result<Box<crate::app::library::Library>, String>),
+    /// A Synchronize Folder scan finished, or failed.
+    FolderSyncScanned(Box<crate::app::folder_sync::Scanned>),
+    /// Applying a synchronization finished: the catalog opened again.
+    FolderSyncApplied(Result<Box<crate::app::folder_sync::Synced>, String>),
     /// A folder change waiting for the user's answer.
     FolderQuestion(Box<crate::app::folder_locations::FolderQuestion>),
     Monitor(PathBuf),
@@ -84,7 +98,7 @@ pub enum Event {
         /// The sampling task's generation; a later sample or a put-away dropper
         /// supersedes it.
         generation: u64,
-        sampled: Box<crate::develop::Recipe>,
+        sampled: Box<Recipe>,
         result: Result<[f32; 3], String>,
     },
     /// The Targeted Adjustment Tool's sample for the photo loaded as `id`, taken
@@ -93,20 +107,20 @@ pub enum Event {
         id: u64,
         /// The sampling task's generation; a later drag supersedes it.
         generation: u64,
-        sampled: Box<crate::develop::Recipe>,
+        sampled: Box<Recipe>,
         result: Result<crate::develop::targeted::TargetSample, String>,
     },
     /// An Auto estimate for the photo loaded as `id`.
     Auto {
         id: u64,
         kind: AutoKind,
-        result: Result<Box<crate::develop::Recipe>, String>,
+        result: Result<Box<Recipe>, String>,
     },
     /// Upright's corrections for the photo loaded as `id`, analysed from `analysed`.
     Upright {
         id: u64,
         generation: u64,
-        analysed: Box<crate::develop::Recipe>,
+        analysed: Box<Recipe>,
         result: Result<Vec<[f32; 9]>, String>,
     },
     /// The Crop panel's Auto straighten angle for the photo loaded as `id`, analysed
@@ -114,7 +128,7 @@ pub enum Event {
     Straighten {
         id: u64,
         generation: u64,
-        analysed: Box<crate::develop::Recipe>,
+        analysed: Box<Recipe>,
         result: Result<Option<f32>, String>,
     },
     /// The setup assistant's scan for cameras, profiles and presets.
@@ -136,6 +150,8 @@ pub enum Event {
         id: u64,
         image: image::RgbImage,
     },
+    /// A stored Standard preview, read for a load or a neighbour.
+    StandIn(Box<crate::app::stand_in::StandIn>),
     Ready {
         id: u64,
         full: Arc<CameraImage>,
@@ -145,7 +161,7 @@ pub enum Event {
         id: u64,
         pane: Pane,
         preview: Preview,
-        histogram: Box<crate::develop::Histogram>,
+        histogram: Box<crate::rendered::Histogram>,
         /// A reduced copy for the library, without overlays, when the job asked for one.
         thumbnail: Option<image::RgbImage>,
         /// The shown pixels without overlays or monitor profile, when the job asked.
@@ -156,7 +172,7 @@ pub enum Event {
     /// The whole photo's histogram, for a render that showed a 100% region.
     Histogram {
         id: u64,
-        histogram: Box<crate::develop::Histogram>,
+        histogram: Box<crate::rendered::Histogram>,
     },
     Failed {
         id: u64,
@@ -179,7 +195,7 @@ pub enum Event {
 }
 /// Textures the renderer registered with the UI and no longer uses. Freed when
 /// dropped, so the UI releases them only once it no longer draws them.
-pub struct RetiredTextures {
+pub(crate) struct RetiredTextures {
     state: eframe::egui_wgpu::RenderState,
     ids: Vec<egui::TextureId>,
 }
@@ -192,7 +208,7 @@ impl Drop for RetiredTextures {
     }
 }
 /// A rendered preview as the viewport draws it.
-pub enum Preview {
+pub(crate) enum Preview {
     /// Rendered on the CPU: display bytes for a texture upload.
     Pixels {
         image: Rendered,
@@ -207,28 +223,28 @@ pub enum Preview {
         navigator: Option<(egui::TextureId, [usize; 2])>,
     },
 }
-pub struct LoadJob {
+pub(crate) struct LoadJob {
     pub id: u64,
     pub path: PathBuf,
     pub cancel: Arc<AtomicBool>,
     /// The photo to decode ahead of time once this one is fully developed.
     pub prefetch: Option<Prefetch>,
     /// What the photo starts from when it has no edit.
-    pub defaults: Arc<crate::develop::defaults::DevelopDefaults>,
+    pub defaults: Arc<crate::raw_defaults::DevelopDefaults>,
     /// The demosaic of the full-size decode and of its decode-cache key.
-    pub demosaic: crate::raw::Demosaic,
+    pub demosaic: crate::camera_data::Demosaic,
 }
 /// A photo to develop into the decode cache ahead of time, so opening it next
 /// skips decoding. It has its own cancel flag: the photo on screen finishing
 /// must not stop it, moving to another photo must.
-pub struct Prefetch {
+pub(crate) struct Prefetch {
     pub path: PathBuf,
     pub cancel: Arc<AtomicBool>,
-    pub demosaic: crate::raw::Demosaic,
+    pub demosaic: crate::camera_data::Demosaic,
 }
 /// What is drawn over (or instead of) the rendered photo.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub enum Overlay {
+pub(crate) enum Overlay {
     #[default]
     None,
     /// Visualize Spots with its threshold (0–1).
@@ -241,7 +257,7 @@ pub enum Overlay {
         opacity: f32,
     },
 }
-pub struct RenderJob {
+pub(crate) struct RenderJob {
     pub id: u64,
     pub pane: Pane,
     pub image: Arc<CameraImage>,
@@ -251,7 +267,7 @@ pub struct RenderJob {
     pub region: Option<[u32; 4]>,
     pub monitor: Option<PathBuf>,
     /// The clipping warnings painted over the shown pixels.
-    pub clipping: crate::develop::ClipOverlay,
+    pub clipping: crate::rendered::ClipOverlay,
     /// Update the Navigator (Fit views).
     pub navigator: bool,
     /// Also produce a library thumbnail of the result.
@@ -269,11 +285,15 @@ fn send(tx: &Sender<Event>, ctx: &egui::Context, event: Event) {
 
 mod latest;
 mod loader;
+#[cfg(test)]
+pub(in crate::app) use loader::tests::cmyk_profile;
 mod reference;
 mod renderer;
-pub use latest::Latest;
+pub(crate) use latest::Latest;
 pub(crate) use latest::panic_message;
-pub use loader::loader;
+pub(crate) use loader::Loader;
 pub(in crate::app) use reference::{ReferenceImage, ReferenceJob, Resolution, reference_loader};
+pub(crate) use renderer::Renderer;
+#[cfg(test)]
+pub(super) use renderer::holding;
 pub(super) use renderer::{RenderBackend, renderer_with_backend};
-pub use renderer::{Renderer, renderer};

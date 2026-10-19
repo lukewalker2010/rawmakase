@@ -1,7 +1,8 @@
 use super::*;
+use crate::{app::Module, model::params::ParameterId};
 mod mapping_tests {
     use super::*;
-    use crate::develop::{Recipe, TEMPERATURE_MAX, TEMPERATURE_MIN, TINT_LIMIT};
+    use crate::model::recipe::{Recipe, TEMPERATURE_MAX, TEMPERATURE_MIN, TINT_LIMIT};
     #[test]
     fn encoder_values_are_relative() {
         assert_eq!(
@@ -33,12 +34,21 @@ mod mapping_tests {
     #[test]
     fn dials_clamp_and_label_like_sliders() {
         let mut r = Recipe::default();
-        assert_eq!(Param::Contrast.turn(&mut r, 3, 0), "+3");
-        assert_eq!(Param::Contrast.turn(&mut r, -5, 0), "-2");
-        assert_eq!(Param::Exposure.turn(&mut r, 5, 0), "+0.10");
-        Param::Highlights.turn(&mut r, 1000, 0);
+        assert_eq!(
+            Param::Setting(ParameterId::Contrast).turn(&mut r, 3, 0),
+            "+3"
+        );
+        assert_eq!(
+            Param::Setting(ParameterId::Contrast).turn(&mut r, -5, 0),
+            "-2"
+        );
+        assert_eq!(
+            Param::Setting(ParameterId::Exposure).turn(&mut r, 5, 0),
+            "+0.10"
+        );
+        Param::Setting(ParameterId::Highlights).turn(&mut r, 1000, 0);
         assert_eq!(r.highlights, 1.);
-        Param::Tint.turn(&mut r, -1000, 0);
+        Param::Setting(ParameterId::Tint).turn(&mut r, -1000, 0);
         assert_eq!(r.tint, -TINT_LIMIT);
     }
     #[test]
@@ -48,13 +58,28 @@ mod mapping_tests {
             ..Recipe::default()
         };
         // Clockwise would move it further out: it stays.
-        assert_eq!(Param::Exposure.turn(&mut r, 1, 0), "+6.00");
+        assert_eq!(
+            Param::Setting(ParameterId::Exposure).turn(&mut r, 1, 0),
+            "+6.00"
+        );
         // Anticlockwise moves one step toward the slider, not to its end.
-        assert_eq!(Param::Exposure.turn(&mut r, -1, 0), "+5.98");
+        assert_eq!(
+            Param::Setting(ParameterId::Exposure).turn(&mut r, -1, 0),
+            "+5.98"
+        );
         // An exact value may be anything a recipe holds.
-        assert_eq!(Param::Exposure.set(&mut r, 7.5, 0), "+7.50");
-        assert_eq!(Param::Exposure.set(&mut r, 9., 0), "+8.00");
-        assert_eq!(Param::Contrast.set(&mut r, 150., 0), "+100");
+        assert_eq!(
+            Param::Setting(ParameterId::Exposure).set(&mut r, 7.5, 0),
+            "+7.50"
+        );
+        assert_eq!(
+            Param::Setting(ParameterId::Exposure).set(&mut r, 9., 0),
+            "+8.00"
+        );
+        assert_eq!(
+            Param::Setting(ParameterId::Contrast).set(&mut r, 150., 0),
+            "+100"
+        );
     }
     #[test]
     fn temperature_clockwise_is_warmer_and_stays_in_range() {
@@ -62,11 +87,11 @@ mod mapping_tests {
             temperature: 5000.,
             ..Recipe::default()
         };
-        Param::Temperature.turn(&mut r, 1, 0);
+        Param::Setting(ParameterId::Temperature).turn(&mut r, 1, 0);
         assert!(r.temperature > 5000.);
-        Param::Temperature.turn(&mut r, 100_000, 0);
+        Param::Setting(ParameterId::Temperature).turn(&mut r, 100_000, 0);
         assert_eq!(r.temperature, TEMPERATURE_MAX);
-        Param::Temperature.turn(&mut r, -100_000, 0);
+        Param::Setting(ParameterId::Temperature).turn(&mut r, -100_000, 0);
         assert_eq!(r.temperature, TEMPERATURE_MIN);
     }
     #[test]
@@ -84,14 +109,20 @@ mod mapping_tests {
     #[test]
     fn sliders_are_set_in_the_units_they_show() {
         let mut r = Recipe::default();
-        assert_eq!(Param::Exposure.set(&mut r, 1.5, 0), "+1.50");
-        assert_eq!(Param::Exposure.shown(&mut r, 0), 1.5);
-        assert_eq!(Param::Contrast.set(&mut r, 35., 0), "+35");
+        assert_eq!(
+            Param::Setting(ParameterId::Exposure).set(&mut r, 1.5, 0),
+            "+1.50"
+        );
+        assert_eq!(Param::Setting(ParameterId::Exposure).shown(&mut r, 0), 1.5);
+        assert_eq!(
+            Param::Setting(ParameterId::Contrast).set(&mut r, 35., 0),
+            "+35"
+        );
         assert!((r.contrast - 0.35).abs() < 1e-6);
-        assert_eq!(Param::Contrast.shown(&mut r, 0), 35.);
-        Param::Exposure.set(&mut r, 99., 0);
-        assert_eq!(r.exposure, crate::develop::EXPOSURE_LIMIT);
-        Param::Temperature.set(&mut r, 1., 0);
+        assert_eq!(Param::Setting(ParameterId::Contrast).shown(&mut r, 0), 35.);
+        Param::Setting(ParameterId::Exposure).set(&mut r, 99., 0);
+        assert_eq!(r.exposure, crate::model::recipe::EXPOSURE_LIMIT);
+        Param::Setting(ParameterId::Temperature).set(&mut r, 1., 0);
         assert_eq!(r.temperature, TEMPERATURE_MIN);
         // A band addressed by channel ignores the Mixer's selector and B&W.
         r.effects.monochrome = true;
@@ -105,25 +136,49 @@ mod mapping_tests {
     #[test]
     fn straighten_is_set_and_turned_in_degrees() {
         let mut r = Recipe::default();
-        assert_eq!(Param::Straighten.set(&mut r, -2.5, 0), "-2.50");
+        assert_eq!(
+            Param::Setting(ParameterId::Straighten).set(&mut r, -2.5, 0),
+            "-2.50"
+        );
         assert_eq!(r.straighten, -2.5);
-        assert_eq!(Param::Straighten.shown(&mut r, 0), -2.5);
-        assert_eq!(Param::Straighten.turn(&mut r, 5, 0), "-2.00");
-        assert_eq!(Param::Straighten.label(0), "Angle");
-        Param::Straighten.set(&mut r, 90., 0);
+        assert_eq!(
+            Param::Setting(ParameterId::Straighten).shown(&mut r, 0),
+            -2.5
+        );
+        assert_eq!(
+            Param::Setting(ParameterId::Straighten).turn(&mut r, 5, 0),
+            "-2.00"
+        );
+        assert_eq!(Param::Setting(ParameterId::Straighten).label(0), "Angle");
+        Param::Setting(ParameterId::Straighten).set(&mut r, 90., 0);
         assert_eq!(r.straighten, 45.);
-        Param::Straighten.turn(&mut r, -1000, 0);
+        Param::Setting(ParameterId::Straighten).turn(&mut r, -1000, 0);
         assert_eq!(r.straighten, -45.);
         assert!(r.validate().is_ok());
-        assert_eq!(Param::Straighten.range(false), (-45., 45.));
-        let mask = crate::develop::masks::LocalAdjust::default();
-        assert_eq!(Param::Straighten.local_shown(&mask), None);
+        assert_eq!(
+            Param::Setting(ParameterId::Straighten).range(false),
+            (-45., 45.)
+        );
+        let mask = crate::model::masks::LocalAdjust::default();
+        assert_eq!(
+            Param::Setting(ParameterId::Straighten).local_shown(&mask),
+            None
+        );
     }
     #[test]
     fn slider_names_parse_with_bands_and_channels() {
-        assert_eq!(Param::parse("Temp"), Some(Param::Temperature));
-        assert_eq!(Param::parse("straighten"), Some(Param::Straighten));
-        assert_eq!(Param::parse("Angle"), Some(Param::Straighten));
+        assert_eq!(
+            Param::parse("Temp"),
+            Some(Param::Setting(ParameterId::Temperature))
+        );
+        assert_eq!(
+            Param::parse("straighten"),
+            Some(Param::Setting(ParameterId::Straighten))
+        );
+        assert_eq!(
+            Param::parse("Angle"),
+            Some(Param::Setting(ParameterId::Straighten))
+        );
         assert_eq!(Param::parse("band3.sat"), Some(Param::Hsl(2, 1)));
         assert_eq!(Param::parse("band8.gray"), Some(Param::Gray(7)));
         assert_eq!(Param::parse("band1"), Some(Param::Band(0)));
@@ -140,7 +195,10 @@ mod mapping_tests {
             "dials": {"41": "contrast", "33": null},
             "buttons": {"98": "cmd+shift+u", "95": null, "99": "hold:shift"}
         }));
-        assert_eq!(config.dials.get(&41), Some(&Param::Contrast));
+        assert_eq!(
+            config.dials.get(&41),
+            Some(&Param::Setting(ParameterId::Contrast))
+        );
         assert!(!config.dials.contains_key(&33));
         assert_eq!(
             config.buttons.get(&98),
@@ -169,6 +227,40 @@ mod mapping_tests {
             Some(Action::Key(Key::ArrowLeft, Modifiers::NONE))
         );
         assert_eq!(parse_action("nonsense"), None);
+    }
+    #[test]
+    fn panel_keys_on_a_button_hide_panels_as_on_the_keyboard() {
+        use crate::app::panels::{PanelChange, WorkspacePanel};
+        let run = |spec| match supported_action(spec) {
+            Some(Action::Key(key, modifiers)) => shortcut_action(key, modifiers),
+            _ => None,
+        };
+        assert_eq!(
+            run("tab"),
+            Some(commands::Action::Panels(PanelChange::Sides))
+        );
+        assert_eq!(
+            run("shift+tab"),
+            Some(commands::Action::Panels(PanelChange::All))
+        );
+        assert_eq!(
+            run("f8"),
+            Some(commands::Action::Panels(PanelChange::Toggle(
+                WorkspacePanel::Right
+            )))
+        );
+        assert_eq!(
+            run("shift+f8"),
+            Some(commands::Action::Panels(PanelChange::Toggle(
+                WorkspacePanel::Presets
+            )))
+        );
+        assert_eq!(
+            parse_action("panels:filmstrip"),
+            Some(Action::Named(commands::Action::Panels(
+                PanelChange::Toggle(WorkspacePanel::Filmstrip)
+            )))
+        );
     }
     #[test]
     fn saved_mapping_reads_back_without_inheriting_removed_controls() {
@@ -243,7 +335,7 @@ mod integration_tests {
     #[test]
     fn disconnect_clears_modifiers_even_with_old_input_queued() {
         let ctx = egui::Context::default();
-        let mut e = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+        let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
         let (tx, rx) = mpsc::sync_channel(1);
         e.controls = Hub::new(
             Settings {
@@ -313,7 +405,7 @@ mod integration_tests {
     #[test]
     fn photo_dial_ignores_grid_preserves_loupe_and_navigates_develop() -> anyhow::Result<()> {
         let ctx = egui::Context::default();
-        let mut e = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+        let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
         e.onboarding.visible = false;
         let dir = tempfile::tempdir()?;
         let photos = dir.path().join("photos");
@@ -330,16 +422,16 @@ mod integration_tests {
             ctx.clone(),
         )?));
         let library = e.library.as_mut().unwrap();
-        let first = library.photos[0].id;
+        let first = library.session.photos[0].id;
         library.make_active(first);
         let second = library.navigate(first, 1).unwrap();
-        e.library_mode = true;
+        e.module = Module::Library;
         e.control_messages(vec![Msg::Cc(48, 1)], &ctx).unwrap();
-        assert!(e.library_mode);
+        assert!(e.module == Module::Library);
         assert_eq!(e.library.as_ref().unwrap().selected(), Some(first));
         e.library.as_mut().unwrap().open_loupe();
         e.control_messages(vec![Msg::Cc(48, 1)], &ctx).unwrap();
-        assert!(e.library_mode);
+        assert!(e.module == Module::Library);
         assert!(e.library.as_ref().unwrap().loupe_open());
         assert_eq!(e.library.as_ref().unwrap().selected(), Some(second));
         // Semantic API navigation and device arrows preserve Loupe too.
@@ -350,7 +442,7 @@ mod integration_tests {
             &ctx,
         )
         .unwrap();
-        assert!(e.library_mode && e.library.as_ref().unwrap().loupe_open());
+        assert!(e.module == Module::Library && e.library.as_ref().unwrap().loupe_open());
         assert_eq!(e.library.as_ref().unwrap().selected(), Some(first));
         e.control_messages(
             vec![Msg::Command(Command::new(commands::Operation::Action(
@@ -359,7 +451,7 @@ mod integration_tests {
             &ctx,
         )
         .unwrap();
-        assert!(e.library_mode && e.library.as_ref().unwrap().loupe_open());
+        assert!(e.module == Module::Library && e.library.as_ref().unwrap().loupe_open());
         assert_eq!(e.library.as_ref().unwrap().selected(), Some(second));
         e.library.as_mut().unwrap().show_grid();
         e.control_messages(
@@ -369,12 +461,12 @@ mod integration_tests {
             &ctx,
         )
         .unwrap();
-        assert!(e.library_mode && !e.library.as_ref().unwrap().loupe_open());
+        assert!(e.module == Module::Library && !e.library.as_ref().unwrap().loupe_open());
         assert_eq!(e.library.as_ref().unwrap().selected(), Some(first));
-        e.library_mode = false;
+        e.module = Module::Develop;
         e.document.catalog_photo = Some(second);
         e.control_messages(vec![Msg::Cc(48, 127)], &ctx).unwrap();
-        assert!(!e.library_mode);
+        assert!(e.module == Module::Develop);
         assert_eq!(e.document.catalog_photo, Some(first));
         Ok(())
     }
@@ -417,7 +509,7 @@ mod integration_tests {
     #[test]
     fn each_socket_request_runs_and_replies_before_the_next() {
         let ctx = egui::Context::default();
-        let mut e = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+        let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
         e.onboarding.visible = false;
         let (tx, rx) = mpsc::sync_channel(4);
         e.controls = Hub::new(
@@ -428,7 +520,7 @@ mod integration_tests {
             rx,
         );
         let (first, r1) = socket::test_request(vec![Msg::Command(Command::new(
-            commands::Operation::Set(Param::Exposure, 1.),
+            commands::Operation::Set(Param::Setting(ParameterId::Exposure), 1.),
         ))]);
         let (second, r2) =
             socket::test_request(vec![Msg::Command(Command::new(commands::Operation::State))]);
@@ -437,6 +529,76 @@ mod integration_tests {
         e.control_commands(&ctx);
         assert_eq!(r1.recv().unwrap().unwrap_err().code, "no_document");
         assert!(r2.recv().unwrap().is_ok());
+    }
+    #[test]
+    fn a_wait_is_answered_when_it_holds_or_when_its_time_is_up() {
+        use std::time::Duration;
+        let ctx = egui::Context::default();
+        let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
+        let (tx, rx) = mpsc::sync_channel(4);
+        e.controls = Hub::new(Settings::default(), rx);
+        let wait = |until, millis| {
+            socket::test_request(vec![Msg::Command(Command::new(commands::Operation::Wait(
+                until,
+                Duration::from_millis(millis),
+            )))])
+        };
+        // A job that does not exist has nothing to wait for.
+        let (done, answer) = wait(commands::Until::Job(7), 5000);
+        tx.send(Msg::Request(done)).unwrap();
+        e.control_commands(&ctx);
+        assert_eq!(answer.try_recv().unwrap().unwrap().status, "applied");
+        // No photo is opened: the wait stays until its time is up.
+        let (pending, answer) = wait(commands::Until::Loaded(crate::catalog::PhotoId(1)), 30);
+        tx.send(Msg::Request(pending)).unwrap();
+        e.control_commands(&ctx);
+        assert!(answer.try_recv().is_err(), "answered before it held");
+        std::thread::sleep(Duration::from_millis(40));
+        e.control_commands(&ctx);
+        assert_eq!(answer.try_recv().unwrap().unwrap().status, "timed_out");
+    }
+    /// A photo that could not be opened ends a wait for it: it will not load,
+    /// and the state says it isn't loaded.
+    #[test]
+    fn a_wait_for_a_photo_that_failed_to_open_is_answered() {
+        use std::time::Duration;
+        let ctx = egui::Context::default();
+        let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
+        let (tx, rx) = mpsc::sync_channel(4);
+        e.controls = Hub::new(Settings::default(), rx);
+        e.module = Module::Develop;
+        let photo = crate::catalog::PhotoId(1);
+        e.document.reset(Some(photo));
+        let (load, _) = e.load.start();
+        let (pending, answer) = socket::test_request(vec![Msg::Command(Command::new(
+            commands::Operation::Wait(commands::Until::Loaded(photo), Duration::from_secs(30)),
+        ))]);
+        tx.send(Msg::Request(pending)).unwrap();
+        e.control_commands(&ctx);
+        assert!(answer.try_recv().is_err(), "answered while loading");
+        e.tx.send(crate::app::worker::Event::Failed {
+            id: load,
+            task: crate::app::worker::TaskKind::Load,
+            error: "Could not read the AVIF file".into(),
+        })
+        .unwrap();
+        e.events(&ctx);
+        e.control_commands(&ctx);
+        let reply = answer.try_recv().expect("answered").unwrap();
+        assert_eq!(reply.status, "applied");
+        // The state says which photo failed, so a client stops waiting.
+        assert_eq!(reply.state.open_failed, Some(photo));
+        assert!(!reply.state.loaded);
+        // The reason stays the failure's when the status line moves on.
+        e.status = "Previews built".into();
+        assert_eq!(
+            e.command_state().open_error.as_deref(),
+            Some("Could not read the AVIF file")
+        );
+        e.document.reset(Some(photo));
+        e.load.start();
+        assert_eq!(e.command_state().open_failed, None);
+        assert_eq!(e.command_state().open_error, None);
     }
 }
 
@@ -450,7 +612,7 @@ fn migration_preserves_legacy_overrides_and_custom_devices_are_empty() {
     assert!(!settings.devices[0].mapping.dials.contains_key(&33));
     assert_eq!(
         settings.devices[0].mapping.dials.get(&41),
-        Some(&Param::Texture)
+        Some(&Param::Setting(ParameterId::Texture))
     );
     assert!(!settings.devices[0].mapping.buttons.contains_key(&95));
     let id = settings.add(Profile::Custom);
@@ -458,7 +620,10 @@ fn migration_preserves_legacy_overrides_and_custom_devices_are_empty() {
     assert!(custom.mapping.dials.is_empty() && custom.mapping.buttons.is_empty());
     assert!(custom.port.is_empty());
     custom.port = "Other device".into();
-    custom.mapping.dials.insert(11, Param::Exposure);
+    custom
+        .mapping
+        .dials
+        .insert(11, Param::Setting(ParameterId::Exposure));
     custom.mapping.encoders.insert(11, Encoder::Offset);
     let restored = Settings::from_json(&settings.to_json()).unwrap();
     assert_eq!(restored.devices, settings.devices);
@@ -511,7 +676,10 @@ fn control_formats_and_midi_channels_are_explicit() {
         Some(Msg::Cc(12, 127))
     ));
     let mut binding = DeviceConfig::new(1, Profile::Custom);
-    binding.mapping.dials.insert(12, Param::Exposure);
+    binding
+        .mapping
+        .dials
+        .insert(12, Param::Setting(ParameterId::Exposure));
     let mut device = Device::new(binding);
     assert!(matches!(
         device
@@ -519,7 +687,7 @@ fn control_formats_and_midi_channels_are_explicit() {
             .unwrap()
             .unwrap()
             .operation,
-        commands::Operation::ControlValue(Param::Exposure, 127)
+        commands::Operation::ControlValue(Param::Setting(ParameterId::Exposure), 127)
     ));
     device.binding.mapping.encoders.insert(12, Encoder::Offset);
     assert!(matches!(
@@ -528,14 +696,14 @@ fn control_formats_and_midi_channels_are_explicit() {
             .unwrap()
             .unwrap()
             .operation,
-        commands::Operation::Adjust(Param::Exposure, -1)
+        commands::Operation::Adjust(Param::Setting(ParameterId::Exposure), -1)
     ));
 }
 
 #[test]
 fn editing_one_device_preserves_others_and_removed_input_is_ignored() {
     let ctx = egui::Context::default();
-    let mut e = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+    let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
     let (_, rx) = mpsc::sync_channel(8);
     e.controls = Hub::new(
         Settings {
@@ -558,7 +726,10 @@ fn editing_one_device_preserves_others_and_removed_input_is_ignored() {
     assert!(!e.controls.legacy.held.shift);
     let unaffected = e.controls.devices[1].identity;
     let mut updated = e.controls.settings.clone();
-    updated.devices[0].mapping.dials.insert(41, Param::Texture);
+    updated.devices[0]
+        .mapping
+        .dials
+        .insert(41, Param::Setting(ParameterId::Texture));
     e.controls.apply(updated.clone());
     assert_eq!(e.controls.devices[1].identity, unaffected);
     assert!(!e.controls.devices[0].held.shift);

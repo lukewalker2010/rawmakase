@@ -7,25 +7,28 @@ use super::preferences::{gap, group, hint};
 use super::theme;
 use super::widgets::{confirm_modal, form_row, pretty_path};
 use super::worker::Event;
-use crate::catalog::{Ambiguity, Catalog, Choice, Conflict, Override, Overrides, RootLocations};
+use crate::catalog::{
+    Ambiguity, Catalog, CatalogLocation, Choice, Conflict, FolderId, Override, Overrides, RootId,
+    RootLocations,
+};
 use eframe::egui;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// A question only the user can answer before a folder change is made.
-pub enum FolderQuestion {
+pub(crate) enum FolderQuestion {
     /// A root moves while folders below it have their own locations here.
     Overrides {
-        catalog: PathBuf,
-        root: i64,
+        catalog: CatalogLocation,
+        root: RootId,
         path: PathBuf,
         overrides: Vec<Override>,
     },
     /// Folders found on disk that equally close locations claim; asked one
     /// at a time, then added with every choice.
     Ambiguous {
-        catalog: PathBuf,
+        catalog: CatalogLocation,
         folder: PathBuf,
         open: Vec<Ambiguity>,
         chosen: Vec<Choice>,
@@ -34,7 +37,7 @@ pub enum FolderQuestion {
 /// What a folder change does once settled.
 enum FolderJob {
     Relink {
-        root: i64,
+        root: RootId,
         path: PathBuf,
         overrides: Overrides,
     },
@@ -43,7 +46,7 @@ enum FolderJob {
         choices: Vec<Choice>,
     },
     Clear {
-        root: i64,
+        root: RootId,
         relative: String,
     },
 }
@@ -53,7 +56,7 @@ enum FolderJob {
 pub(super) struct LocationsView {
     roots: Vec<RootLocations>,
     /// Folder ids by root and logical path, for Change….
-    folders: HashMap<(i64, String), i64>,
+    folders: HashMap<(RootId, String), FolderId>,
     /// This computer's name, as typed.
     computer: String,
     /// Typed and not saved yet: saved when the field or the page is left.
@@ -110,6 +113,7 @@ impl LocationsView {
 impl Editor {
     /// The Folder locations block of Preferences › Catalog.
     pub(super) fn folder_locations_block(&mut self, ui: &mut egui::Ui) {
+        let palette = theme::palette(ui.ctx());
         let ctx = ui.ctx().clone();
         let Some(library) = &self.library else {
             return;
@@ -117,7 +121,7 @@ impl Editor {
         let view = self
             .preferences
             .locations
-            .get_or_insert_with(|| LocationsView::load(&library.catalog, &ctx));
+            .get_or_insert_with(|| LocationsView::load(&library.session.catalog, &ctx));
         group(ui, "Folder locations");
         if let Some(error) = &view.error {
             form_row(ui, "", |ui| hint(ui, error));
@@ -138,13 +142,13 @@ impl Editor {
         });
         let found = view.found.lock().unwrap().clone();
         let status = |path: &Path| match found.get(path) {
-            Some(true) => ("Found", theme::gray(150)),
+            Some(true) => ("Found", palette.gray(150)),
             Some(false) => ("Offline", egui::Color32::from_rgb(222, 150, 90)),
-            None => ("Checking…", theme::gray(120)),
+            None => ("Checking…", palette.gray(120)),
         };
         enum Click {
             Change(FolderAction),
-            Clear(i64, String),
+            Clear(RootId, String),
         }
         let mut click = None;
         for root in &view.roots {
@@ -154,7 +158,7 @@ impl Editor {
                 .unwrap_or_else(|| root.original.clone());
             ui.add_space(6.);
             egui::Frame::new()
-                .fill(theme::gray(36))
+                .fill(palette.gray(36))
                 .corner_radius(6.)
                 .inner_margin(egui::Margin::symmetric(12, 8))
                 .show(ui, |ui| {
@@ -221,7 +225,7 @@ impl Editor {
                                     pretty_path(path)
                                 ))
                                 .size(11.)
-                                .color(theme::gray(120)),
+                                .color(palette.gray(120)),
                             )
                             .truncate(),
                         );
@@ -251,17 +255,21 @@ impl Editor {
         if !std::mem::take(&mut view.computer_dirty) {
             return;
         }
-        if let Err(e) = library.catalog.rename_computer(&view.computer) {
+        if let Err(e) = library.session.catalog.rename_computer(&view.computer) {
             self.status = format!("Computer not renamed: {e:#}");
         }
     }
     /// Clears a location, then opens the catalog again as relinking does,
     /// so a photo open in Develop follows its new path.
-    fn clear_folder_location(&mut self, root: i64, relative: &str) {
+    fn clear_folder_location(&mut self, root: RootId, relative: &str) {
         if !self.ready_for_catalog() {
             return;
         }
-        let Some(catalog) = self.library.as_ref().map(|l| l.catalog.path.clone()) else {
+        let Some(catalog) = self
+            .library
+            .as_ref()
+            .map(|l| l.session.catalog.location().clone())
+        else {
             return;
         };
         let ctx = self.context.clone();
@@ -276,7 +284,7 @@ impl Editor {
     }
     /// Asks the pending folder question, then carries out the change.
     pub(super) fn folder_question_window(&mut self, ctx: &egui::Context) {
-        let Some(question) = &mut self.folder_question else {
+        let Some(super::Modal::FolderQuestion(question)) = &mut self.modal else {
             return;
         };
         match question {
@@ -316,7 +324,7 @@ impl Editor {
                     return;
                 };
                 let (catalog, root, path) = (catalog.clone(), *root, path.clone());
-                self.folder_question = None;
+                self.modal = None;
                 if let Some(overrides) = choice {
                     self.folder_job(
                         catalog,
@@ -338,7 +346,7 @@ impl Editor {
                 let Some(ambiguity) = open.first() else {
                     let (catalog, folder, choices) =
                         (catalog.clone(), folder.clone(), std::mem::take(chosen));
-                    self.folder_question = None;
+                    self.modal = None;
                     self.folder_job(catalog, FolderJob::Import { folder, choices }, ctx);
                     return;
                 };
@@ -395,58 +403,67 @@ impl Editor {
                             options: answered.options,
                         });
                     }
-                    None => self.folder_question = None,
+                    None => self.modal = None,
                 }
             }
         }
     }
     /// Carries out a settled folder change and opens the catalog again.
-    fn folder_job(&mut self, catalog: PathBuf, job: FolderJob, ctx: &egui::Context) {
-        if !self.activity.begin_dialog() {
+    fn folder_job(&mut self, catalog: CatalogLocation, job: FolderJob, ctx: &egui::Context) {
+        if !self.activity.begin_folder_change() {
             return;
         }
-        let tx = self.tx.clone();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let result = (|| -> anyhow::Result<_> {
-                let mut cat = Catalog::open(&catalog)?;
-                Ok(match job {
-                    FolderJob::Relink {
-                        root,
-                        path,
-                        overrides,
-                    } => {
-                        cat.relink_root_with(root, &path, overrides)?;
-                        (true, Default::default(), Vec::new())
+        // A panic ends the folder change as a failure does, so closing never waits
+        // for it.
+        let opened = ctx.clone();
+        super::task::spawn(
+            self.tx.clone(),
+            ctx.clone(),
+            move |tx| {
+                let event = match change_folders(&catalog, job) {
+                    Ok((relinked, report, conflicts)) => {
+                        reopened(&catalog, relinked, &report, &conflicts, &opened)
                     }
-                    FolderJob::Clear { root, relative } => {
-                        cat.clear_folder_location(root, &relative)?;
-                        (true, Default::default(), Vec::new())
-                    }
-                    FolderJob::Import { folder, choices } => {
-                        let added = cat.import_folder(
-                            &folder,
-                            &crate::catalog::MetadataDefaults::load(),
-                            &choices,
-                        )?;
-                        anyhow::ensure!(
-                            added.ambiguous.is_empty(),
-                            "The folders changed meanwhile; add the folder again"
-                        );
-                        (false, added.report, added.conflicts)
-                    }
-                })
-            })();
-            let event = match result {
-                Ok((relinked, report, conflicts)) => {
-                    reopened(&catalog, relinked, &report, &conflicts, &ctx)
-                }
-                Err(e) => Event::CatalogReady(Err(format!("{e:#}"))),
-            };
-            let _ = tx.send(event);
-            ctx.request_repaint();
-        });
+                    Err(e) => Event::CatalogReady(Err(format!("{e:#}"))),
+                };
+                let _ = tx.send(event);
+            },
+            |tx, message| {
+                let _ = tx.send(Event::CatalogReady(Err(message)));
+            },
+        );
     }
+}
+/// Makes a settled folder change in the catalog at `catalog`: whether it relinked a
+/// root, and what adding a folder found.
+fn change_folders(
+    catalog: &CatalogLocation,
+    job: FolderJob,
+) -> anyhow::Result<(bool, crate::catalog::SidecarReport, Vec<Conflict>)> {
+    let mut cat = Catalog::open(catalog)?;
+    Ok(match job {
+        FolderJob::Relink {
+            root,
+            path,
+            overrides,
+        } => {
+            cat.relink_root_with(root, &path, overrides)?;
+            (true, Default::default(), Vec::new())
+        }
+        FolderJob::Clear { root, relative } => {
+            cat.clear_folder_location(root, &relative)?;
+            (true, Default::default(), Vec::new())
+        }
+        FolderJob::Import { folder, choices } => {
+            let added =
+                cat.import_folder(&folder, &crate::catalog::MetadataDefaults::load(), &choices)?;
+            anyhow::ensure!(
+                added.ambiguous.is_empty(),
+                "The folders changed meanwhile; add the folder again"
+            );
+            (false, added.report, added.conflicts)
+        }
+    })
 }
 /// A button of a Folder locations entry.
 enum Button {
@@ -463,6 +480,7 @@ fn entry(
     status: (&str, egui::Color32),
     clearable: bool,
 ) -> Option<Button> {
+    let palette = theme::palette(ui.ctx());
     let mut clicked = None;
     // Buttons and status first, from the right, so a long name can't push
     // them out of the window; the name takes what is left.
@@ -486,7 +504,7 @@ fn entry(
                     egui::RichText::new(name)
                         .size(13.)
                         .strong()
-                        .color(theme::gray(230)),
+                        .color(palette.gray(230)),
                 )
                 .truncate(),
             );
@@ -496,32 +514,33 @@ fn entry(
         egui::Label::new(
             egui::RichText::new(pretty_path(path))
                 .size(12.)
-                .color(theme::gray(200)),
+                .color(palette.gray(200)),
         )
         .truncate(),
     )
     .on_hover_text(path.display().to_string());
-    ui.label(egui::RichText::new(note).size(11.).color(theme::gray(125)));
+    ui.label(egui::RichText::new(note).size(11.).color(palette.gray(125)));
     clicked
 }
-/// The catalog at `path` opened again after a folder change, with what the
-/// change found.
+/// The catalog at `location` opened again after a folder change, with what
+/// the change found.
 pub(super) fn reopened(
-    path: &Path,
+    location: &CatalogLocation,
     relinked: bool,
     report: &crate::catalog::SidecarReport,
     conflicts: &[Conflict],
     ctx: &egui::Context,
 ) -> Event {
     Event::CatalogReady(
-        crate::app::library::Library::load(path, ctx.clone())
+        crate::catalog_session::CatalogSession::open(location)
+            .map(|opened| crate::app::library::Library::new(opened, ctx.clone()))
             .map(|mut l| {
                 if relinked {
                     l.wait_for_availability();
                     let available = l.available_count();
                     l.message = format!(
                         "Folder location changed. {available} of {} photos are available.",
-                        l.photos.len()
+                        l.session.photos.len()
                     );
                     if available == 0 {
                         l.message.push_str(

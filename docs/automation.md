@@ -77,8 +77,19 @@ Device rating/flag buttons retain Shift and Photo > Auto Advance behavior; label
 buttons toggle their labels. Named `label:red` sets a label idempotently, while
 `toggle_label:red` toggles it explicitly.
 
+Panel actions hide or show the open module's panels, as the keyboard does:
+`panels:sides` (Tab), `panels:all` (Shift+Tab, with the filmstrip and status
+bar), and `panels:left`, `panels:right` and `panels:filmstrip` (F7, F8, F6).
+`panels:presets` folds or opens Develop's Presets and History panel, as its rail
+does. They need no photo. `state.panels` reports each panel of the open module as
+`shown` or `hidden`. A device button can also be set to `tab`, `shift+tab` or
+`f6`–`f8`.
+
 Dialog actions report that the action was applied, but require user interaction.
 `auto_running` and `treatment_pending` describe asynchronous editor work.
+`open_failed` names the photo Develop could not open (a cut-short or
+unreadable file), with the reason in `open_error`, which stays while `message`
+moves on; `open` and MCP `open_photo` stop waiting for it with that error.
 Prefer the explicit `export` command for unattended output.
 
 ## Guard the target
@@ -113,7 +124,7 @@ catalog queries and output-job polling remain available.
 `preview` and `export` capture the decoded photo, recipe and its generation and
 revision before starting a background job. Later UI edits do not change that
 output. Preview defaults to a 1600-pixel long edge; use `--max-edge` to choose a
-size. Export defaults to full size. Both accept JPEG and TIFF paths and use the
+size. Export defaults to full size. Both accept JPEG, TIFF and PNG paths and use the
 existing export pipeline. They never overwrite an existing file or change saved
 Export dialog settings.
 
@@ -128,7 +139,9 @@ The job result contains `job_id`, `status`, `path`, `generation`, `revision` and
 `progress`. Only `completed` confirms a published file; `failed` includes an
 error. Two output jobs may run concurrently. The latest 32 jobs are retained;
 IDs are scoped to the running app session. If a client stops waiting, the job
-continues and can be polled. Closing the app cancels its remaining jobs.
+continues and can be read with `job`. `wait` with `until: "job"` answers as soon as
+a job finishes, so a client need not poll. Closing the app cancels its remaining
+jobs.
 
 `save` waits for the current Develop edit to be saved to its catalog, or returns
 an error. Protected and uncataloged edits cannot report save success. Ordinary edit
@@ -169,13 +182,15 @@ use target guards for a sequence that must refer to the same edit.
 | `curve` | `channel`: `rgb`, `red`, `green` or `blue`; `points`: 2–32 normalized input/output pairs; optional `target` | Post-edit state |
 | `turn` | `param`, integer `ticks` (−1000…1000), optional `target` | Post-edit state; grouped gesture |
 | `action` | named `action`, optional `target` | Post-action state |
-| `open` | catalog `id` or `name` | `opened` identity; poll `loaded` |
+| `open` | catalog `id` or `name` | `opened` identity; `wait` for `loaded` |
 | `search` | `text` | Applied Library query |
 | `module` | `module`: `develop` or `library` | Post-action state |
 | `photo` | `step`: −1 or 1 | Selection change in Library; opened identity in Develop |
 | `save` | optional `target` | `saved: true` |
 | `preview`, `export` | absolute `path`, optional `max_edge`, optional `target` | Captured output job |
 | `job` | `job_id` | Output status |
+| `build_previews` | optional `kind`: `standard` (the default) or `one_to_one` | `queued` and `skipped` (offline or not RAW) counts for the selection, as the thumbnail menu's Build Standard-Sized Previews; state's `building_previews` (`done`, `total`) shows progress while they build |
+| `wait` | `until`: `loaded` with `photo_id`, or `job` with `job_id`; optional `timeout_ms` (1…5000, default 1000) | State once the photo is loaded (or replaced by another, or could not be opened) or the job finished, status `applied`; or at `timeout_ms`, status `timed_out` |
 | `cc` | integer `cc`, `value` (0…127) | Legacy device mapping |
 | `note` | integer `note` (0…127), `press`: `click`, `down`, `up` | Legacy device mapping |
 
@@ -201,7 +216,10 @@ different command ends that group. Auto tone and white-balance commands return
 Common error codes include `invalid_request`, `unsupported_protocol`,
 `unauthorized`, `busy`, `stale_target`, `target_required`, `no_document`,
 `not_ready`, `unsupported_parameter`, `not_editable`, `protected`, `save_failed`,
-`already_exists` and `unknown_job`.
+`already_exists` and `unknown_job`. `open` returns `not_editable` for a photo whose
+file is offline, or a JPEG, PNG or TIFF Develop can't edit (a CMYK JPEG, say);
+any other JPEG, PNG or TIFF opens as a RAW does. On a JPEG, PNG or TIFF,
+`temperature` and `tint` move its relative Temp and Tint (−100 to 100).
 
 The request limit is 64 KiB, the input queue is bounded and at most 16 socket
 clients are served concurrently. If a request has not started within three

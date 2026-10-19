@@ -4,7 +4,7 @@
 //! for DCP transforms, and [`develop`] for recipes and rendering. [`xmp`] translates
 //! Adobe settings; [`presets`] manages reusable native and XMP presets.
 //!
-//! [`storage`] owns session persistence and legacy sidecar import, [`catalog`] owns
+//! [`storage`] owns file identity and paths, [`catalog`] owns legacy sidecar import,
 //! the photo database, edits and Lightroom import, and [`export`] writes finished images.
 //! [`app`] composes these APIs into the desktop editor; [`comparison`] provides
 //! reference-image validation and [`platform`] isolates OS integration.
@@ -12,33 +12,45 @@
 //! The repository's `docs/code-map.md` maps implementation files and runtime flows,
 //! and `docs/architecture.md` records ownership rules. This library exists for the
 //! RAWmakase binary, its examples and its tests; it is not a stable public API.
+// The values a photo's edit is made of, built on their own (crates/rawmakase-model).
+// The catalog and which edit a photo develops with (crates/rawmakase-catalog).
+pub use rawmakase_catalog::{catalog, edits};
+// Rendering (crates/rawmakase-engine).
+pub use rawmakase_engine::develop;
+// Developing and writing exports, with their watermarks (crates/rawmakase-export).
+pub use rawmakase_export::{export, watermark};
+// RAW decoding, colour management, demosaicing, opening and decoding a photo
+// (crates/rawmakase-decode).
+pub use rawmakase_decode::{
+    color_management, decode_cache, decode_dump, fingerprint, half_check, photo, raw,
+};
+pub(crate) use rawmakase_decode::{decode, raster};
+// File formats and presets over the model (crates/rawmakase-interop).
+pub use rawmakase_interop::{exif, export_settings, jpeg, lr_develop, presets, raw_defaults, xmp};
+pub(crate) use rawmakase_model::time;
+pub use rawmakase_model::{
+    camera_data, camera_profiles, cameras, color, dng, ids, lens, metadata, model, optics,
+    rendered, storage, tiff, xml,
+};
 pub mod app;
-mod build_info;
-pub mod camera_profiles;
-pub mod cameras;
-pub mod catalog;
-pub mod color;
+pub(crate) mod catalog_session;
 pub mod comparison;
-pub mod decode_cache;
-pub mod demosaic;
-pub mod develop;
-pub mod dng;
-pub mod exif;
-pub mod export;
-mod jpeg;
-pub mod lens;
-pub mod lr_develop;
-pub mod metadata;
-pub mod optics;
-pub mod platform;
-pub mod presets;
-pub mod raw;
+pub(crate) mod edit_session;
+pub(crate) mod platform;
+/// For headless commands: whether a path's volume is mounted.
+pub use platform::volume::mounted as volume_mounted;
 #[cfg(feature = "telemetry")]
-pub mod stats;
-pub mod storage;
-mod tiff;
-pub mod time;
+pub(crate) mod stats;
 pub mod updates;
-pub mod watermark;
-pub mod xml;
-pub mod xmp;
+
+#[cfg(test)]
+mod tests {
+    /// Exports name the app's release, though the export crate has its own version.
+    #[test]
+    fn exports_name_this_release() {
+        assert_eq!(
+            rawmakase_export::build_info::SOFTWARE,
+            concat!("RAWmakase ", env!("CARGO_PKG_VERSION"))
+        );
+    }
+}

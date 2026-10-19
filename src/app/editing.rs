@@ -1,12 +1,13 @@
 //! A frame edits exactly one document generation, even when navigation happens mid-frame.
 use super::Editor;
-use crate::develop::Recipe;
+use crate::edit_session::FrameOutcome;
+use crate::model::recipe::Recipe;
 use eframe::egui;
 
 pub(super) struct EditFrame {
     pub(super) command_adjust: bool,
     generation: u64,
-    recipe: Recipe,
+    edit: crate::edit_session::Frame,
     modes: RenderModes,
     overlay: super::worker::Overlay,
     aspect: f32,
@@ -16,7 +17,7 @@ pub(super) struct EditFrame {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RenderModes {
     crop: bool,
-    clipping: crate::develop::ClipOverlay,
+    clipping: crate::rendered::ClipOverlay,
     compare: super::before_after::Compare,
     zoom: bool,
     /// The swatch Point Color's Visualize Range shows.
@@ -32,15 +33,23 @@ impl Editor {
             visualized: self.visualized_swatch(),
         }
     }
+    /// Starts `frame` again on the photo now open, when the frame so far opened
+    /// another (a shortcut or the filmstrip moved to the next photo): what is
+    /// drawn after edits the new photo, in a frame of its own. The old photo's
+    /// frame ends with its document.
+    pub(super) fn follow_edit_frame(&mut self, frame: &mut EditFrame) {
+        if frame.generation != self.load.id() {
+            *frame = self.begin_edit_frame();
+        }
+    }
     pub(super) fn begin_edit_frame(&mut self) -> EditFrame {
         self.sync_command_revision();
-        self.document.history.begin_frame();
         // Before the frame looks at it, so reading it changes no crop.
         self.read_aspect();
         let frame = EditFrame {
             command_adjust: false,
             generation: self.load.id(),
-            recipe: self.document.recipe.clone(),
+            edit: self.document.edit.begin(),
             modes: self.render_modes(),
             overlay: self.overlay(),
             aspect: self.view.aspect,
@@ -65,25 +74,25 @@ impl Editor {
                 .iter()
                 .any(|e| matches!(e, egui::Event::PointerButton { .. }))
         });
-        let edit = if self.document.recipe == frame.recipe && !clicked {
+        let edit = if *self.document.edit.recipe() == *frame.edit.before() && !clicked {
             super::brush_scroll::Edit::Unchanged
         } else {
             super::brush_scroll::Edit::Changed
         };
         if self.view.wheel.ends_before(edit) {
-            self.document.history.finish_gesture(&frame.recipe);
+            self.document.edit.finish_gesture_before(&frame.edit);
         }
         if self.automation.has_turn()
             && !frame.command_adjust
-            && (self.document.recipe != frame.recipe || clicked)
+            && (*self.document.edit.recipe() != *frame.edit.before() || clicked)
         {
             self.automation.end_turn();
-            self.document.history.finish_gesture(&frame.recipe);
+            self.document.edit.finish_gesture_before(&frame.edit);
         }
         if let Some((name, value)) = step {
             self.document
-                .history
-                .label(super::history::Step::new(name, value));
+                .edit
+                .name_next_step(super::history::Step::new(name, value));
         }
         self.leave_compare_for_tools();
         if frame.aspect != self.view.aspect {
@@ -92,7 +101,8 @@ impl Editor {
         // The Guided tool goes with the mode, however it was left: a reset, an undo, a
         // preset, with the Transform panel open or not.
         if self.view.is(super::state::Tool::Guided)
-            && self.document.recipe.upright.mode != crate::develop::UprightMode::Guided
+            && self.document.edit.recipe().upright.mode
+                != crate::model::transform::UprightMode::Guided
         {
             self.view.tool = super::state::Tool::None;
         }
@@ -111,7 +121,7 @@ impl Editor {
         }
         // A conversion waiting for the photo, once it is decoded and nothing else
         // changed this frame (any edit drops it below).
-        if self.document.recipe == frame.recipe {
+        if *self.document.edit.recipe() == *frame.edit.before() {
             self.finish_pending_treatment();
         }
         // A wheel scroll sizing a spot is a gesture like a drag: one step once it pauses.
@@ -119,46 +129,67 @@ impl Editor {
             ctx.request_repaint_after(left);
         }
         // A dial turned on a control surface is one too.
-        let gesture = ctx.input(|i| i.pointer.primary_down())
+        let held = ctx.input(|i| i.pointer.primary_down())
             || self.view.wheel.active()
             || self.automation.turning();
-        if !self.document.history.is_replaying() {
-            turn_on_edited_panels(&frame.recipe, &mut self.document.recipe);
-        }
-        let edited = self
-            .document
-            .history
-            .observe(frame.recipe, &self.document.recipe, gesture);
+        let gesture = if held {
+            crate::edit_session::Gesture::Held
+        } else {
+            crate::edit_session::Gesture::Released
+        };
+        let edited = self.document.edit.finish(frame.edit, gesture) == FrameOutcome::Edited;
         // Any change but the Amount's own ends the preset Amount, whether or not the
         // Presets panel is open.
         self.end_stale_preset_amount();
         if edited {
-            self.sync_command_revision();
-            self.document.save.mark_changed();
-            // A conversion waiting for the photo lapses with any other edit, Undo
-            // included.
-            self.document.pending_treatment = None;
+            self.edited();
         }
         if edited || frame.modes != self.render_modes() || frame.overlay != self.overlay() {
-            self.schedule();
+            if edited {
+                self.schedule_edit();
+            } else {
+                self.schedule();
+            }
         }
         if frame.export != (self.document.export.quality, self.document.export.max_edge) {
-            self.document.save.mark_changed();
+            self.document.edit.save_state_mut().mark_changed();
         }
     }
 }
 
-/// Turns a switched-off panel back on when this frame changed only its settings, as
-/// Lightroom does, so the change shows: a slider in it, or an edit applied later in
-/// the frame (B&W Auto, Clear Guides, the fringe picker).
-fn turn_on_edited_panels(before: &Recipe, after: &mut Recipe) {
-    use crate::develop::panels::{Panel, PanelState};
-    let edited = Panel::ALL.into_iter().find(|panel| {
-        before.panels.state(*panel) == PanelState::Off
-            && after.panels.state(*panel) == PanelState::Off
-            && panel.holds_change(before, after)
-    });
-    if let Some(panel) = edited {
-        after.panels.set(panel, PanelState::On);
+impl Editor {
+    /// Records an edit made outside an edit frame (a preset loaded from a file, a
+    /// result computed off the UI thread) as one History step, `step` or one named
+    /// for what changed, with what an edit frame does after a slider moves.
+    pub(super) fn commit_edit(&mut self, before: Recipe, step: Option<super::history::Step>) {
+        if self.document.edit.commit(before, step) {
+            self.edited();
+        }
+        self.end_stale_preset_amount();
+        self.schedule();
+    }
+    /// Changes the settings outside an edit frame (a result computed off the UI
+    /// thread, say) as one History step, `step` or one named for what changed, with
+    /// what an edit frame does after a slider moves. A change of nothing is no step.
+    pub(super) fn change_edit<T>(
+        &mut self,
+        step: Option<super::history::Step>,
+        edit: impl FnOnce(&mut Recipe) -> T,
+    ) -> T {
+        let before = self.document.edit.recipe().clone();
+        let out = self.document.edit.change(step, edit);
+        if *self.document.edit.recipe() != before {
+            self.edited();
+        }
+        self.end_stale_preset_amount();
+        self.schedule();
+        out
+    }
+    /// What any change to the photo's settings ends or advances, Undo included;
+    /// the edit session has marked it for saving.
+    fn edited(&mut self) {
+        self.sync_command_revision();
+        // A conversion waiting for the photo lapses with any other edit.
+        self.document.pending_treatment = None;
     }
 }

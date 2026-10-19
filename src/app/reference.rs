@@ -12,11 +12,12 @@ use super::Editor;
 use super::before_after::{Axis, Compare, Pane, Panes, badge};
 use super::navigator::Zoom;
 use super::worker::{ReferenceImage, ReferenceJob, Resolution};
-use crate::app::library::DraggedPhoto;
-use crate::app::theme;
+use crate::model::recipe::Recipe;
 use crate::{
-    develop::{Geometry, Recipe},
-    raw::CameraImage,
+    app::{library::DraggedPhoto, theme},
+    camera_data::CameraImage,
+    catalog::PhotoId,
+    develop::Geometry,
 };
 use eframe::egui::{self, Color32, Pos2, Rect, Vec2};
 use std::sync::Arc;
@@ -25,7 +26,7 @@ use std::sync::Arc;
 /// photo as last developed.
 pub(super) struct ReferenceView {
     /// The catalog photo shown as the reference.
-    pub(super) photo: Option<i64>,
+    pub(super) photo: Option<PhotoId>,
     /// Kept when leaving Develop, as Lightroom's lock in the toolbar.
     pub(super) locked: bool,
     /// Where the reference sits: left or on top. Shift+R shows the last one used.
@@ -35,7 +36,7 @@ pub(super) struct ReferenceView {
     /// The reference as developed, once it is.
     loaded: Option<Loaded>,
     /// The photo and edit being developed.
-    pending: Option<(i64, String)>,
+    pending: Option<(PhotoId, String)>,
     load: super::task::Task,
     /// Why the reference could not be shown.
     pub(super) error: Option<String>,
@@ -56,7 +57,7 @@ impl Default for ReferenceView {
 }
 /// The reference photo as developed.
 struct Loaded {
-    photo: i64,
+    photo: PhotoId,
     /// Its edit's tag then: another edit, or other defaults, develop it again.
     tag: String,
     image: Arc<CameraImage>,
@@ -69,6 +70,10 @@ pub(super) struct ReferenceSide {
 }
 
 impl ReferenceView {
+    /// Stops loading the reference photo.
+    pub(super) fn cancel_load(&mut self) {
+        self.load.invalidate();
+    }
     /// No reference: the side shows how to set one.
     fn clear(&mut self) {
         self.photo = None;
@@ -104,8 +109,11 @@ impl Editor {
     }
     /// Makes catalog photo `id` the reference and shows Reference View, as dropping
     /// it on the Reference side or Set as Reference Photo does.
-    pub(super) fn set_reference(&mut self, id: i64) {
-        let source = self.library.as_ref().and_then(|l| l.develop_source(id));
+    pub(super) fn set_reference(&mut self, id: PhotoId) {
+        let source = self
+            .library
+            .as_ref()
+            .and_then(|l| l.develop_source(id, self.demosaic));
         let Some(source) = source else {
             return;
         };
@@ -138,7 +146,10 @@ impl Editor {
             }
             return;
         }
-        let source = self.library.as_ref().and_then(|l| l.develop_source(id));
+        let source = self
+            .library
+            .as_ref()
+            .and_then(|l| l.develop_source(id, self.demosaic));
         let source = match source {
             // No longer in the catalog, e.g. a virtual copy removed.
             None => return self.clear_reference(),
@@ -167,7 +178,7 @@ impl Editor {
             path: source.path,
             edit: source.edit,
             cancel,
-            demosaic: crate::raw::demosaic(),
+            demosaic: self.demosaic,
         });
     }
     /// Develops the reference photo again even when its edit and file are as they
@@ -228,7 +239,7 @@ impl Editor {
         {
             return Some(ReferenceSide {
                 image: image.clone(),
-                recipe: self.document.recipe.clone(),
+                recipe: self.document.edit.recipe().clone(),
             });
         }
         let loaded = self.reference.loaded.as_ref().filter(|l| l.photo == id)?;
@@ -265,6 +276,7 @@ impl Editor {
         panes: &Panes,
         pane: Pane,
     ) -> Option<Rect> {
+        let palette = theme::palette(ui.ctx());
         badge(ui, panes.after.clip, "Active");
         let rect = self.reference_rect(ui, pane);
         match (rect, self.reference.photo) {
@@ -277,7 +289,7 @@ impl Editor {
                     egui::Align2::CENTER_CENTER,
                     text,
                     egui::FontId::proportional(13.),
-                    theme::gray(150),
+                    palette.gray(150),
                 );
             }
         }
@@ -287,7 +299,7 @@ impl Editor {
                 egui::Align2::CENTER_CENTER,
                 error,
                 egui::FontId::proportional(12.),
-                theme::gray(170),
+                palette.gray(170),
             );
         }
         badge(ui, pane.clip, "Reference");
@@ -303,7 +315,7 @@ impl Editor {
         Some((self.reference.zoom.photo_rect(pane.area, size, ppp), g))
     }
     /// The reference's Library preview, fitted, while it is developed.
-    fn reference_stand_in(&self, ui: &egui::Ui, pane: Pane, id: i64) {
+    fn reference_stand_in(&self, ui: &egui::Ui, pane: Pane, id: PhotoId) {
         let texture = self.library.as_ref().and_then(|l| l.thumbnail(id));
         if let Some(texture) = texture {
             let size = texture.size_vec2();
@@ -316,7 +328,7 @@ impl Editor {
         }
         if self.reference.loading() {
             let at = Rect::from_center_size(pane.clip.center(), Vec2::splat(18.));
-            egui::Spinner::new().size(18.).paint_at(ui, at);
+            super::widgets::paint_spinner(ui, at, None);
         }
     }
     /// Clicks, drags and drops on the Reference side: a click zooms the reference
@@ -342,7 +354,7 @@ impl Editor {
             ui.painter().rect_stroke(
                 pane.clip.shrink(2.),
                 0.,
-                egui::Stroke::new(2., theme::accent()),
+                egui::Stroke::new(2., theme::palette(ui.ctx()).accent()),
                 egui::StrokeKind::Inside,
             );
         }
@@ -391,8 +403,8 @@ mod tests {
     struct Fixture {
         _dir: tempfile::TempDir,
         editor: Editor,
-        open: i64,
-        other: i64,
+        open: PhotoId,
+        other: PhotoId,
     }
     fn fixture() -> anyhow::Result<Fixture> {
         let dir = tempfile::tempdir()?;
@@ -408,9 +420,10 @@ mod tests {
         c.add_folder(&photos)?;
         drop(c);
         let ctx = egui::Context::default();
-        let library = crate::app::library::Library::load(&catalog, ctx.clone())?;
+        let mut library = crate::app::library::Library::load(&catalog, ctx.clone())?;
         let id = |name: &str| {
             library
+                .session
                 .photos
                 .iter()
                 .find(|p| p.filename == name)
@@ -422,14 +435,15 @@ mod tests {
             exposure: 1.5,
             ..Default::default()
         };
-        library.catalog.save_edit(
+        library.session.catalog.save_edit(
             other,
             &photos.join("b.dng"),
             &edit,
             &Default::default(),
             crate::catalog::HistoryUpdate::Keep,
         )?;
-        let mut editor = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+        let mut editor =
+            Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
         editor.library = Some(Box::new(library));
         editor.document.catalog_photo = Some(open);
         editor.document.path = Some(photos.join("a.dng"));
@@ -475,7 +489,7 @@ mod tests {
         let side = editor.reference_side().unwrap();
         assert_eq!(side.recipe.exposure, 1.5);
         // Editing changes the Active photo, never the reference.
-        editor.document.recipe.exposure = -0.5;
+        editor.document.edit.setup_mut().exposure = -0.5;
         assert_eq!(editor.reference_side().unwrap().recipe.exposure, 1.5);
         // The reference renders in Before's lane, from its own photo.
         editor.schedule_before();
@@ -486,18 +500,18 @@ mod tests {
         editor.document.set_image(image);
         editor.load_reference();
         assert!(!editor.reference.loading());
-        editor.document.recipe.exposure = 0.25;
+        editor.document.edit.setup_mut().exposure = 0.25;
         assert_eq!(editor.reference_side().unwrap().recipe.exposure, 0.25);
         editor.document.reset(Some(open));
         assert_eq!(editor.reference_side().unwrap().recipe.exposure, 1.5);
         // An edit saved to it since develops it again.
-        let library = editor.library.as_ref().unwrap();
+        let library = editor.library.as_mut().unwrap();
         let path = library.photo(other).unwrap().path.clone();
         let edit = Recipe {
             exposure: -1.,
             ..Default::default()
         };
-        library.catalog.save_edit(
+        library.session.catalog.save_edit(
             other,
             &path,
             &edit,
@@ -551,8 +565,8 @@ mod tests {
         editor.document.reset(Some(other));
         editor.set_reference(open);
         wait_for_reference(editor);
-        editor.set_raw_defaults(crate::develop::defaults::RawDefaults {
-            master: crate::develop::defaults::DefaultChoice::Rawmakase,
+        editor.set_raw_defaults(crate::raw_defaults::RawDefaults {
+            master: crate::raw_defaults::DefaultChoice::Rawmakase,
             ..Default::default()
         })?;
         assert!(editor.reference.loading());
@@ -596,7 +610,8 @@ mod tests {
             .library
             .as_mut()
             .unwrap()
-            .create_virtual_copy(other)?;
+            .create_virtual_copy(other)?
+            .value;
         editor.set_reference(copy);
         wait_for_reference(editor);
         editor.remove_virtual_copy(copy);
@@ -709,7 +724,7 @@ mod tests {
     #[test]
     fn shift_r_shows_reference_view_and_r_still_crops() {
         let ctx = egui::Context::default();
-        let mut e = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+        let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
         let press = |modifiers: egui::Modifiers, e: &mut Editor| {
             let key = |pressed| egui::Event::Key {
                 key: egui::Key::R,

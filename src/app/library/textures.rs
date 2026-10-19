@@ -3,12 +3,17 @@
 //! bounded; requests go to the workers in `previews`, and results are
 //! matched to the latest request so a late or stale render never shows.
 use super::previews::{self, EditJob, EditResult, EditSource, PreviewResult, Progress, Wanted};
-use crate::catalog::Photo;
+use crate::catalog::{Photo, PhotoId};
 use eframe::egui;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
-    sync::mpsc::{Receiver, Sender, SyncSender},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender, SyncSender},
+    },
+    thread::JoinHandle,
 };
 
 /// Textures kept per cache; older ones are dropped first.
@@ -27,29 +32,42 @@ pub(super) struct PreviewTextures {
     pub(super) edit_rx: Receiver<EditResult>,
     /// Photos with an edited preview requested, by the ticket of the latest
     /// request; results of earlier requests are dropped.
-    pub(super) edited_requested: HashMap<i64, u64>,
+    pub(super) edited_requested: HashMap<PhotoId, u64>,
     next_ticket: u64,
     /// Photos asking for an edited preview this frame, and last frame's
     /// as the worker sees them.
-    pub(super) edit_seen: HashSet<i64>,
+    pub(super) edit_seen: HashSet<PhotoId>,
     edit_wanted: Wanted,
     /// Edited previews queued and not yet back.
     pub(super) edits_pending: usize,
     /// Previews showing each photo's edit, by photo.
-    pub(super) edited: HashMap<i64, egui::TextureHandle>,
-    pub(super) edited_order: VecDeque<i64>,
+    pub(super) edited: HashMap<PhotoId, egui::TextureHandle>,
+    pub(super) edited_order: VecDeque<PhotoId>,
     pub(super) progress: Progress,
     /// Photos one view shows at once, e.g. a large survey; never fewer
     /// textures are kept, so none is dropped while it is shown.
     pub(super) shown_at_once: usize,
+    /// Cancels the edited preview being rendered, and ends its worker.
+    edit_closed: Arc<AtomicBool>,
+    /// The two workers, to wait for at exit.
+    threads: [Option<JoinHandle<()>>; 2],
+}
+/// A library replaced by another catalog cancels its edited preview too; its
+/// workers end once their channels are dropped with it.
+impl Drop for PreviewTextures {
+    fn drop(&mut self) {
+        self.edit_closed.store(true, Ordering::Relaxed);
+    }
 }
 impl PreviewTextures {
     /// Starts both preview workers on the shared disk cache.
     pub(super) fn new(ctx: &egui::Context) -> Self {
         let cache = crate::catalog::preview_cache::PreviewCache::path();
-        let (thumb_tx, thumb_rx) = previews::spawn(cache.clone(), ctx.clone());
+        let (thumb_tx, thumb_rx, thumbs) = previews::spawn(cache.clone(), ctx.clone());
         let edit_wanted = Wanted::default();
-        let (edit_tx, edit_rx) = previews::spawn_edited(cache, edit_wanted.clone(), ctx.clone());
+        let edit_closed = Arc::<AtomicBool>::default();
+        let (edit_tx, edit_rx, edits) =
+            previews::spawn_edited(cache, edit_wanted.clone(), edit_closed.clone(), ctx.clone());
         Self {
             thumbs: HashMap::new(),
             thumb_order: VecDeque::new(),
@@ -68,7 +86,21 @@ impl PreviewTextures {
             edited_order: VecDeque::new(),
             progress: Progress::default(),
             shown_at_once: 0,
+            edit_closed,
+            threads: [Some(thumbs), Some(edits)],
         }
+    }
+    /// Cancels the edited preview being rendered and drops both workers' channels,
+    /// so neither waits for the grid; the workers are then waited for at exit.
+    pub(super) fn close(&mut self) -> [crate::app::task::Stopping; 2] {
+        self.edit_closed.store(true, Ordering::Relaxed);
+        self.thumb_tx = mpsc::sync_channel(0).0;
+        self.thumb_rx = mpsc::sync_channel(0).1;
+        self.edit_tx = mpsc::channel().0;
+        self.edit_rx = mpsc::channel().1;
+        self.threads
+            .each_mut()
+            .map(|thread| crate::app::task::Stopping::new(thread.take()))
     }
     /// Takes every finished preview. Drain in every workspace so the bounded
     /// worker never waits for the grid.
@@ -130,7 +162,7 @@ impl PreviewTextures {
         self.thumbs
             .insert(path.clone(), texture(ctx, path.display().to_string(), im));
     }
-    pub(super) fn insert_edited(&mut self, ctx: &egui::Context, id: i64, im: &image::RgbImage) {
+    pub(super) fn insert_edited(&mut self, ctx: &egui::Context, id: PhotoId, im: &image::RgbImage) {
         if !self.edited.contains_key(&id) {
             while self.edited.len() >= KEPT.max(self.shown_at_once) {
                 let Some(old) = self.edited_order.pop_front() else {
@@ -144,13 +176,17 @@ impl PreviewTextures {
         self.edited
             .insert(id, texture(ctx, format!("edited-{id}"), im));
     }
+    /// The ticket of the photo's latest edited preview request, if any.
+    pub(super) fn edited_ticket(&self, id: PhotoId) -> Option<u64> {
+        self.edited_requested.get(&id).copied()
+    }
     fn ticket(&mut self) -> u64 {
         self.next_ticket += 1;
         self.next_ticket
     }
     /// Forgets a removed photo's previews, so a later photo given its id
     /// starts afresh.
-    pub(super) fn forget(&mut self, id: i64) {
+    pub(super) fn forget(&mut self, id: PhotoId) {
         self.edited.remove(&id);
         self.edited_order.retain(|other| *other != id);
         self.edited_requested.remove(&id);
@@ -163,11 +199,11 @@ impl PreviewTextures {
             .or_else(|| self.thumbs.get(&photo.path))
     }
     /// Photos whose thumbnail shows an edit.
-    pub(super) fn edited_ids(&self) -> impl Iterator<Item = i64> + '_ {
+    pub(super) fn edited_ids(&self) -> impl Iterator<Item = PhotoId> + '_ {
         self.edited.keys().copied()
     }
     /// Whether the photo's thumbnail already shows its edit (crop included).
-    pub(super) fn has_edited(&self, id: i64) -> bool {
+    pub(super) fn has_edited(&self, id: PhotoId) -> bool {
         self.edited.contains_key(&id)
     }
     /// Queues the previews a shown photo needs: the embedded one until its
@@ -227,7 +263,7 @@ impl PreviewTextures {
     pub(super) fn store_edited(
         &mut self,
         ctx: &egui::Context,
-        id: i64,
+        id: PhotoId,
         path: PathBuf,
         image: image::RgbImage,
         recipe_json: String,

@@ -3,14 +3,14 @@
 //! transaction and is handed to the shared undo log once saved.
 use super::{Library, Place};
 use crate::app::photo_metadata::Edit;
-use crate::catalog::Photo;
+use crate::catalog::{Photo, PhotoId};
 use anyhow::Result;
 
 /// Rating, flag and label of a photo.
-pub type Metadata = (i64, i32, i32, String);
+pub(crate) type Metadata = (PhotoId, i32, i32, String);
 /// A metadata change made through the Library, for the shared undo log.
 #[derive(Clone, Debug, PartialEq)]
-pub struct MetadataCommand {
+pub(crate) struct MetadataCommand {
     /// Orders it among Develop steps made in the same frame.
     pub sequence: u64,
     pub before: Vec<Metadata>,
@@ -24,12 +24,17 @@ pub struct MetadataCommand {
 impl Library {
     /// Sets the rating, flag or label of one photo, as Develop and the
     /// filmstrip do; see `edit_photos`.
-    pub fn edit_metadata(&mut self, id: i64, edit: Edit, advance: bool) -> Result<Option<i64>> {
+    pub(crate) fn edit_metadata(
+        &mut self,
+        id: PhotoId,
+        edit: Edit,
+        advance: bool,
+    ) -> Result<Option<PhotoId>> {
         self.edit_photos(&[id], edit, advance)
     }
     /// A metadata key in the Grid: Lightroom applies it to every selected
     /// photo.
-    pub fn edit_selection(&mut self, edit: Edit, advance: bool) -> Result<Option<i64>> {
+    pub(crate) fn edit_selection(&mut self, edit: Edit, advance: bool) -> Result<Option<PhotoId>> {
         self.edit_photos(&self.selected_ids(), edit, advance)
     }
     /// Sets the rating, flag or label of `ids` in one transaction. A toggle
@@ -37,12 +42,12 @@ impl Library {
     /// With `advance` (Shift), a single photo is followed by the next one
     /// shown, which is returned. A photo the filter now hides leaves the
     /// selection; when the active one goes, the next one shown is selected.
-    pub(super) fn edit_photos(
+    pub(in crate::app) fn edit_photos(
         &mut self,
-        ids: &[i64],
+        ids: &[PhotoId],
         edit: Edit,
         advance: bool,
-    ) -> Result<Option<i64>> {
+    ) -> Result<Option<PhotoId>> {
         let Some(&first) = ids.first() else {
             return Ok(None);
         };
@@ -67,11 +72,14 @@ impl Library {
         // Only a change to the active photo moves the selection: one made to
         // another (a filmstrip menu) leaves the photo shown where it is.
         let was_active = self.selection.active == Some(lead);
-        let position = self.visible.iter().position(|i| self.photos[*i].id == lead);
+        let position = self
+            .visible
+            .iter()
+            .position(|i| self.session.photos[*i].id == lead);
         let following: Vec<_> = position.map_or_else(Vec::new, |at| {
             self.visible[at + 1..]
                 .iter()
-                .map(|i| self.photos[*i].id)
+                .map(|i| self.session.photos[*i].id)
                 .filter(|id| !ids.contains(id))
                 .collect()
         });
@@ -92,17 +100,22 @@ impl Library {
         if self.filters.sort != super::sort::Sort::CaptureTime {
             self.scroll_to_active = true;
         }
-        let next = following
-            .into_iter()
-            .find(|next| self.visible.iter().any(|i| self.photos[*i].id == *next));
-        let still_visible = self.visible.iter().any(|i| self.photos[*i].id == lead);
+        let next = following.into_iter().find(|next| {
+            self.visible
+                .iter()
+                .any(|i| self.session.photos[*i].id == *next)
+        });
+        let still_visible = self
+            .visible
+            .iter()
+            .any(|i| self.session.photos[*i].id == lead);
         let advance = advance && changes.len() == 1;
         if was_active && (advance || !still_visible) {
             let to = next.or_else(|| {
                 if still_visible {
                     Some(lead)
                 } else {
-                    self.visible.last().map(|i| self.photos[*i].id)
+                    self.visible.last().map(|i| self.session.photos[*i].id)
                 }
             });
             // Photos still selected and shown stay selected.
@@ -118,7 +131,7 @@ impl Library {
             return Ok(if advance { next } else { None });
         }
         self.done.push(MetadataCommand {
-            sequence: crate::app::undo::sequence(),
+            sequence: crate::edit_session::sequence(),
             before,
             after: changes,
             place_before,
@@ -146,15 +159,7 @@ impl Library {
     }
     /// Sets rating, flag and label in the catalog, then as shown.
     fn write_ratings(&mut self, values: &[Metadata]) -> Result<()> {
-        self.catalog.set_metadata_of(values)?;
-        for (id, rating, flag, label) in values {
-            if let Some(p) = self.photos.iter_mut().find(|p| p.id == *id) {
-                p.rating = *rating;
-                p.flag = *flag;
-                p.label = label.clone();
-            }
-        }
-        Ok(())
+        self.session.set_ratings(values)
     }
 }
 /// Rating, flag and label of each photo given.

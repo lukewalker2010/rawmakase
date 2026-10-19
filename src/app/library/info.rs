@@ -3,14 +3,19 @@ use super::rows::{ROW, caption_at, paint_truncated, value_at};
 use super::{Action, Library};
 use crate::app::theme;
 use crate::app::widgets::section;
-use crate::catalog::Photo;
+use crate::catalog::{Photo, PhotoId};
 use crate::metadata::PhotoInfo;
 use eframe::egui::{self, Vec2};
 
 impl Library {
-    /// Right panel: the selected photo's rating, flag, label and file details.
-    /// The layout is identical with or without a selection, so nothing moves.
-    pub fn info_panel(&mut self, ui: &mut egui::Ui) -> Action {
+    /// Right panel: the selected photo's rating, flag, label and file details,
+    /// under `top` (the Navigator, while it scrolls with them). The layout is
+    /// identical with or without a selection, so nothing moves.
+    pub(crate) fn info_panel(
+        &mut self,
+        ui: &mut egui::Ui,
+        top: impl FnOnce(&mut egui::Ui),
+    ) -> Action {
         let mut action = Action::None;
         ui.spacing_mut().item_spacing.y = 0.;
         let photo = self.selected().and_then(|id| self.photo(id)).cloned();
@@ -19,10 +24,9 @@ impl Library {
             .id_salt("library-info")
             .auto_shrink(false)
             .show(ui, |ui| {
+                top(ui);
                 section(ui, "Quick Develop", false, |ui| {
-                    let refusal = photo
-                        .as_ref()
-                        .and_then(|p| super::develop_refusal(p, self.is_available(&p.path)));
+                    let refusal = photo.as_ref().and_then(|p| self.shown_refusal(p));
                     let open = ui
                         .add_enabled(
                             photo.is_some() && refusal.is_none(),
@@ -47,8 +51,8 @@ impl Library {
                         Some(super::Refusal::Offline) => {
                             "Offline: relink its folder to edit".into()
                         }
-                        Some(super::Refusal::NotRaw(format)) => {
-                            format!("{format} files can't be edited in Develop")
+                        Some(super::Refusal::Unsupported { reason, .. }) => {
+                            format!("{reason} images can't be edited in Develop")
                         }
                         None if photo.as_ref().is_some_and(|p| p.has_lightroom_edits) => {
                             "Has Lightroom edits".into()
@@ -83,15 +87,11 @@ impl Library {
                     let text = |f: fn(&PhotoInfo) -> Option<String>| f(&info).unwrap_or_default();
                     metadata_row(ui, "File Name", &field(|p| &p.filename));
                     match photo.as_ref().filter(|p| p.master.is_some()) {
-                        Some(p) => {
-                            match self.copy_names.row(ui, p, &self.catalog, &mut self.photos) {
-                                Ok(true) => self.filter(),
-                                Ok(false) => {}
-                                Err(e) => {
-                                    self.message = format!("Copy name could not be saved: {e}")
-                                }
-                            }
-                        }
+                        Some(p) => match self.copy_names.row(ui, p, &mut self.session) {
+                            Ok(true) => self.filter(),
+                            Ok(false) => {}
+                            Err(e) => self.message = format!("Copy name could not be saved: {e}"),
+                        },
                         None => {
                             metadata_row(ui, "Copy Name", "");
                         }
@@ -132,7 +132,12 @@ impl Library {
     }
     /// Rating, flag and label of `id`; a change applies to the whole
     /// selection when `whole_selection` (the Grid) and `id` is in it.
-    pub fn metadata_controls(&mut self, ui: &mut egui::Ui, id: i64, whole_selection: bool) -> bool {
+    pub(crate) fn metadata_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: PhotoId,
+        whole_selection: bool,
+    ) -> bool {
         if let Some(photo) = self.photo(id).cloned()
             && let Some(edit) = crate::app::photo_metadata::controls(ui, &photo, &self.labels())
         {
@@ -174,5 +179,11 @@ fn metadata_row(ui: &mut egui::Ui, key: &str, value: &str) -> egui::Response {
 fn info_text(ui: &mut egui::Ui, text: &str) {
     let (rect, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 18.), egui::Sense::hover());
-    paint_truncated(ui, rect.left_center(), rect.width(), text, theme::gray(150));
+    paint_truncated(
+        ui,
+        rect.left_center(),
+        rect.width(),
+        text,
+        theme::palette(ui.ctx()).gray(150),
+    );
 }

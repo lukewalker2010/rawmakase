@@ -1,15 +1,17 @@
 # Demosaicing
 
-By default RAWmakase demosaics full-size images itself (`src/demosaic.rs`). LibRaw only unpacks the sensor data (`ora_cfa_open` / `ora_cfa_copy` in `native/raw.cpp`), and still provides metadata, white balance, crops and previews. Black levels (including per-position patterns), white level and camera white balance are applied in RAWmakase. The colour pattern comes from LibRaw's `COLOR()` as a 48×48 tile, which covers Bayer and X-Trans periods.
+RAWmakase demosaics images itself (`crates/rawmakase-decode/src/demosaic.rs`) from the sensor data its own decoders unpack (`crates/rawmakase-raw`, see [RAW decoding](raw-decoding.md)). Black levels (including per-position patterns), white level and camera white balance are applied in RAWmakase. The colour pattern is the decoder's filter as a 48×48 tile, which covers Bayer and X-Trans periods.
 
-The algorithm uses the same two passes for both sensor types:
+Bayer uses two passes:
 
-1. **Green** at red and blue sites. On Bayer it blends Hamilton–Adams horizontal and vertical estimates by inverse gradient, clamped to the neighbouring greens. On X-Trans it weights the green neighbours by how well opposite neighbours agree.
+1. **Green** at red and blue sites, blending Hamilton–Adams horizontal and vertical estimates by inverse gradient, clamped to the neighbouring greens.
 2. **Red and blue** from the difference to green of the nearest same-colour samples (radius 1, else 2), weighted by inverse distance.
 
-Borders are mirrored, which keeps the Bayer colour parity. Half-size drafts and files that aren't single-channel Bayer or X-Trans (e.g. Foveon, linear DNG) still use LibRaw.
+X-Trans (`crates/rawmakase-decode/src/demosaic/xtrans.rs`) builds one full RGB candidate per direction (horizontal, vertical, both diagonals): green interpolated along that line between the nearest greens with a same-colour curvature correction, red and blue from their difference to that green along the same line. Each pixel blends the four candidates by how smooth their R − G and B − G is in the surrounding 3×3 (weight = (smoothest ÷ own roughness)⁴), so a wrong direction, which leaves a colour pattern, gets little weight. The same-colour curvature correction of the directional green is kept small (0.2): at 0.5 it overshot on sharp edges and left a violet, stair-stepped fringe (X-S10). A single isotropic estimate turned fine periodic detail such as louvres and grilles into green and magenta moiré (X100F DSCF8231, DSCF8232); LibRaw's Markesteijn did not. An isotropic candidate added to the four (#523) brought it back on fine meshes (the tower in DSCF8231): its colour there is smooth but wrong, so it won the blend; it was removed, keeping #523's curvature and blend power, which are what fixed the X-S10 edge. Bands of 128 rows with a mirrored margin keep the working set small.
 
-`rawmakase::raw::set_demosaic(Demosaic::Libraw)` switches to LibRaw's AHD (Bayer) and 1-pass Markesteijn (X-Trans); the environment variable `RAWMAKASE_LIBRAW_DEMOSAIC=1` forces the same.
+Borders are mirrored, which keeps the Bayer colour parity. Half-size drafts are ⌈W/2⌉ × ⌈H/2⌉: on Bayer data each pixel is a 2 × 2 block's red, blue and mean green; other mosaics (X-Trans) are demosaiced in full and averaged over 2 × 2 blocks. Small RAWs and linear DNGs, which are not mosaics, develop at full size in both modes. Files that are neither (Foveon, four-colour filters) are not developed.
+
+LibRaw's AHD and Markesteijn, once offered under Preferences > Performance, are no longer offered; a session that chose them reads as RAWmakase's demosaic.
 
 ## Measurements — 2026-09-26 (M1 Pro, loaded machine)
 

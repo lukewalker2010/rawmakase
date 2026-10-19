@@ -64,7 +64,7 @@ pub(super) struct Updates {
     checked: bool,
 }
 impl Updates {
-    pub(super) fn new(session: &crate::storage::Session, ctx: Option<&egui::Context>) -> Self {
+    pub(super) fn new(session: &crate::app::session::Session, ctx: Option<&egui::Context>) -> Self {
         let automatic = !session.no_update_checks;
         let mut updates = Self {
             automatic,
@@ -104,6 +104,12 @@ impl Updates {
         self.available.as_ref().is_some_and(|release| {
             !self.dismissed && self.skipped.as_deref() != Some(release.version.as_str())
         })
+    }
+    /// Drops the update checker's channels at exit. It ends after the request it is
+    /// working on; a download cannot be cancelled, so it is not waited for.
+    pub(super) fn close(&mut self) {
+        self.requests = None;
+        self.replies = None;
     }
     fn send(&self, request: Request) {
         if let Some(requests) = &self.requests {
@@ -237,6 +243,7 @@ impl Editor {
     /// so the layout never moves. Hidden behind modal windows and first-run
     /// setup.
     pub(super) fn update_notice(&mut self, ctx: &egui::Context, modal: bool) {
+        let palette = theme::palette(ctx);
         let updates = &self.updates;
         let Some(release) = updates.available.clone() else {
             return;
@@ -253,7 +260,7 @@ impl Editor {
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::RIGHT_TOP, Vec2::new(-16., 112.))
             .show(ctx, |ui| {
-                modal_frame()
+                modal_frame(&palette)
                     .inner_margin(egui::Margin::same(16))
                     .shadow(egui::Shadow {
                         offset: [0, 6],
@@ -291,6 +298,10 @@ impl Editor {
     fn install_update(&mut self) {
         if self.exporting() {
             self.status = "Finish exporting before updating".into();
+            return;
+        }
+        if self.activity.is_syncing() {
+            self.status = "Wait for Sync Settings to finish before updating".into();
             return;
         }
         // Edits are saved before the app quits for the helper.
@@ -337,7 +348,7 @@ impl Editor {
         }
         match &updates.manual {
             Some(None) => {
-                ui.add(egui::Spinner::new().size(12.));
+                super::widgets::spinner(ui, 12.);
                 note(ui, "Checking…");
             }
             Some(Some(Ok(()))) => {
@@ -369,12 +380,13 @@ impl Editor {
 
 /// The notice's text and buttons for where the update is.
 fn notice_contents(ui: &mut egui::Ui, updates: &Updates, release: &Release) -> Option<Action> {
+    let palette = theme::palette(ui.ctx());
     let mut action = None;
     ui.horizontal(|ui| {
         ui.label(
             egui::RichText::new("Update available")
                 .size(14.)
-                .color(theme::gray(236)),
+                .color(palette.gray(236)),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if close_button(ui).on_hover_text("Remind me later").clicked() {
@@ -402,7 +414,7 @@ fn notice_contents(ui: &mut egui::Ui, updates: &Updates, release: &Release) -> O
             ui.add(
                 egui::ProgressBar::new(progress)
                     .desired_height(6.)
-                    .fill(theme::accent()),
+                    .fill(palette.accent()),
             );
             note(ui, "Downloading…");
         }
@@ -414,14 +426,14 @@ fn notice_contents(ui: &mut egui::Ui, updates: &Updates, release: &Release) -> O
         }
         Download::Installing => {
             ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(12.));
+                super::widgets::spinner(ui, 12.);
                 note(ui, "Preparing to restart…");
             });
         }
         Download::Idle | Download::Failed(_) => {
             let failed = matches!(updates.download, Download::Failed(_));
             if let Download::Failed(error) = &updates.download {
-                ui.label(egui::RichText::new(error).size(12.).color(theme::danger()));
+                ui.label(egui::RichText::new(error).size(12.).color(palette.danger()));
             }
             if let Some(reason) = &updates.unsupported {
                 note(ui, &reason.to_string());
@@ -446,16 +458,24 @@ fn notice_contents(ui: &mut egui::Ui, updates: &Updates, release: &Release) -> O
 }
 
 fn note(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    ui.add(egui::Label::new(egui::RichText::new(text).size(12.).color(theme::gray(160))).wrap())
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(12.)
+                .color(theme::palette(ui.ctx()).gray(160)),
+        )
+        .wrap(),
+    )
 }
 
 /// An unframed ×.
 fn close_button(ui: &mut egui::Ui) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(20.), Sense::click());
     if response.hovered() {
-        ui.painter().rect_filled(rect, 4., theme::gray(48));
+        ui.painter().rect_filled(rect, 4., palette.gray(48));
     }
-    let color = theme::gray(if response.hovered() { 235 } else { 150 });
+    let color = palette.gray(if response.hovered() { 235 } else { 150 });
     super::icons::paint_at(
         ui.painter(),
         super::icons::Icon::Close,

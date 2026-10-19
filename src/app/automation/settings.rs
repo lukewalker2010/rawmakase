@@ -9,7 +9,7 @@ use crate::app::{
 use mapping::supported_action as parse_action;
 /// What a button can be set to from the list: its name and the key it presses,
 /// spelled as in `midi.json`. Anything else is typed in the field beside it.
-pub(super) const PRESETS: [(&str, &str); 45] = [
+pub(super) const PRESETS: [(&str, &str); 47] = [
     ("Do nothing", ""),
     ("Undo", "cmd+z"),
     ("Redo", "cmd+shift+z"),
@@ -37,6 +37,8 @@ pub(super) const PRESETS: [(&str, &str); 45] = [
     ("Spot removal", "q"),
     ("White balance selector", "w"),
     ("Masking", "shift+w"),
+    ("Hide / show the side panels", "tab"),
+    ("Hide / show all panels", "shift+tab"),
     ("Convert to black & white or color", "toggle:bw"),
     ("Color Mixer: Hue", "mixer:hue"),
     ("Color Mixer: Saturation", "mixer:sat"),
@@ -120,10 +122,21 @@ fn set_dial(config: &mut Config, cc: u8, choice: DialUse) {
 }
 
 fn small(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).size(12.).color(theme::gray(135)));
+    ui.label(
+        egui::RichText::new(text)
+            .size(12.)
+            .color(theme::palette(ui.ctx()).gray(135)),
+    );
 }
 pub(super) fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.add(egui::Label::new(egui::RichText::new(text).size(12.).color(theme::gray(135))).wrap());
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(12.)
+                .color(theme::palette(ui.ctx()).gray(135)),
+        )
+        .wrap(),
+    );
 }
 
 fn mappings(
@@ -309,7 +322,6 @@ fn mappings(
 impl Editor {
     pub(in crate::app) fn automation_page(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        ctx.request_repaint_after(Duration::from_millis(500));
         if let Some(error) = &self.controls.load_error {
             hint(ui, error);
             hint(

@@ -1,11 +1,15 @@
-//! First-run setup: a catalog, then optional Lightroom profiles and presets.
+//! Bringing over a Lightroom library: its catalog, camera and lens profiles
+//! and presets, offered on a first launch where Lightroom's are found; and the
+//! Library's start while it has no photos.
 use super::Editor;
 use super::bulk_import::{ImportKind, Summary, find_files};
-use super::dialogs::{CatalogDialog, FileDialog};
+use super::dialogs::{CatalogDialog, FileDialog, FolderAction};
 use super::task::Task;
 use super::widgets::pretty_path;
 use super::worker::Event;
+use crate::app::Module;
 use crate::app::theme;
+use crate::catalog::CatalogLocation;
 use eframe::egui::{self, Color32, Sense, Stroke, Vec2};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -39,7 +43,7 @@ fn user_camera_raw() -> Option<PathBuf> {
 pub(super) struct Onboarding {
     pub(super) visible: bool,
     scanned: bool,
-    scanned_for: Option<PathBuf>,
+    scanned_for: Option<CatalogLocation>,
     /// How many times the catalog had saved photo info read from files when
     /// it last scanned; a later save may add cameras.
     info_saves: u64,
@@ -47,12 +51,19 @@ pub(super) struct Onboarding {
     /// so it runs off the UI thread and arrives as [`Event::OnboardingScanned`].
     scan: Task,
     found: Found,
-    /// The last profile or preset import, shown under the steps.
-    pub(super) last_import: Option<Box<Summary>>,
+    /// The last import of each kind started here, shown in its row.
+    results: Vec<Summary>,
+    /// The kind of import this view started and is under way.
+    importing: Option<ImportKind>,
+    /// Why the last catalog open or import failed, until one succeeds.
+    pub(super) catalog_error: Option<String>,
+    /// The Lightroom catalogs the open catalog was imported from, read when
+    /// the view scans.
+    imported_from: Vec<PathBuf>,
 }
 /// What the setup view found on disk, refreshed when it opens.
 #[derive(Default)]
-pub struct Found {
+pub(crate) struct Found {
     /// The catalog's cameras as Adobe names them ("Sony ILCE-7CR").
     cameras: BTreeSet<String>,
     /// Adobe base and Camera Matching profiles for those cameras, then looks.
@@ -69,6 +80,8 @@ pub struct Found {
     /// Makers of the catalog's cameras, e.g. "Sony".
     makers: BTreeSet<String>,
     user_presets: Vec<PathBuf>,
+    /// Lightroom catalogs where Lightroom keeps them, the latest used first.
+    catalogs: Vec<PathBuf>,
 }
 impl Onboarding {
     pub(super) fn new(visible: bool) -> Self {
@@ -80,6 +93,51 @@ impl Onboarding {
     fn scanning(&self) -> bool {
         self.scan.is_running()
     }
+    /// Keeps an import's result for its row.
+    pub(super) fn imported(&mut self, summary: Summary) {
+        if self.importing == Some(summary.kind) {
+            self.importing = None;
+        }
+        self.results.retain(|r| r.kind != summary.kind);
+        self.results.push(summary);
+    }
+    fn result(&self, kind: ImportKind) -> Option<&Summary> {
+        self.results.iter().find(|r| r.kind == kind)
+    }
+}
+/// The folder Lightroom Classic keeps its catalog in unless told otherwise.
+fn lightroom_folder() -> Option<PathBuf> {
+    let home = if cfg!(windows) {
+        std::env::var_os("USERPROFILE")?
+    } else {
+        std::env::var_os("HOME")?
+    };
+    Some(PathBuf::from(home).join("Pictures").join("Lightroom"))
+}
+/// The Lightroom catalogs in Lightroom's folder, the latest used first.
+fn lightroom_catalogs() -> Vec<PathBuf> {
+    let Some(folder) = lightroom_folder() else {
+        return Vec::new();
+    };
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "lrcat") && p.is_file())
+        .map(|p| {
+            let used = p.metadata().and_then(|m| m.modified());
+            (used.unwrap_or(std::time::UNIX_EPOCH), p)
+        })
+        .collect();
+    found.sort_by_key(|(used, _)| std::cmp::Reverse(*used));
+    found.into_iter().map(|(_, p)| p).collect()
+}
+/// Whether this computer has something of Lightroom's to bring over: its
+/// catalog or Camera Raw's profiles and presets. A first launch opens the
+/// setup view only then.
+pub(super) fn lightroom_here() -> bool {
+    shared_camera_raw().is_some() || user_camera_raw().is_some() || !lightroom_catalogs().is_empty()
 }
 /// The full name `model` goes by among `names`, which spell out the maker:
 /// Lightroom records "ILCE-7M2" where Adobe's profiles say "Sony ILCE-7M2", but
@@ -146,6 +204,7 @@ impl Found {
             }
         }
         found.find_on_disk(cancel);
+        found.catalogs = lightroom_catalogs();
         found
     }
     /// Camera Raw's profiles and presets, narrowed to the cameras found.
@@ -248,7 +307,10 @@ impl Found {
 impl Editor {
     pub(super) fn onboarding_ui(&mut self, ui: &mut egui::Ui) {
         // Rescan when opened and whenever a different catalog is loaded.
-        let catalog = self.library.as_ref().map(|l| l.catalog.path.clone());
+        let catalog = self
+            .library
+            .as_ref()
+            .map(|l| l.session.catalog.location().clone());
         // And once the catalog has read cameras from new photos' files, when
         // the reader is done rather than at each of its saves.
         let read = self.library.as_ref().is_some_and(|l| {
@@ -258,303 +320,398 @@ impl Editor {
             self.start_onboarding_scan(catalog);
         }
         let ctx = ui.ctx().clone();
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(theme::gray(24)))
+        let area = egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(theme::palette(ui.ctx()).gray(24)))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink(false)
                     .show(ui, |ui| {
-                        let width = ui.available_width().min(600.);
-                        let margin = ((ui.available_width() - width) / 2.).max(20.);
-                        ui.add_space(48.);
+                        let width = (ui.available_width() - 48.).min(640.);
+                        let margin = ((ui.available_width() - width) / 2.).max(24.);
+                        ui.add_space((ui.available_height() * 0.1).clamp(32., 96.));
                         ui.horizontal(|ui| {
                             ui.add_space(margin);
                             ui.vertical(|ui| {
                                 ui.set_width(width);
-                                self.onboarding_steps(ui, &ctx);
+                                self.lightroom_view(ui, &ctx);
                             });
                         });
                         ui.add_space(48.);
                     });
             });
+        self.drop_area = Some(area.response.rect);
     }
 
-    fn onboarding_steps(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// Lightroom's catalog, profiles and presets, a row each.
+    fn lightroom_view(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.spacing_mut().item_spacing = Vec2::new(8., 0.);
-        text(ui, "Set up RAWmakase", 24., 240);
-        ui.add_space(6.);
-        text(
+        text(ui, "Bring over your Lightroom library", 26., 240);
+        ui.add_space(8.);
+        paragraph(
             ui,
-            "Pick a catalog, then bring over your Lightroom look. Steps 2 to 4 are optional.",
-            13.,
+            "Import your catalog, camera and lens profiles and presets. Everything here \
+             is optional, and nothing in Lightroom is changed.",
+            14.,
             150,
         );
-        ui.add_space(24.);
+        ui.add_space(28.);
 
-        let busy = self.activity.is_busy();
-        let catalog = self.library.as_ref().map(|l| {
-            format!(
-                "{} · {} photos",
-                l.catalog
-                    .path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy(),
-                l.photos.len()
-            )
-        });
-        let has_catalog = catalog.is_some();
-        step(ui, 1, "Catalog", catalog.as_deref(), |ui| {
-            body(
-                ui,
-                "Import your Lightroom Classic catalog to keep folders, ratings, flags, \
-                 labels, keywords and edits. Your .lrcat is only read, and photos stay \
-                 where they are.",
-            );
-            ui.add_space(12.);
-            ui.horizontal(|ui| {
-                ui.add_enabled_ui(!busy, |ui| {
-                    if primary(ui, "Import Lightroom catalog…").clicked() {
-                        self.catalog_dialog(CatalogDialog::ImportLightroom, ctx);
-                    }
-                    if secondary(ui, "New empty catalog…").clicked() {
-                        self.catalog_dialog(CatalogDialog::Create, ctx);
-                    }
-                    if secondary(ui, "Open RAWmakase catalog…").clicked() {
-                        self.catalog_dialog(CatalogDialog::Open, ctx);
-                    }
-                });
-            });
-            if let Some(work) = &self.catalog_work {
-                ui.add_space(10.);
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new().size(12.).color(theme::gray(170)));
-                    hint(
-                        ui,
-                        &format!("{work} This can take a few minutes for a large catalog."),
-                    );
-                });
-            }
-        });
-
-        // Profiles before presets: many presets name a profile.
-        let importing = self.importing.is_some();
-        let enabled = !busy && !importing;
-        let mut chosen = None;
+        let enabled = !self.activity.is_busy() && self.importing.is_none();
         let scanning = self.onboarding.scanning();
-        let adobe = self.onboarding.found.adobe_profiles.len();
-        let user_profiles = self.onboarding.found.user_profiles.len();
-        let cameras = self
-            .onboarding
-            .found
-            .cameras
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        step(ui, 2, "Camera profiles", None, |ui| {
-            body(
-                ui,
-                "Profiles set the starting look, such as Adobe Color. Choose a folder \
-                 and RAWmakase imports the .dcp profiles and .xmp looks in it and its \
-                 subfolders.",
-            );
-            ui.add_space(10.);
-            let shared = shared_camera_raw();
-            let user = user_camera_raw();
-            if let Some(shared) = &shared {
-                location(ui, "Adobe", &pretty_path(&shared.join("CameraProfiles")));
-            }
-            if let Some(user) = &user {
-                location(ui, "Yours", &pretty_path(&user.join("CameraProfiles")));
-            }
-            ui.add_space(8.);
-            if scanning && (shared.is_some() || user.is_some()) {
-                looking(ui, "Looking for profiles for your cameras…");
-            } else {
-                hint(
-                    ui,
-                    &if shared.is_none() && user.is_none() {
-                        "Lightroom keeps them in CameraRaw/CameraProfiles, under \
-                     /Library/Application Support/Adobe on a Mac and C:\\ProgramData\\Adobe \
-                     on Windows. Copy that folder here, or any folder of profiles."
-                            .to_string()
-                    } else if self.onboarding.found.cameras.is_empty() {
-                        format!(
-                            "Found {user_profiles} of your profiles. Choose a catalog to also \
-                         find Adobe's profiles and narrow yours to your cameras."
-                        )
-                    } else if adobe + user_profiles == 0 {
-                        format!("No profiles found for {cameras}.")
-                    } else {
-                        format!(
-                            "Found {adobe} Adobe and {user_profiles} of your profiles for {cameras}"
-                        )
-                    },
-                );
-            }
-            ui.add_space(10.);
-            let found = (adobe + user_profiles > 0)
-                .then(|| format!("Import {} profiles", adobe + user_profiles));
-            if let Some(choice) = import_buttons(ui, found, enabled) {
-                chosen = Some((ImportKind::CameraProfiles, choice));
-            }
-        });
-
-        let presets = self.presets.library.presets.len();
-        let found = self.onboarding.found.user_presets.len();
-        let lenses = self.onboarding.found.lens_profiles.len();
-        let makers = self
-            .onboarding
-            .found
-            .makers
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        step(ui, 3, "Lens profiles", None, |ui| {
-            body(
-                ui,
-                "Lens profiles correct distortion and vignetting, like Lightroom's Enable \
-                 Profile Corrections. Choose a folder and RAWmakase imports the .lcp \
-                 profiles in it and its subfolders.",
-            );
-            ui.add_space(10.);
-            let shared = shared_camera_raw();
-            let user = user_camera_raw();
-            if let Some(shared) = &shared {
-                location(ui, "Adobe", &pretty_path(&shared.join("LensProfiles")));
-            }
-            if let Some(user) = &user {
-                location(ui, "Yours", &pretty_path(&user.join("LensProfiles")));
-            }
-            ui.add_space(8.);
-            if scanning && (shared.is_some() || user.is_some()) {
-                looking(ui, "Looking for lens profiles for your cameras…");
-            } else {
-                hint(
-                    ui,
-                    &if shared.is_none() && user.is_none() {
-                        "Lightroom keeps them in CameraRaw/LensProfiles. Adobe's cover thousands \
-                     of lenses; the folders of your camera maker and lens brands are enough."
-                            .to_string()
-                    } else if self.onboarding.found.makers.is_empty() {
-                        "Choose a catalog to find lens profiles for your cameras.".to_string()
-                    } else if lenses == 0 {
-                        format!("No lens profiles found for {makers}.")
-                    } else {
-                        format!("Found {lenses} lens profiles for {makers} and third-party lenses")
-                    },
-                );
-            }
-            ui.add_space(10.);
-            let found = (lenses > 0).then(|| format!("Import {lenses} lens profiles"));
-            if let Some(choice) = import_buttons(ui, found, enabled) {
-                chosen = Some((ImportKind::LensProfiles, choice));
-            }
-        });
-
-        step(ui, 4, "Presets", None, |ui| {
-            body(
-                ui,
-                "Your Lightroom develop presets are .xmp files. Choose a folder and \
-                 RAWmakase imports the presets in it and its subfolders, keeping their \
-                 groups. Presets that need something RAWmakase lacks still appear and \
-                 apply what they can.",
-            );
-            ui.add_space(10.);
-            if let Some(user) = user_camera_raw() {
-                location(ui, "Yours", &pretty_path(&user.join("Settings")));
-            }
-            if presets > 0 {
-                ui.add_space(8.);
-                hint(ui, &format!("{presets} presets already in RAWmakase."));
-            }
-            ui.add_space(10.);
-            let found = (found > 0).then(|| format!("Import {found} presets"));
-            if let Some(choice) = import_buttons(ui, found, enabled) {
-                chosen = Some((ImportKind::Presets, choice));
-            }
-        });
-        if let Some((kind, choice)) = chosen {
-            self.onboarding.last_import = None;
-            match choice {
-                Choice::Found => {
-                    let paths = match kind {
-                        ImportKind::CameraProfiles => {
-                            let mut paths = self.onboarding.found.user_profiles.clone();
-                            paths.extend(self.onboarding.found.adobe_profiles.iter().cloned());
-                            paths
-                        }
-                        ImportKind::LensProfiles => self.onboarding.found.lens_profiles.clone(),
-                        // The folder rather than its files, to skip Defaults and
-                        // keep preset folders.
-                        ImportKind::Presets => user_camera_raw()
-                            .map(|user| vec![user.join("Settings")])
-                            .unwrap_or_default(),
-                    };
-                    self.import(kind, paths, ctx);
+        let mut catalog_action = None;
+        let mut chosen = None;
+        let rows = [
+            self.catalog_row(),
+            self.import_row(ImportKind::CameraProfiles, scanning),
+            self.import_row(ImportKind::LensProfiles, scanning),
+            self.import_row(ImportKind::Presets, scanning),
+        ];
+        let palette = theme::palette(ui.ctx());
+        egui::Frame::new()
+            .fill(palette.gray(30))
+            .stroke(Stroke::new(1., palette.gray(40)))
+            .corner_radius(10.)
+            .inner_margin(egui::Margin::symmetric(22, 2))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for (i, row) in rows.iter().enumerate() {
+                    if i > 0 {
+                        divider(ui);
+                    }
+                    let action = row_ui(ui, row, enabled);
+                    match (i, action) {
+                        (_, None) => {}
+                        (0, Some(action)) => catalog_action = Some(action),
+                        (_, Some(action)) => chosen = Some((row.kind, action)),
+                    }
                 }
-                Choice::Folder => self.dialog(FileDialog::ImportFolder(kind), ctx),
-                Choice::Files => self.dialog(
+            });
+
+        ui.add_space(20.);
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 32.),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                if ui
+                    .add(
+                        egui::Button::new(
+                            egui::RichText::new("Continue")
+                                .size(14.)
+                                .color(palette.on_accent()),
+                        )
+                        .fill(palette.accent())
+                        .min_size(Vec2::new(112., 32.)),
+                    )
+                    .clicked()
+                {
+                    self.finish_onboarding(true);
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    hint(ui, "Come back any time from the catalog menu.");
+                });
+            },
+        );
+
+        match catalog_action {
+            Some(RowAction::Import) => {
+                let source = self.onboarding.found.catalogs.first().cloned();
+                self.import_lightroom_here(source, ctx);
+            }
+            Some(RowAction::Choose(_)) => self.import_lightroom_here(None, ctx),
+            None => {}
+        }
+        let Some((Some(kind), action)) = chosen else {
+            return;
+        };
+        match action {
+            RowAction::Import => {
+                let found = &self.onboarding.found;
+                let paths = match kind {
+                    // Yours first: an Adobe profile of the same name wins.
+                    ImportKind::CameraProfiles => {
+                        let mut paths = found.user_profiles.clone();
+                        paths.extend(found.adobe_profiles.iter().cloned());
+                        paths
+                    }
+                    ImportKind::LensProfiles => found.lens_profiles.clone(),
+                    // The folder rather than its files, to skip Defaults and
+                    // keep preset folders.
+                    ImportKind::Presets => user_camera_raw()
+                        .map(|user| vec![user.join("Settings")])
+                        .unwrap_or_default(),
+                };
+                self.onboarding.importing = Some(kind);
+                self.import(kind, paths, ctx);
+            }
+            RowAction::Choose(Pick::Folder) => {
+                self.onboarding.importing = Some(kind);
+                self.dialog(FileDialog::ImportFolder(kind), ctx);
+            }
+            RowAction::Choose(Pick::Files) => {
+                self.onboarding.importing = Some(kind);
+                self.dialog(
                     match kind {
                         ImportKind::CameraProfiles => FileDialog::CameraProfile,
                         ImportKind::LensProfiles => FileDialog::LensProfile,
                         ImportKind::Presets => FileDialog::ImportXmp,
                     },
                     ctx,
-                ),
+                );
             }
         }
+    }
 
-        step(ui, 5, "Good to know", None, |ui| {
-            for line in [
-                "AI and color-range masks aren't rendered yet; they stay in the catalog.",
-                "Export presets, watermarks and plug-ins don't carry over.",
-                "Calibrated display? Set it in Develop under Settings › Monitor Profile.",
-            ] {
-                body(ui, line);
-                ui.add_space(4.);
-            }
+    /// The Lightroom catalog's row: the one found where Lightroom keeps it,
+    /// imported already or not.
+    fn catalog_row(&self) -> Row {
+        let found = self.onboarding.found.catalogs.first();
+        // Imported when the open catalog says it came from that file; an
+        // import leaves its catalog open, and the next launch opens it again.
+        let same = |a: &std::path::Path, b: &std::path::Path| {
+            a == b
+                || a.canonicalize()
+                    .is_ok_and(|a| b.canonicalize().is_ok_and(|b| a == b))
+        };
+        let imported = found.filter(|source| {
+            self.onboarding
+                .imported_from
+                .iter()
+                .any(|from| same(from, source))
         });
-
-        if importing {
-            let status = self.status.clone();
-            text(ui, &status, 12., 200);
-            ui.add_space(14.);
-        } else if let Some(summary) = &self.onboarding.last_import {
-            text(ui, &summary.message(), 12., 200);
-            if !summary.failed.is_empty() {
-                ui.add_space(4.);
-                hint(ui, &summary.details(5));
-            }
-            ui.add_space(14.);
+        let mut row = Row {
+            kind: None,
+            title: "Catalog",
+            detail: "Folders, collections, ratings, flags, labels, keywords and edits.",
+            mark: Mark::Todo,
+            status: String::new(),
+            hover: found.map(|p| pretty_path(p)),
+            import: None,
+            choose: ChooseWith::File,
+        };
+        if let Some(work) = &self.catalog_work {
+            row.mark = Mark::Working;
+            row.status = format!("{work} A large catalog takes a few minutes.");
+        } else if imported.is_some()
+            && let Some(library) = &self.library
+        {
+            row.mark = Mark::Done;
+            row.status = format!(
+                "Imported as {}, open now",
+                library.session.catalog.location().name()
+            );
+        } else if let Some(source) = found {
+            row.status = format!(
+                "Found {}",
+                source.file_name().unwrap_or_default().to_string_lossy()
+            );
+            row.import = Some("Import".into());
+        } else {
+            row.status = match lightroom_folder() {
+                Some(folder) => format!("None in {}", pretty_path(&folder)),
+                None => "None found".into(),
+            };
         }
-        ui.add_space(6.);
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    has_catalog,
-                    egui::Button::new(
-                        egui::RichText::new("Start")
-                            .size(14.)
-                            .color(theme::on_accent()),
-                    )
-                    .fill(theme::accent())
-                    .min_size(Vec2::new(120., 34.)),
-                )
-                .on_disabled_hover_text("Choose a catalog first")
-                .clicked()
-            {
-                self.finish_onboarding(true);
+        if let Some(error) = &self.onboarding.catalog_error
+            && row.mark != Mark::Working
+        {
+            row.status = format!("Import failed: {error}");
+            row.mark = Mark::Failed;
+        }
+        row
+    }
+
+    /// The row of profiles or presets of `kind`: what the scan found, the
+    /// import under way, or the last one's result.
+    fn import_row(&self, kind: ImportKind, scanning: bool) -> Row {
+        let found = &self.onboarding.found;
+        let shared = shared_camera_raw();
+        let user = user_camera_raw();
+        let (title, detail, n, hover) = match kind {
+            ImportKind::CameraProfiles => (
+                "Camera profiles",
+                "Starting looks such as Adobe Color, for your cameras.",
+                found.adobe_profiles.len() + found.user_profiles.len(),
+                folders(&[&shared, &user], "CameraProfiles"),
+            ),
+            ImportKind::LensProfiles => (
+                "Lens profiles",
+                "Distortion and vignetting corrections for your lenses.",
+                found.lens_profiles.len(),
+                folders(&[&shared, &user], "LensProfiles"),
+            ),
+            ImportKind::Presets => (
+                "Presets",
+                "Your develop presets, in their groups.",
+                found.user_presets.len(),
+                folders(&[&user], "Settings"),
+            ),
+        };
+        let noun = match kind {
+            ImportKind::CameraProfiles => "profile",
+            ImportKind::LensProfiles => "lens profile",
+            ImportKind::Presets => "preset",
+        };
+        let mut row = Row {
+            kind: Some(kind),
+            title,
+            detail,
+            mark: Mark::Todo,
+            status: String::new(),
+            hover,
+            import: (n > 0).then(|| format!("Import {}", count(n, noun))),
+            choose: ChooseWith::FolderOrFiles,
+        };
+        let cameras = || found.cameras.iter().cloned().collect::<Vec<_>>().join(", ");
+        if self.importing.is_some() && self.onboarding.importing == Some(kind) {
+            row.mark = Mark::Working;
+            row.status = "Importing…".into();
+        } else if let Some(result) = self.onboarding.result(kind) {
+            row.mark = if result.imported + result.already > 0 {
+                Mark::Done
+            } else {
+                Mark::Failed
+            };
+            row.status = result.message();
+            if !result.failed.is_empty() {
+                row.hover = Some(result.details(8));
             }
-            ui.add_space(8.);
-            if ui
-                .add(egui::Button::new(egui::RichText::new("Skip for now").size(13.)).frame(false))
-                .on_hover_text("Reopen it any time from the catalog menu › Setup assistant")
-                .clicked()
-            {
-                self.finish_onboarding(has_catalog);
+        } else if scanning && n == 0 {
+            row.mark = Mark::Working;
+            row.status = "Looking…".into();
+        } else if row.hover.is_none() {
+            row.status = "Lightroom's folders aren't on this computer".into();
+        } else if n == 0 && kind == ImportKind::LensProfiles && found.makers.is_empty() {
+            // Adobe's thousands are narrowed to the catalog's camera makers.
+            row.status = "Add photos first to find the ones for your cameras".into();
+        } else if n == 0 {
+            row.status = "None found".into();
+        } else {
+            row.status = match kind {
+                ImportKind::CameraProfiles if !found.cameras.is_empty() => format!(
+                    "{} Adobe and {} of yours, for {}",
+                    found.adobe_profiles.len(),
+                    found.user_profiles.len(),
+                    cameras()
+                ),
+                ImportKind::CameraProfiles => format!(
+                    "{} of yours found. Add photos to match Adobe's to your cameras.",
+                    found.user_profiles.len()
+                ),
+                ImportKind::LensProfiles if !found.makers.is_empty() => {
+                    let makers = found.makers.iter().cloned().collect::<Vec<_>>().join(", ");
+                    format!("{n} found for {makers} and third-party lenses")
+                }
+                _ => format!("{} found", count(n, noun)),
+            };
+            if kind == ImportKind::Presets && !self.presets.library.presets.is_empty() {
+                row.status.push_str(&format!(
+                    " · {} in RAWmakase already",
+                    self.presets.library.presets.len()
+                ));
+            }
+        }
+        row
+    }
+
+    /// The Library's view while its catalog has no photos, or no catalog is
+    /// open: what to do first, in place of an empty grid.
+    pub(super) fn library_start(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let palette = theme::palette(&ctx);
+        let busy = self.activity.is_busy();
+        let default = self.default_catalog();
+        // Folders added that held no photos still show in the Folders panel.
+        let folders = self.library.as_ref().map(|l| l.session.roots.len());
+        let (title, detail) = match folders {
+            Some(0) => (
+                "Add your photos".to_string(),
+                "Choose a folder and RAWmakase shows every photo in it and its subfolders. \
+                 Photos stay where they are; nothing is copied, moved or changed.",
+            ),
+            Some(n) => (
+                format!("No photos in the {} added", count(n, "folder")),
+                "RAWmakase reads RAW, DNG, JPEG, PNG and TIFF files. Add a folder that holds \
+                 some, or find the folder again if it has moved.",
+            ),
+            None => (
+                "No catalog is open".to_string(),
+                "RAWmakase keeps your folders, ratings and edits in a catalog. Start one \
+                 to add photos, or open a catalog you already have.",
+            ),
+        };
+        // The setup view's backdrop, not the grid's black.
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0., palette.gray(24));
+        let width = 400_f32.min(ui.available_width() - 64.);
+        let height = 380.;
+        let top = ((ui.available_height() - height) / 2.).max(24.);
+        ui.add_space(top);
+        ui.vertical_centered(|ui| {
+            ui.set_max_width(width);
+            ui.spacing_mut().item_spacing = Vec2::new(8., 0.);
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(64.), Sense::hover());
+            ui.painter()
+                .circle_filled(rect.center(), 32., palette.gray(36));
+            super::icons::paint_at(
+                ui.painter(),
+                super::icons::Icon::FolderPlus,
+                rect.center(),
+                28.,
+                palette.gray(190),
+            );
+            ui.add_space(24.);
+            text(ui, &title, 20., 235);
+            ui.add_space(12.);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(detail)
+                        .size(13.)
+                        .line_height(Some(20.))
+                        .color(palette.gray(150)),
+                )
+                .halign(egui::Align::Center)
+                .wrap(),
+            );
+            ui.add_space(32.);
+            ui.add_enabled_ui(!busy, |ui| {
+                if folders.is_some() {
+                    if icon_primary(ui, super::icons::Icon::FolderPlus, "Add photo folder…")
+                        .clicked()
+                    {
+                        self.catalog_dialog(CatalogDialog::Folder(FolderAction::Add), &ctx);
+                    }
+                    ui.add_space(14.);
+                    hint(ui, "Or drag a folder onto this window.");
+                } else {
+                    if primary(ui, default_catalog_label(&default))
+                        .on_hover_text(pretty_path(&default))
+                        .clicked()
+                    {
+                        self.open_default_catalog(&ctx);
+                    }
+                    ui.add_space(8.);
+                    if secondary(ui, "Open RAWmakase catalog…").clicked() {
+                        self.catalog_dialog(CatalogDialog::Open, &ctx);
+                    }
+                }
+                ui.add_space(48.);
+                text(ui, "Coming from Lightroom Classic?", 12., 150);
+                ui.add_space(12.);
+                if secondary(ui, "Bring over your Lightroom library…").clicked() {
+                    self.open_onboarding();
+                }
+            });
+            if busy {
+                ui.add_space(16.);
+                let status = self
+                    .catalog_work
+                    .clone()
+                    .unwrap_or_else(|| self.status.clone());
+                ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(12.), egui::Sense::hover());
+                    super::widgets::paint_spinner(ui, rect, Some(palette.gray(170)));
+                    hint(ui, &status);
+                });
             }
         });
     }
@@ -563,18 +720,27 @@ impl Editor {
     fn finish_onboarding(&mut self, done: bool) {
         self.onboarding.visible = false;
         self.onboarding_done = done;
-        self.library_mode = self.library.is_some();
+        self.module = if self.library.is_some() {
+            Module::Library
+        } else {
+            Module::Develop
+        };
         let _ = self.save_session();
     }
     /// Scans in the background; until the result arrives the steps say so.
-    fn start_onboarding_scan(&mut self, catalog: Option<PathBuf>) {
+    fn start_onboarding_scan(&mut self, catalog: Option<CatalogLocation>) {
         // The catalog already records each photo's camera; no RAW is opened.
         let models = self
             .library
             .as_ref()
-            .and_then(|l| l.catalog.raw_cameras().ok())
+            .and_then(|l| l.session.catalog.raw_cameras().ok())
             .unwrap_or_default();
         self.onboarding.info_saves = self.library.as_ref().map_or(0, |l| l.photo_info_saves());
+        self.onboarding.imported_from = self
+            .library
+            .as_ref()
+            .and_then(|l| l.session.catalog.lightroom_sources().ok())
+            .unwrap_or_default();
         let (generation, cancel) = self.onboarding.scan.start();
         self.onboarding.scanned = true;
         self.onboarding.scanned_for = catalog;
@@ -602,81 +768,251 @@ impl Editor {
     pub(super) fn open_onboarding(&mut self) {
         self.onboarding.visible = true;
         self.onboarding.scanned = false;
-        self.onboarding.last_import = None;
+        self.onboarding.results.clear();
     }
 }
 
-/// A numbered card. When `done` is set it shows that summary and a check
-/// instead of the number, but keeps its actions so the choice can change.
-fn step(
-    ui: &mut egui::Ui,
-    number: usize,
-    title: &str,
-    done: Option<&str>,
-    contents: impl FnOnce(&mut egui::Ui),
-) {
-    egui::Frame::new()
-        .fill(theme::gray(32))
-        .stroke(Stroke::new(1., theme::gray(44)))
-        .corner_radius(8.)
-        .inner_margin(egui::Margin::symmetric(20, 18))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(22.), Sense::hover());
-                let c = rect.center();
-                if done.is_some() {
-                    ui.painter()
-                        .circle_filled(c, 11., Color32::from_rgb(64, 132, 90));
-                    super::icons::paint_at(
-                        ui.painter(),
-                        super::icons::Icon::Check,
-                        c,
-                        14.,
-                        theme::on_accent(),
-                    );
-                } else {
-                    ui.painter().circle_filled(c, 11., theme::gray(52));
-                    ui.painter().text(
-                        c,
-                        egui::Align2::CENTER_CENTER,
-                        number.to_string(),
-                        egui::FontId::proportional(12.),
-                        theme::gray(210),
-                    );
-                }
-                ui.add_space(10.);
-                text(ui, title, 16., 235);
-                if let Some(done) = done {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        text(ui, done, 12., 150);
+/// Where a row stands, shown in its first column.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Todo,
+    Working,
+    Done,
+    Failed,
+}
+/// What a row's "Choose…" asks for.
+#[derive(Clone, Copy)]
+enum ChooseWith {
+    File,
+    FolderOrFiles,
+}
+/// What the user chose in "Choose…".
+#[derive(Clone, Copy)]
+enum Pick {
+    Folder,
+    Files,
+}
+/// A row's button that was clicked.
+#[derive(Clone, Copy)]
+enum RowAction {
+    /// Import what the row found.
+    Import,
+    Choose(Pick),
+}
+/// One thing to bring over, as its row shows it.
+struct Row {
+    /// None for the catalog.
+    kind: Option<ImportKind>,
+    title: &'static str,
+    detail: &'static str,
+    mark: Mark,
+    status: String,
+    /// Where it was looked for, or what failed.
+    hover: Option<String>,
+    /// The label of the button importing what was found.
+    import: Option<String>,
+    choose: ChooseWith,
+}
+/// Draws `row`: its mark on the title's line, its buttons on the right of
+/// that line, and its text in the width they leave. Returns the button
+/// clicked.
+fn row_ui(ui: &mut egui::Ui, row: &Row, enabled: bool) -> Option<RowAction> {
+    /// The mark's column, and the gap after it and before the buttons.
+    const MARK: f32 = 22.;
+    const GAP: f32 = 16.;
+    /// The title's line, which the mark and the buttons are centred on.
+    const LINE: f32 = 22.;
+    const BUTTON: f32 = 28.;
+    let palette = theme::palette(ui.ctx());
+    let mut action = None;
+    ui.add_space(18.);
+    let top = ui.cursor().min;
+    let width = ui.available_width();
+    // Buttons first, right-aligned on the title's line: the text gets the rest.
+    let line = egui::Rect::from_min_size(
+        egui::pos2(top.x, top.y + (LINE - BUTTON) / 2.),
+        Vec2::new(width, BUTTON),
+    );
+    let buttons = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(line)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 8.;
+                ui.add_enabled_ui(enabled && row.mark != Mark::Working, |ui| {
+                    let choose = secondary(ui, "Choose…").on_hover_text(match row.choose {
+                        ChooseWith::File => "Pick a Lightroom catalog (.lrcat) elsewhere",
+                        ChooseWith::FolderOrFiles => {
+                            "Import from a folder (and its subfolders) or chosen files"
+                        }
                     });
+                    match row.choose {
+                        ChooseWith::File => {
+                            if choose.clicked() {
+                                action = Some(RowAction::Choose(Pick::Files));
+                            }
+                        }
+                        ChooseWith::FolderOrFiles => {
+                            egui::Popup::menu(&choose).show(|ui| {
+                                if ui.button("Folder…").clicked() {
+                                    action = Some(RowAction::Choose(Pick::Folder));
+                                }
+                                if ui.button("Files…").clicked() {
+                                    action = Some(RowAction::Choose(Pick::Files));
+                                }
+                            });
+                        }
+                    }
+                    if let Some(label) = &row.import {
+                        // Imported already: again, without the emphasis.
+                        let clicked = if row.mark == Mark::Done {
+                            secondary(ui, label).clicked()
+                        } else {
+                            primary(ui, label).clicked()
+                        };
+                        if clicked {
+                            action = Some(RowAction::Import);
+                        }
+                    }
+                });
+            },
+        )
+        .response
+        .rect;
+    mark(
+        ui,
+        egui::pos2(top.x + MARK / 2., top.y + LINE / 2.),
+        row.mark,
+    );
+    let left = top.x + MARK + GAP;
+    let text_width = (buttons.left() - GAP - left).max(160.);
+    let text = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_size(
+                    egui::pos2(left, top.y),
+                    Vec2::new(text_width, f32::INFINITY),
+                ))
+                .layout(egui::Layout::top_down(egui::Align::Min)),
+            |ui| {
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                ui.set_width(text_width);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(text_width, LINE),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| text(ui, row.title, 15., 235),
+                );
+                ui.add_space(2.);
+                paragraph(ui, row.detail, 13., 150);
+                ui.add_space(6.);
+                let status = egui::RichText::new(&row.status)
+                    .size(12.)
+                    .line_height(Some(17.))
+                    .color(match row.mark {
+                        Mark::Done => Color32::from_rgb(120, 190, 140),
+                        Mark::Failed => Color32::from_rgb(220, 140, 110),
+                        _ => palette.gray(125),
+                    });
+                let response = ui.add(egui::Label::new(status).wrap());
+                if let Some(hover) = &row.hover {
+                    response.on_hover_text(hover);
                 }
-            });
-            ui.add_space(10.);
-            ui.horizontal(|ui| {
-                ui.add_space(32.);
-                ui.vertical(contents);
-            });
-        });
-    ui.add_space(12.);
+            },
+        )
+        .response
+        .rect;
+    let bottom = text.bottom().max(line.bottom());
+    ui.advance_cursor_after_rect(egui::Rect::from_min_max(
+        top,
+        egui::pos2(top.x + width, bottom),
+    ));
+    ui.add_space(18.);
+    action
+}
+/// A row's mark: an empty ring, a spinner, a check or a cross.
+fn mark(ui: &mut egui::Ui, center: egui::Pos2, mark: Mark) {
+    let palette = theme::palette(ui.ctx());
+    let painter = ui.painter();
+    match mark {
+        Mark::Todo => {
+            painter.circle_stroke(center, 9., Stroke::new(1.5, palette.gray(80)));
+        }
+        Mark::Working => {
+            let rect = egui::Rect::from_center_size(center, Vec2::splat(16.));
+            super::widgets::paint_spinner(ui, rect, Some(palette.gray(190)));
+        }
+        Mark::Done => {
+            painter.circle_filled(center, 10., Color32::from_rgb(64, 132, 90));
+            super::icons::paint_at(
+                painter,
+                super::icons::Icon::Check,
+                center,
+                13.,
+                Color32::WHITE,
+            );
+        }
+        Mark::Failed => {
+            painter.circle_filled(center, 10., Color32::from_rgb(150, 72, 52));
+            super::icons::paint_at(
+                painter,
+                super::icons::Icon::Close,
+                center,
+                12.,
+                Color32::WHITE,
+            );
+        }
+    }
+}
+/// The folders of `subfolder` under each of `dirs` that exist, one a line,
+/// for a row's hover; None when there are none.
+fn folders(dirs: &[&Option<PathBuf>], subfolder: &str) -> Option<String> {
+    let lines: Vec<String> = dirs
+        .iter()
+        .filter_map(|dir| dir.as_ref())
+        .map(|dir| pretty_path(&dir.join(subfolder)))
+        .collect();
+    (!lines.is_empty()).then(|| format!("Looks in\n{}", lines.join("\n")))
+}
+/// The button that opens the default catalog, made on first use.
+fn default_catalog_label(path: &std::path::Path) -> &'static str {
+    if path.exists() {
+        "Open the Photos catalog"
+    } else {
+        "Start a new catalog"
+    }
+}
+/// "1 photo", "312 photos".
+fn count(n: usize, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+/// A hairline across the card, between rows.
+fn divider(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 0., theme::palette(ui.ctx()).gray(40));
+}
+/// Wrapped text with room between its lines.
+fn paragraph(ui: &mut egui::Ui, value: &str, size: f32, gray: u8) {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(value)
+                .size(size)
+                .line_height(Some(size * 1.45))
+                .color(theme::palette(ui.ctx()).gray(gray)),
+        )
+        .wrap(),
+    );
 }
 fn text(ui: &mut egui::Ui, value: &str, size: f32, gray: u8) {
     ui.label(
         egui::RichText::new(value)
             .size(size)
-            .color(theme::gray(gray)),
-    );
-}
-fn body(ui: &mut egui::Ui, value: &str) {
-    ui.add(
-        egui::Label::new(
-            egui::RichText::new(value)
-                .size(13.)
-                .line_height(Some(19.))
-                .color(theme::gray(170)),
-        )
-        .wrap(),
+            .color(theme::palette(ui.ctx()).gray(gray)),
     );
 }
 fn hint(ui: &mut egui::Ui, value: &str) {
@@ -688,87 +1024,32 @@ fn names_camera(name: &str, camera: &str) -> bool {
     let (name, camera) = (name.to_lowercase(), camera.to_lowercase());
     name.starts_with(&format!("{camera} ")) || name.contains(&format!(" {camera} "))
 }
-/// A hint with a spinner, while the scan runs.
-fn looking(ui: &mut egui::Ui, value: &str) {
-    ui.horizontal(|ui| {
-        ui.add(egui::Spinner::new().size(12.).color(theme::gray(170)));
-        hint(ui, value);
-    });
-}
-/// A labelled folder path in a quiet monospace chip.
-fn location(ui: &mut egui::Ui, label: &str, path: &str) {
-    ui.horizontal(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::new(48., 22.), Sense::hover());
-        ui.painter().text(
-            rect.left_center(),
-            egui::Align2::LEFT_CENTER,
-            label,
-            egui::FontId::proportional(11.),
-            theme::gray(125),
-        );
-        egui::Frame::new()
-            .fill(theme::gray(24))
-            .corner_radius(4.)
-            .inner_margin(egui::Margin::symmetric(8, 3))
-            .show(ui, |ui| {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(path)
-                            .monospace()
-                            .size(11.)
-                            .color(theme::gray(180)),
-                    )
-                    .truncate(),
-                );
-            });
-    });
-    ui.add_space(4.);
-}
-/// A step's import button, as chosen.
-enum Choice {
-    /// The files the step found.
-    Found,
-    Folder,
-    Files,
-}
-/// A step's import buttons: the files found, if any, then a folder or files
-/// of your choosing. The first one is the primary action.
-fn import_buttons(ui: &mut egui::Ui, found: Option<String>, enabled: bool) -> Option<Choice> {
-    let mut choice = None;
-    ui.horizontal(|ui| {
-        ui.add_enabled_ui(enabled, |ui| {
-            if let Some(label) = &found
-                && primary(ui, label).clicked()
-            {
-                choice = Some(Choice::Found);
-            }
-            let folder = if found.is_some() {
-                secondary(ui, "Choose folder…")
-            } else {
-                primary(ui, "Choose folder…")
-            };
-            if folder
-                .on_hover_text("Imports every file in the folder and its subfolders")
-                .clicked()
-            {
-                choice = Some(Choice::Folder);
-            }
-            if secondary(ui, "Choose files…").clicked() {
-                choice = Some(Choice::Files);
-            }
-        });
-    });
-    choice
-}
 fn primary(ui: &mut egui::Ui, label: &str) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
     ui.add(
         egui::Button::new(
             egui::RichText::new(label)
                 .size(13.)
-                .color(theme::on_accent()),
+                .color(palette.on_accent()),
         )
-        .fill(theme::accent())
+        .fill(palette.accent())
         .min_size(Vec2::new(0., 28.)),
+    )
+}
+/// The primary button with an icon before its label.
+fn icon_primary(ui: &mut egui::Ui, icon: super::icons::Icon, label: &str) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
+    ui.add(
+        egui::Button::image_and_text(
+            egui::Image::new(icon.uri())
+                .fit_to_exact_size(Vec2::splat(15.))
+                .tint(palette.on_accent()),
+            egui::RichText::new(label)
+                .size(13.)
+                .color(palette.on_accent()),
+        )
+        .fill(palette.accent())
+        .min_size(Vec2::new(0., 30.)),
     )
 }
 fn secondary(ui: &mut egui::Ui, label: &str) -> egui::Response {
@@ -791,7 +1072,8 @@ mod tests {
         drop(c);
         let ctx = egui::Context::default();
         let library = crate::app::library::Library::load(&catalog, ctx.clone())?;
-        let mut editor = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+        let mut editor =
+            Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
         editor.library = Some(Box::new(library));
         editor.open_onboarding();
         let frame = |editor: &mut Editor| {
@@ -810,7 +1092,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
             frame(&mut editor);
         }
-        assert_eq!(editor.onboarding.scanned_for.as_deref(), Some(&*catalog));
+        let catalog = CatalogLocation::File(catalog);
+        assert_eq!(editor.onboarding.scanned_for.as_ref(), Some(&catalog));
         assert!(editor.onboarding.found.cameras.is_empty());
 
         // A scan superseded by a later one is ignored.
@@ -824,6 +1107,31 @@ mod tests {
         editor.onboarding_scanned(stale, found);
         assert!(editor.onboarding.scanning());
         assert!(editor.onboarding.found.cameras.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_lightroom_catalog_is_imported_only_when_the_open_catalog_came_from_it()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        // The default catalog, named like the Lightroom catalog found.
+        let catalog = dir.path().join("Photos.rawmakase");
+        crate::catalog::Catalog::create(&catalog)?;
+        let source = dir.path().join("Photos.lrcat");
+        std::fs::write(&source, b"lightroom")?;
+        let ctx = egui::Context::default();
+        let mut editor =
+            Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
+        editor.library = Some(Box::new(crate::app::library::Library::load(&catalog, ctx)?));
+        editor.onboarding.found.catalogs = vec![source.clone()];
+        let row = editor.catalog_row();
+        assert!(row.mark == Mark::Todo);
+        assert_eq!(row.import.as_deref(), Some("Import"));
+
+        editor.onboarding.imported_from = vec![source];
+        let row = editor.catalog_row();
+        assert!(row.mark == Mark::Done);
+        assert_eq!(row.import, None);
         Ok(())
     }
 

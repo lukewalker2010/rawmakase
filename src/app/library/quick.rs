@@ -4,17 +4,17 @@
 //! change is one undoable command.
 use super::{Library, Place};
 use crate::app::widgets::plural;
-use crate::catalog::{CollectionKind, QUICK_COLLECTION};
+use crate::catalog::PhotoId;
 use anyhow::Result;
 
 /// A change to a collection's photos, for the shared undo log.
 #[derive(Clone, Debug, PartialEq)]
-pub struct CollectionCommand {
+pub(crate) struct CollectionCommand {
     /// Orders it among other changes made in the same frame.
     pub sequence: u64,
-    pub collection: i64,
-    pub added: Vec<i64>,
-    pub removed: Vec<i64>,
+    pub collection: crate::catalog::CollectionId,
+    pub added: Vec<PhotoId>,
+    pub removed: Vec<PhotoId>,
     pub place_before: Place,
     pub place_after: Place,
     /// What changed, as the status line said it.
@@ -23,33 +23,22 @@ pub struct CollectionCommand {
 
 impl Library {
     /// The Quick Collection, once there is one.
-    pub(super) fn quick(&self) -> Option<i64> {
-        self.collections
-            .iter()
-            .find(|c| {
-                c.kind == CollectionKind::System && c.name == QUICK_COLLECTION && c.parent.is_none()
-            })
-            .map(|c| c.id)
+    pub(super) fn quick(&self) -> Option<crate::catalog::CollectionId> {
+        self.session.quick_collection()
     }
     /// The Quick Collection, made if there is none yet.
-    fn ensure_quick(&mut self) -> Result<i64> {
-        if let Some(id) = self.quick() {
-            return Ok(id);
-        }
-        let id = self.catalog.quick_collection()?;
-        self.collections = self.catalog.collections()?;
-        self.collection_photos.entry(id).or_default();
-        Ok(id)
+    fn ensure_quick(&mut self) -> Result<crate::catalog::CollectionId> {
+        self.session.ensure_quick_collection()
     }
-    pub(super) fn in_quick(&self, id: i64) -> bool {
+    pub(super) fn in_quick(&self, id: PhotoId) -> bool {
         self.quick()
-            .and_then(|q| self.collection_photos.get(&q))
+            .and_then(|q| self.session.collection_photos.get(&q))
             .is_some_and(|members| members.contains(&id))
     }
     /// The Quick Collection's photo count, for the Catalog panel.
     pub(super) fn quick_count(&self) -> usize {
         self.quick()
-            .and_then(|q| self.collection_photos.get(&q))
+            .and_then(|q| self.session.collection_photos.get(&q))
             .map_or(0, |members| members.len())
     }
     pub(super) fn showing_quick(&self) -> bool {
@@ -57,7 +46,7 @@ impl Library {
     }
     /// B: adds `ids` to the Quick Collection, or takes them out when they are
     /// all in it already.
-    pub(in crate::app) fn toggle_quick(&mut self, ids: &[i64]) -> Result<()> {
+    pub(in crate::app) fn toggle_quick(&mut self, ids: &[PhotoId]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -66,7 +55,7 @@ impl Library {
         let (added, removed, verb) = if all_in {
             (Vec::new(), ids.to_vec(), "Removed from")
         } else {
-            let added: Vec<i64> = ids
+            let added: Vec<PhotoId> = ids
                 .iter()
                 .copied()
                 .filter(|id| !self.in_quick(*id))
@@ -85,7 +74,8 @@ impl Library {
         let Some(quick) = self.quick() else {
             return Ok(());
         };
-        let removed: Vec<i64> = self
+        let removed: Vec<PhotoId> = self
+            .session
             .collection_photos
             .get(&quick)
             .map(|m| m.iter().copied().collect())
@@ -107,7 +97,7 @@ impl Library {
         Ok(())
     }
     /// B, Cmd+B and Cmd+Shift+B, for `ids`.
-    pub(super) fn quick_key(&mut self, modifiers: eframe::egui::Modifiers, ids: Vec<i64>) {
+    pub(super) fn quick_key(&mut self, modifiers: eframe::egui::Modifiers, ids: Vec<PhotoId>) {
         // Option, and Control on a Mac, make other keys.
         if modifiers.alt || (modifiers.ctrl && (modifiers.mac_cmd || !modifiers.command)) {
             return;
@@ -125,16 +115,16 @@ impl Library {
     /// Makes a change and hands it to the undo log once it is saved.
     fn record_collection(
         &mut self,
-        collection: i64,
-        added: Vec<i64>,
-        removed: Vec<i64>,
+        collection: crate::catalog::CollectionId,
+        added: Vec<PhotoId>,
+        removed: Vec<PhotoId>,
         summary: String,
     ) -> Result<()> {
         let place_before = self.place();
         self.change_collection(collection, &added, &removed)?;
         self.message = summary.clone();
         self.collection_done.push(CollectionCommand {
-            sequence: crate::app::undo::sequence(),
+            sequence: crate::edit_session::sequence(),
             collection,
             added,
             removed,
@@ -148,23 +138,18 @@ impl Library {
     /// and their undo.
     pub(in crate::app) fn change_collection(
         &mut self,
-        collection: i64,
-        add: &[i64],
-        remove: &[i64],
+        collection: crate::catalog::CollectionId,
+        add: &[PhotoId],
+        remove: &[PhotoId],
     ) -> Result<()> {
         // A photo removed since (a virtual copy) is left out.
-        let add: Vec<i64> = add
+        let add: Vec<PhotoId> = add
             .iter()
             .copied()
             .filter(|id| self.photo(*id).is_some())
             .collect();
         let add = add.as_slice();
-        self.catalog.change_collection(collection, add, remove)?;
-        let members = self.collection_photos.entry(collection).or_default();
-        members.extend(add);
-        for id in remove {
-            members.remove(id);
-        }
+        let members = self.session.change_collection(collection, add, remove)?;
         if self.filters.collection == Some(collection) {
             self.filters.members = members.clone();
             self.filter();

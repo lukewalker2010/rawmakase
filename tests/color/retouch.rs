@@ -1,12 +1,14 @@
 //! Spot removal on a synthetic chart: dust on a smooth gradient and on a lit texture,
 //! healed with automatically chosen sources, scored against the clean render.
 use crate::{chart_path, develop, embedded_profiles, measure};
+use rawmakase::model::image_frame::ImageFrame;
 use rawmakase::{
-    develop::{
-        ImageFrame, Recipe, ViewMapping, render,
-        retouch::{RetouchMode, RetouchOp, RetouchShape, find_source},
+    camera_data::CameraImage,
+    develop::{ViewMapping, render, retouch::find_source},
+    model::{
+        recipe::Recipe,
+        retouch::{RetouchMode, RetouchOp, RetouchShape},
     },
-    raw::CameraImage,
 };
 
 /// The chart's camera and metadata with a gradient above a lit texture, so results
@@ -72,10 +74,10 @@ fn dust_on_gradient_and_texture_heals_cleanly() {
             op
         })
         .collect();
-    let reference = render(&clean, &recipe, 0).unwrap();
+    let reference = render(&clean, &recipe.checked().unwrap(), 0).unwrap();
     let score = |recipe: &Recipe| {
         let expected = &reference;
-        let actual = render(&dusty, recipe, 0).unwrap();
+        let actual = render(&dusty, &recipe.checked().unwrap(), 0).unwrap();
         let rw = expected.width as usize;
         let map = ViewMapping::new(&clean, recipe);
         let mut worst: f64 = 0.;

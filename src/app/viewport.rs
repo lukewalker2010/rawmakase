@@ -4,6 +4,7 @@ use super::crop_tool::{Attention, Guide, Ruler};
 use super::icons::{self, Icon};
 use super::navigator;
 use super::state::{TextureMode, Tool};
+use crate::app::Module;
 use crate::app::theme;
 use crate::develop::{self, Geometry};
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
@@ -16,7 +17,7 @@ impl Editor {
             return;
         }
         if let Some(im) = self.document.full().cloned() {
-            let mut r = self.document.recipe.clone();
+            let mut r = self.document.edit.recipe().clone();
             r.crop = [0., 0., 1., 1.];
             let g = Geometry::new(&im, &r, 0);
             let portrait = g.oriented_height > g.oriented_width;
@@ -28,7 +29,7 @@ impl Editor {
                 self.view.aspect
             };
             let ratio = aspect * g.oriented_height / g.oriented_width;
-            let c = &mut self.document.recipe.crop;
+            let c = &mut self.document.edit.recipe_mut().crop;
             let cx = (c[0] + c[2]) / 2.;
             let cy = (c[1] + c[3]) / 2.;
             let mut w = c[2] - c[0];
@@ -54,12 +55,12 @@ impl Editor {
             return;
         };
         self.view.aspect_read = true;
-        let c = self.document.recipe.crop;
+        let c = self.document.edit.recipe().crop;
         if c == [0., 0., 1., 1.] {
             self.view.aspect = -1.;
             return;
         }
-        let mut r = self.document.recipe.clone();
+        let mut r = self.document.edit.recipe().clone();
         r.crop = [0., 0., 1., 1.];
         let g = Geometry::new(&im, &r, 0);
         let photo = g.oriented_width / g.oriented_height;
@@ -87,6 +88,13 @@ impl Editor {
     /// Lightroom's Navigator: the whole photo with the zoomed area outlined.
     /// Clicking or dragging in it moves the zoomed view there.
     pub(super) fn navigator_ui(&mut self, ui: &mut egui::Ui) {
+        let (photo, shown) = self.navigator_view();
+        if let Some(change) = navigator::navigator(ui, photo, Some(self.view.zoom), shown) {
+            self.navigator_change(change);
+        }
+    }
+    /// What Develop's Navigator shows: the photo, and the part in view.
+    pub(super) fn navigator_view(&self) -> (Option<navigator::Photo>, Option<[f32; 4]>) {
         let shown = self
             .region()
             .zip(self.document.full())
@@ -109,45 +117,66 @@ impl Editor {
                     .thumbnail(self.document.catalog_photo?)?;
                 Some((texture.id(), texture.size_vec2()))
             });
-        match navigator::navigator(ui, photo, Some(self.view.zoom), shown) {
-            Some(navigator::Change::Level(level)) => self.set_zoom(level),
-            Some(navigator::Change::Inspect(at)) => {
+        (photo, shown)
+    }
+    /// A zoom chosen in Develop's Navigator.
+    pub(super) fn navigator_change(&mut self, change: navigator::Change) {
+        match change {
+            navigator::Change::Level(level) => self.set_zoom(level),
+            navigator::Change::Inspect(at) => {
                 self.view.zoom.pan = at;
                 self.view.zoom.on = true;
                 if self.view.is(Tool::Crop) {
                     self.view.tool = Tool::None;
                 }
             }
-            None => {}
         }
     }
     /// Before the first image arrives: the Library preview of the photo being
-    /// opened with a spinner, or a hint when nothing is open.
+    /// opened with a spinner, or without one if it could not be opened, or a
+    /// hint when nothing is open.
     fn loading_placeholder(&self, ui: &mut egui::Ui, area: Rect) {
+        let palette = theme::palette(ui.ctx());
         // A photo counts as opening until its first render arrives, even after
         // the decode has finished; only an empty document shows the hint.
         let opening = self.load.is_running()
             || self.document.catalog_photo.is_some()
             || self.document.path.is_some();
         if !opening {
+            let empty = self
+                .library
+                .as_ref()
+                .is_none_or(|l| l.session.photos.is_empty());
             ui.painter().text(
                 area.center(),
                 egui::Align2::CENTER_CENTER,
-                "Pick a photo in the Library to edit it",
+                if empty {
+                    "Add photos in the Library to start editing"
+                } else {
+                    "Pick a photo in the Library to edit it"
+                },
                 egui::FontId::proportional(15.),
-                theme::gray(120),
+                palette.gray(120),
             );
             return;
         }
+        // The stored Standard preview, else the Library's.
         let thumb = self
-            .document
-            .catalog_photo
-            .and_then(|id| self.library.as_ref()?.thumbnail(id));
-        if let Some(texture) = thumb {
-            let size = texture.size_vec2();
+            .preview
+            .stand_in
+            .as_ref()
+            .map(|p| (p.id(), p.size_vec2()))
+            .or_else(|| {
+                let t = self
+                    .document
+                    .catalog_photo
+                    .and_then(|id| self.library.as_ref()?.thumbnail(id))?;
+                Some((t.id(), t.size_vec2()))
+            });
+        if let Some((texture, size)) = thumb {
             let k = (area.width() / size.x).min(area.height() / size.y);
             ui.painter().image(
-                texture.id(),
+                texture,
                 Rect::from_center_size(area.center(), size * k),
                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1., 1.)),
                 Color32::WHITE,
@@ -159,15 +188,25 @@ impl Editor {
         );
         ui.painter()
             .rect_filled(badge, 15., Color32::from_black_alpha(170));
+        if self.document.failed.is_some() {
+            ui.painter().text(
+                badge.center(),
+                egui::Align2::CENTER_CENTER,
+                "Couldn't open this photo",
+                egui::FontId::proportional(12.),
+                palette.gray(225),
+            );
+            return;
+        }
         let spinner =
             Rect::from_center_size(badge.left_center() + Vec2::new(20., 0.), Vec2::splat(14.));
-        ui.put(spinner, egui::Spinner::new().size(14.));
+        super::widgets::paint_spinner(ui, spinner, None);
         ui.painter().text(
             badge.left_center() + Vec2::new(36., 0.),
             egui::Align2::LEFT_CENTER,
             "Loading photo…",
             egui::FontId::proportional(12.),
-            theme::gray(225),
+            palette.gray(225),
         );
     }
     /// Sets a zoom level; 0 means Fit.
@@ -175,7 +214,7 @@ impl Editor {
         self.view.zoom.set(level);
         // A JPEG, TIFF or PNG in the Loupe zooms on its own; the document
         // behind it is not rendered again.
-        let raster_loupe = self.library_mode
+        let raster_loupe = self.module == Module::Library
             && self
                 .library
                 .as_ref()
@@ -196,7 +235,9 @@ impl Editor {
         let raster_fit = self
             .library
             .as_ref()
-            .filter(|l| self.library_mode && l.loupe_open() && l.loupe_develops().is_none())
+            .filter(|l| {
+                self.module == Module::Library && l.loupe_open() && l.loupe_develops().is_none()
+            })
             .map(|l| l.loupe_fit());
         // Not known until the image is decoded: no step until then.
         if raster_fit == Some(None) {
@@ -235,7 +276,8 @@ impl Editor {
     pub(super) fn viewport_ui(&mut self, ui: &mut egui::Ui) {
         let (whole, response) =
             ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
-        ui.painter().rect_filled(whole, 0., theme::photo_backdrop());
+        ui.painter()
+            .rect_filled(whole, 0., theme::palette(ui.ctx()).photo_backdrop());
         // The edit's side of the viewport; all of it unless Before shows beside it.
         let panes = before_after::panes(self.view.compare, whole);
         let area = panes.after.area;
@@ -264,7 +306,11 @@ impl Editor {
             TextureMode::Region(_) => self.preview.region.clone(),
             TextureMode::Whole => None,
         };
-        let Some(texture) = self.preview.texture.clone().or(region_texture.clone()) else {
+        // The stored preview outranks the embedded JPEG until the first render.
+        let shown = (!self.preview.standing_in())
+            .then(|| self.preview.texture.clone().or(region_texture.clone()))
+            .flatten();
+        let Some(texture) = shown else {
             // The reference stays on screen, and takes drops, while the Active photo
             // loads.
             if self.reference_view() {
@@ -439,7 +485,7 @@ impl Editor {
         }
         // The RGB readout follows the pointer over the photo being edited, not over
         // Before (alone or beside it) or the reference, nor in the Library's Loupe.
-        let edit_shown = !self.library_mode && !self.view.compare.before_only();
+        let edit_shown = self.module == Module::Develop && !self.view.compare.before_only();
         let hover = response
             .hover_pos()
             .filter(|p| edit_shown && panes.after.clip.contains(*p));
@@ -452,14 +498,11 @@ impl Editor {
         if self.wants_samples() {
             // The loupe and the readout read the shown pixels, which renders keep only
             // while they are wanted.
-            if !self.preview.samples_requested {
-                self.preview.samples_requested = true;
+            if self.preview.ask_for_samples() {
                 self.schedule();
             }
-        } else if self.preview.samples_requested {
-            self.preview.samples_requested = false;
-            self.preview.samples = None;
-            self.preview.region_samples = None;
+        } else {
+            self.preview.stop_asking_for_samples();
         }
         if self.view.picks_color()
             && let Some(pos) = response.hover_pos()
@@ -476,11 +519,10 @@ impl Editor {
         {
             let u = (pos.x - rect.left()) / rect.width();
             let v = (pos.y - rect.top()) / rect.height();
-            self.document.recipe.wb = develop::neutral_pick(&im, &self.document.recipe, u, v);
-            self.document.recipe.auto_white_balance = None;
-            self.document
-                .recipe
-                .sync_white_balance_controls(&im.metadata);
+            let gains = develop::neutral_pick(&im, self.document.edit.recipe(), u, v);
+            let recipe = self.document.edit.recipe_mut();
+            recipe.pick_white_balance(gains, &im.metadata);
+            recipe.auto_white_balance = None;
             self.view.tool = Tool::None;
         }
         // Point Color's dropper adds a swatch of the color under the pointer and
@@ -510,15 +552,11 @@ impl Editor {
             && let Some(pos) = response.interact_pointer_pos()
             && rect.contains(pos)
         {
-            let metadata = self.document.full().map(|im| im.metadata.clone());
             // The samples must come from the settings the pick is mapped through.
-            let current = self.preview.samples_recipe.as_ref() == Some(&self.effective_recipe());
-            match self
-                .shown_color(pos, rect, region_rect)
-                .filter(|_| current)
-                .zip(metadata)
-            {
-                Some((rgb, m)) => match develop::pick_fringe(&mut self.document.recipe, &m, rgb) {
+            let current = self.preview.samples_recipe.as_ref() == Some(&self.effective_recipe())
+                && self.document.full().is_some();
+            match self.shown_color(pos, rect, region_rect).filter(|_| current) {
+                Some(rgb) => match develop::pick_fringe(self.document.edit.recipe_mut(), rgb) {
                     Some(_) => self.view.tool = Tool::None,
                     None => {
                         self.status =
@@ -529,7 +567,7 @@ impl Editor {
             }
         }
         if self.view.is(Tool::Crop) && !self.view.zoom.on && self.document.full().is_some() {
-            let c = self.document.recipe.crop;
+            let c = self.document.edit.recipe().crop;
             let cr = Rect::from_min_max(
                 Pos2::new(
                     rect.left() + c[0] * rect.width(),
@@ -637,7 +675,7 @@ impl Editor {
                 c[1] = c[1].clamp(0., start[3] - 0.01);
                 c[2] = c[2].clamp(c[0] + 0.01, 1.);
                 c[3] = c[3].clamp(c[1] + 0.01, 1.);
-                self.document.recipe.crop = c;
+                self.document.edit.recipe_mut().crop = c;
                 self.fit_aspect();
             }
             if response.drag_stopped() {
@@ -719,12 +757,12 @@ impl Editor {
         }
         if response.drag_stopped() || !response.dragged() {
             self.view.ruler = Ruler::Off;
-            let current = self.document.recipe.straighten;
+            let current = self.document.edit.recipe().straighten;
             if let Some(angle) = super::crop_tool::ruler_angle(from, to, current)
                 && angle != current
             {
-                self.document.recipe.straighten = angle;
-                self.document.history.label(super::history::Step::new(
+                self.document.edit.recipe_mut().straighten = angle;
+                self.document.edit.name_next_step(super::history::Step::new(
                     "Straighten",
                     format!("{angle:+.2}"),
                 ));
@@ -735,7 +773,7 @@ impl Editor {
     /// The Loupe's Info overlay (I) over the photo being edited, below the Before,
     /// After or Active label when there is one. The Library's Loupe draws its own.
     fn develop_info_overlay(&mut self, ui: &egui::Ui, pane: Rect) {
-        if self.library_mode {
+        if self.module == Module::Library {
             return;
         }
         let labelled = self.view.compare != before_after::Compare::Off;
@@ -784,6 +822,7 @@ impl Editor {
         region: Option<Rect>,
         area: Rect,
     ) {
+        let palette = theme::palette(ui.ctx());
         const CELLS: i32 = 5;
         const CELL: f32 = 30.;
         let painter = ui
@@ -834,7 +873,7 @@ impl Editor {
             ))
         });
         let values =
-            painter.layout_no_wrap(text, egui::FontId::proportional(13.), theme::gray(225));
+            painter.layout_no_wrap(text, egui::FontId::proportional(13.), palette.gray(225));
         let grid = CELLS as f32 * CELL;
         let pad = 8.;
         let line = 24.;
@@ -863,17 +902,17 @@ impl Editor {
             }
             .as_shape(frame, 8.),
         );
-        painter.rect_filled(frame, 8., theme::gray(24));
+        painter.rect_filled(frame, 8., palette.gray(24));
         painter.text(
             Pos2::new(frame.center().x, frame.top() + line / 2.),
             egui::Align2::CENTER_CENTER,
             self.view.loupe_prompt(),
             egui::FontId::proportional(12.),
-            theme::gray(215),
+            palette.gray(215),
         );
         let origin = Pos2::new(frame.center().x - grid / 2., frame.top() + line);
         let cells = Rect::from_min_size(origin, Vec2::splat(grid));
-        painter.rect_filled(cells, 0., theme::gray(60));
+        painter.rect_filled(cells, 0., palette.gray(60));
         let half = CELLS / 2;
         for j in 0..CELLS {
             for i in 0..CELLS {
@@ -883,7 +922,7 @@ impl Editor {
                 )
                 .shrink(0.5);
                 let color = pixel(cx + i - half, cy + j - half)
-                    .map_or(theme::photo_backdrop(), |[r, g, b]| {
+                    .map_or(palette.photo_backdrop(), |[r, g, b]| {
                         Color32::from_rgb(r, g, b)
                     });
                 painter.rect_filled(cell, 0., color);
@@ -905,7 +944,7 @@ impl Editor {
         painter.galley(
             Pos2::new(frame.center().x, frame.bottom() - line / 2.) - values.size() / 2.,
             values,
-            theme::gray(225),
+            palette.gray(225),
         );
     }
 }

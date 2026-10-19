@@ -1,0 +1,320 @@
+//! What a camera captured, as values: a RAW's metadata as RAWmakase keeps it,
+//! the demosaic and decode choices, and the decoded camera-space image. Reading
+//! them from a file is the RAW decoders'; nothing here needs native code.
+use serde::{Deserialize, Serialize};
+
+/// A DNG's illuminant-independent diagonal camera calibration. The signature
+/// must match the selected profile before these gains may be used.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NeutralCalibration {
+    pub gains: [f32; 3],
+    pub signature: String,
+}
+
+/// What kind of file a photo's pixels come from: a camera RAW, or a
+/// rendered JPEG, PNG or TIFF decoded through its colour profile. A rendered file's
+/// develop [`CameraImage`] holds its pseudo-scene: linear ProPhoto values whose
+/// Camera Raw default rendering is the file (see `develop::rendered`), not the
+/// file's own values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Source {
+    #[default]
+    Raw,
+    Rendered,
+}
+
+impl Source {
+    pub fn is_raw(&self) -> bool {
+        *self == Source::Raw
+    }
+}
+
+/// A white-balance preset a camera stores for itself, as R, G, B multipliers.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WhiteBalancePreset {
+    Daylight,
+    Shade,
+    D65,
+    /// Olympus's 5300 K entry, which LibRaw names Fine Weather.
+    #[serde(rename = "fine-weather")]
+    FineWeather,
+}
+
+/// The presets of a native RAW that individual-unit calibration uses: Sony and
+/// most Canon bodies record theirs as Daylight, some Canon bodies as Shade,
+/// Fujifilm as the D65 entry of its standard-illuminant table, and Olympus and
+/// OM System as the 5300 K entry (Fine Weather). Each is `None` when the RAW has
+/// none or it is not positive and finite.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct WhiteBalancePresets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daylight: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shade: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub d65: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fine_weather: Option<[f32; 3]>,
+}
+impl WhiteBalancePresets {
+    pub fn get(&self, preset: WhiteBalancePreset) -> Option<[f32; 3]> {
+        match preset {
+            WhiteBalancePreset::Daylight => self.daylight,
+            WhiteBalancePreset::Shade => self.shade,
+            WhiteBalancePreset::D65 => self.d65,
+            WhiteBalancePreset::FineWeather => self.fine_weather,
+        }
+    }
+    /// Keeps a preset only when every multiplier is positive and finite.
+    pub fn valid(v: [f32; 3]) -> Option<[f32; 3]> {
+        v.iter().all(|v| v.is_finite() && *v > 0.).then_some(v)
+    }
+    fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Metadata {
+    pub make: String,
+    pub model: String,
+    pub width: u32,
+    pub height: u32,
+    pub raw_width: u32,
+    pub raw_height: u32,
+    /// The camera's default crop (Adobe's DNG DefaultCrop) in decoded pixels: the
+    /// frame image space, Lightroom's crop and its positions are relative to.
+    pub crop_width: u32,
+    pub crop_height: u32,
+    pub crop_left: u32,
+    pub crop_top: u32,
+    /// The aspect ratio chosen in the camera (1:1, 4:3, 16:9…), as `[left, top,
+    /// right, bottom]` fractions of the default crop. Like Camera Raw's default user
+    /// crop, it is the crop a photo's settings start from, not part of the frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera_crop: Option<[f32; 4]>,
+    pub flip: i32,
+    pub xtrans: bool,
+    #[serde(default)]
+    pub fuji_dynamic_range: u32,
+    /// Canon Highlight Tone Priority, from the maker notes; `Off` for other makes.
+    #[serde(default)]
+    pub highlight_tone_priority: HighlightTonePriority,
+    /// A Canon sRAW or mRAW (or Nikon sRAW): stored as YCbCr, which the decoder
+    /// converts to camera RGB on a scale of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sraw: bool,
+    /// A monochrome DNG (monochrome sensors, film scanners): developed as grey,
+    /// R = G = B, through a neutral camera matrix. It has no white balance, so
+    /// Temp and Tint do not apply (`Recipe::update_wb`), as in Lightroom.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub monochrome: bool,
+    /// Fujifilm's exposure midpoint shift in EV (maker note ExpoMidPointShift): about
+    /// −0.7 at DR100, a stop lower for each DR step up, a stop higher at extended
+    /// low ISO. `None` when the raw has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fuji_exposure_shift: Option<f32>,
+    pub iso: f32,
+    pub shutter: f32,
+    pub aperture: f32,
+    pub focal: f32,
+    /// Focal length in 35mm equivalent (EXIF FocalLengthIn35mmFilm); 0 when unknown.
+    #[serde(default)]
+    pub focal_35mm: f32,
+    pub wb: [f32; 3],
+    pub daylight_wb: [f32; 3],
+    /// White-balance presets the camera stored in a native RAW's maker notes.
+    /// Unlike `daylight_wb`, these are not calculated from a color matrix.
+    #[serde(default, skip_serializing_if = "WhiteBalancePresets::is_empty")]
+    pub wb_presets: WhiteBalancePresets,
+    pub matrix: [[f32; 3]; 3],
+    /// LibRaw's XYZ(D65)-to-camera matrix, equivalent to a DNG ColorMatrix. Zero when unknown.
+    #[serde(default)]
+    pub cam_xyz: [[f32; 3]; 3],
+    /// Built-in lens correction stored by the camera, when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lens: Option<crate::optics::LensCorrection>,
+    /// Lens model as recorded by the camera, e.g. "FE 55mm F1.8 ZA". A file that
+    /// records only `lens_id` takes the name of the imported lens profile that
+    /// identifies it (see `rawmakase_decode::photo::open`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lens_model: String,
+    /// The maker's numeric lens ID from the maker notes (Nikon's `LensIDNumber`,
+    /// Pentax's two `LensType` bytes as 4 << 8 | 252, as the lens profiles'
+    /// `stCamera:LensID` holds them too); 0 when the file records none. Cameras that
+    /// write no lens model leave the ID as the only lens identity.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub lens_id: u32,
+    /// Other names, as "Make Model", that Adobe's camera profiles may use for this
+    /// camera: LibRaw's canonical name for a body sold under several names, and
+    /// `crate::cameras::adobe_names`' table. See `CameraProfile::ensure_camera`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adobe_names: Vec<String>,
+    /// DNG BaselineExposure (0 when the DNG has none); `None` for other formats.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_exposure: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dng_neutral_calibration: Option<NeutralCalibration>,
+    /// A linear raw DNG's AnalogBalance relative to green, when not 1: gains
+    /// its writer applied to the samples, which `wb` is of. A white set by
+    /// temperature is the profile's camera neutral times these gains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dng_analog_balance: Option<[f32; 3]>,
+    /// Signature of a DNG's matrix-only profile, retained when no forward profile parses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dng_matrix_profile_signature: Option<String>,
+    /// Raw unless the photo is a JPEG, PNG or TIFF. Raw is not written, so RAW
+    /// metadata keeps its saved form; metadata from earlier releases reads as Raw.
+    #[serde(default, skip_serializing_if = "Source::is_raw")]
+    pub source: Source,
+    /// The sensor data's mean black, white and maximum (the samples' bit depth's)
+    /// where the decoder knows them on opening (Canon's mosaics, whose white
+    /// Adobe takes by ISO speed): the camera exposure follows the white as
+    /// Adobe's BaselineExposure does (`camera_profiles::reference`). Read again
+    /// on open, not saved.
+    #[serde(skip)]
+    pub levels: Option<[u32; 3]>,
+    /// Imported Adobe lens profiles that fit this camera, Enable Profile Corrections'
+    /// choices; rebuilt on open.
+    #[serde(skip)]
+    pub lens_profiles: crate::optics::lcp::PhotoProfiles,
+    /// Lateral chromatic aberration measured from the decoded image, shared by every
+    /// image made from it (see `crate::lens::auto_ca::prime`).
+    #[serde(skip)]
+    pub lateral_ca: std::sync::Arc<std::sync::OnceLock<Option<[crate::optics::Radial; 2]>>>,
+    /// The camera profile a DNG embeds, in DCP form, when it reads and fits this
+    /// camera (`camera_profiles::builtin` reads it); rebuilt from the file on open.
+    #[serde(skip)]
+    pub embedded_dcp: Option<std::sync::Arc<[u8]>>,
+}
+impl Metadata {
+    pub fn is_rendered(&self) -> bool {
+        self.source == Source::Rendered
+    }
+
+    /// Adobe's default crop (DNG DefaultCrop, or the RAF header's crop, which is
+    /// 2 px larger per side than LibRaw's), as `[left, top, width, height]`;
+    /// ignored unless it fits the image.
+    pub fn apply_default_crop(&mut self, [left, top, width, height]: [u32; 4]) {
+        if left.checked_add(width).is_some_and(|r| r <= self.width)
+            && top.checked_add(height).is_some_and(|b| b <= self.height)
+        {
+            self.crop_left = left;
+            self.crop_top = top;
+            self.crop_width = width;
+            self.crop_height = height;
+        }
+    }
+}
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+/// Canon Highlight Tone Priority: the camera exposes a stop darker to keep
+/// highlights, and Camera Raw brightens the photo by that stop again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HighlightTonePriority {
+    #[default]
+    Off,
+    On,
+    /// "Enhanced" (D+2) on recent bodies. No sample has been measured yet.
+    Enhanced,
+}
+impl HighlightTonePriority {
+    /// From LibRaw's `makernotes.canon.HighlightTonePriority`.
+    pub fn from_libraw(v: i32) -> Self {
+        match v {
+            1 => Self::On,
+            2 => Self::Enhanced,
+            _ => Self::Off,
+        }
+    }
+}
+/// Which demosaic full-size development uses, passed to each job that decodes.
+/// RAWmakase's own is the only one; the preference RAWmakase once offered
+/// (LibRaw's AHD and Markesteijn, saved as `"Libraw"`) reads as it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Demosaic {
+    /// RAWmakase's own demosaic of the unpacked sensor data (`crate::demosaic`).
+    #[default]
+    #[serde(alias = "Libraw")]
+    Rawmakase,
+}
+/// What [`Raw::develop`] makes of the sensor data. A job captures it when it is
+/// created and keys its decode-cache entry with the same value, so a preference
+/// changed while the job runs can never file one demosaic under another's key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decode {
+    /// A half-size draft: each pixel a 2 × 2 block of the mosaic.
+    Half,
+    /// Every pixel, demosaiced this way.
+    Full(Demosaic),
+}
+impl Decode {
+    /// Full size, with `preferred`.
+    pub fn full(preferred: Demosaic) -> Self {
+        Self::Full(preferred)
+    }
+}
+impl crate::metadata::PhotoInfo {
+    /// From a RAW's metadata, as the decoder reads it.
+    pub fn from_metadata(m: &Metadata) -> Self {
+        let positive = |v: f32| (v > 0.).then_some(v as f64);
+        let text = |t: &str| (!t.trim().is_empty()).then(|| t.trim().to_string());
+        // LibRaw's flip 5 and 6 are quarter turns.
+        // The camera's default crop is the frame shown, when it has one.
+        let (w, h) = if m.crop_width > 0 && m.crop_height > 0 {
+            (m.crop_width, m.crop_height)
+        } else {
+            (m.width, m.height)
+        };
+        let (w, h) = if matches!(m.flip, 5 | 6) {
+            (h, w)
+        } else {
+            (w, h)
+        };
+        Self {
+            camera: text(&m.model).or_else(|| text(&m.make)),
+            lens: text(&m.lens_model),
+            focal: positive(m.focal),
+            aperture: positive(m.aperture),
+            exposure: positive(m.shutter),
+            iso: positive(m.iso),
+            dimensions: (w > 0 && h > 0).then_some((w, h)),
+        }
+    }
+}
+/// A decoded photo for developing. For a RAW, camera-space values; for a rendered
+/// file ([`Source::Rendered`]), its pseudo-scene: linear ProPhoto values whose Camera
+/// Raw default rendering is the file (see `develop::rendered`).
+#[derive(Clone)]
+pub struct CameraImage {
+    pub width: u32,
+    pub height: u32,
+    pub recovered: std::sync::OnceLock<std::sync::Arc<CameraImage>>,
+    pub pixels: Vec<[f32; 3]>,
+    pub metadata: Metadata,
+    pub fast: bool,
+    pub scale_factor: f32,
+    pub scale_clipped: u32,
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    #[test]
+    fn metadata_saved_before_sources_reads_as_raw() {
+        // A Metadata serialised by an earlier release has no `source`.
+        let mut v = serde_json::to_value(Metadata::default()).unwrap();
+        v.as_object_mut().unwrap().remove("source");
+        let m: Metadata = serde_json::from_value(v).unwrap();
+        assert_eq!(m.source, Source::Raw);
+        assert!(!m.is_rendered());
+        let r = Metadata {
+            source: Source::Rendered,
+            ..Default::default()
+        };
+        let back: Metadata = serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+        assert!(back.is_rendered());
+    }
+}

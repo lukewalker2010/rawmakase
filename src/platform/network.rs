@@ -1,6 +1,6 @@
 //! Make desktop-mounted network shares accessible to filesystem-based RAW readers.
 #[cfg(target_os = "linux")]
-pub fn prepare_filesystem_bridge() {
+pub(crate) fn prepare_filesystem_bridge() {
     use std::{
         path::{Path, PathBuf},
         process::{Command, Stdio},
@@ -31,7 +31,7 @@ pub fn prepare_filesystem_bridge() {
         return;
     }
     // GVFS already owns the share/session/authentication. This exposes its existing
-    // mounts to native file choosers and LibRaw; no share credentials are handled here.
+    // mounts to native file choosers and the decoders; no share credentials are handled here.
     let Ok(mut child) = Command::new(binary)
         .arg(&mount)
         .arg("-f")
@@ -75,7 +75,7 @@ fn bridge_is_mounted(mountinfo: &str, path: &std::path::Path) -> bool {
     })
 }
 #[cfg(not(target_os = "linux"))]
-pub fn prepare_filesystem_bridge() {}
+pub(crate) fn prepare_filesystem_bridge() {}
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;

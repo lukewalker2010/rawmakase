@@ -5,6 +5,7 @@ use super::Editor;
 use super::icons::{self, Icon};
 use super::theme;
 use super::widgets::modal_frame;
+use crate::app::Module;
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 
 /// A shortcut: its keys and what it does. Keys are written "Cmd+Shift+Z";
@@ -14,7 +15,7 @@ type Shortcut = (&'static str, &'static str);
 /// A titled group of shortcuts.
 type Group<'a> = (&'a str, &'a [Shortcut]);
 
-const LIBRARY: [Shortcut; 9] = [
+const LIBRARY: [Shortcut; 10] = [
     ("Arrows", "Move the active photo"),
     ("Home / End", "First / last photo"),
     ("Shift+Arrows / Shift+click", "Extend the selection"),
@@ -24,6 +25,10 @@ const LIBRARY: [Shortcut; 9] = [
     ("/", "Deselect the active photo"),
     ("Cmd+L", "Turn the filters off / on"),
     ("J", "Cycle the grid cell style"),
+    (
+        "Cmd+Shift+S",
+        "Sync the active photo's settings to the selection",
+    ),
 ];
 const LOUPE: [Shortcut; 7] = [
     ("E / Return / double-click", "Open the Loupe"),
@@ -64,14 +69,18 @@ const QUICK: [Shortcut; 3] = [
     ("Cmd+B", "Show it"),
     ("Cmd+Shift+B", "Clear it"),
 ];
-const GENERAL: [Shortcut; 5] = [
+const GENERAL: [Shortcut; 9] = [
     ("G", "Library"),
     ("D", "Develop"),
+    ("Tab", "Hide / show the side panels"),
+    ("Shift+Tab", "Hide / show the side panels and filmstrip"),
+    ("F7 / F8 / F6", "Left panel / right panel / filmstrip"),
+    ("Shift+F8", "Fold / open Presets and History"),
     ("Cmd+'", "Create virtual copy"),
     ("Cmd+,", "Preferences"),
     ("Cmd+/", "These shortcuts"),
 ];
-const DEVELOP: [Shortcut; 47] = [
+const DEVELOP: [Shortcut; 49] = [
     ("R", "Crop & Straighten"),
     ("Return", "Finish the crop"),
     ("X", "Swap the crop's orientation"),
@@ -112,6 +121,8 @@ const DEVELOP: [Shortcut; 47] = [
     ("J", "Show shadow and highlight clipping"),
     ("Z / F", "Toggle zoom / fit"),
     ("Left / Right", "Previous / next photo"),
+    ("Cmd+A", "Select all in the filmstrip, for Sync"),
+    ("Cmd+D", "Select none in the filmstrip"),
     ("Cmd+Shift+C / Cmd+Shift+V", "Copy / paste settings"),
     ("Cmd+Option+V", "Paste settings from previous photo"),
     ("Cmd+Shift+S", "Sync settings to the selected photos"),
@@ -137,6 +148,7 @@ const ROW: f32 = 26.;
 
 impl Editor {
     pub(super) fn shortcuts_window(&mut self, ctx: &egui::Context) {
+        let palette = theme::palette(ctx);
         if !self.view.shortcuts {
             return;
         }
@@ -158,7 +170,7 @@ impl Editor {
         ];
         let develop: [Group; 1] = [("Develop", &DEVELOP)];
         // The current module's shortcuts come first, in the left column.
-        let (left, right): (Vec<Group>, Vec<Group>) = if self.library_mode {
+        let (left, right): (Vec<Group>, Vec<Group>) = if self.module == Module::Library {
             (views.to_vec(), [&common[..], &develop].concat())
         } else {
             ([&develop[..], &common].concat(), views.to_vec())
@@ -166,7 +178,7 @@ impl Editor {
         let (left, right) = (left.as_slice(), right.as_slice());
         let response = egui::Modal::new(egui::Id::new("keyboard-shortcuts"))
             .backdrop_color(Color32::from_black_alpha(140))
-            .frame(modal_frame().inner_margin(egui::Margin::symmetric(28, 22)))
+            .frame(modal_frame(&palette).inner_margin(egui::Margin::symmetric(28, 22)))
             .show(ctx, |ui| {
                 ui.set_width(WIDTH);
                 let mut close = false;
@@ -174,13 +186,13 @@ impl Editor {
                     ui.label(
                         egui::RichText::new("Keyboard Shortcuts")
                             .size(17.)
-                            .color(theme::gray(235)),
+                            .color(palette.gray(235)),
                     );
                     ui.add_space(10.);
                     ui.label(
                         egui::RichText::new(format!("{} shows this anytime", keys_text("Cmd+/")))
                             .size(12.)
-                            .color(theme::gray(130)),
+                            .color(palette.gray(130)),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         close = icon_button(ui, Icon::Close, "Close · Esc").clicked();
@@ -214,10 +226,11 @@ impl Editor {
 }
 
 fn group(ui: &mut egui::Ui, title: &str, shortcuts: &[Shortcut]) {
+    let palette = theme::palette(ui.ctx());
     ui.label(
         egui::RichText::new(title.to_uppercase())
             .size(10.5)
-            .color(theme::gray(125)),
+            .color(palette.gray(125)),
     );
     ui.add_space(6.);
     for (keys, action) in shortcuts {
@@ -241,7 +254,7 @@ fn group(ui: &mut egui::Ui, title: &str, shortcuts: &[Shortcut]) {
                     Align2::RIGHT_CENTER,
                     "/",
                     FontId::proportional(11.),
-                    theme::gray(100),
+                    palette.gray(100),
                 );
                 x -= 10.;
             }
@@ -251,7 +264,7 @@ fn group(ui: &mut egui::Ui, title: &str, shortcuts: &[Shortcut]) {
             Align2::LEFT_CENTER,
             *action,
             FontId::proportional(12.5),
-            theme::gray(205),
+            palette.gray(205),
         );
     }
     ui.add_space(16.);
@@ -260,12 +273,13 @@ fn group(ui: &mut egui::Ui, title: &str, shortcuts: &[Shortcut]) {
 /// Draws one key cap ending at `right`; returns its left edge. A word in
 /// lower case is an action, drawn as plain text.
 fn key_cap(ui: &egui::Ui, cap: &str, right: Pos2) -> f32 {
+    let palette = theme::palette(ui.ctx());
     let label = cap_label(cap);
     let action = cap.chars().all(|c| c.is_lowercase() || c == '-') && cap.len() > 1;
     let galley = ui.painter().layout_no_wrap(
         label,
         FontId::proportional(if action { 11.5 } else { 11. }),
-        theme::gray(if action { 150 } else { 230 }),
+        palette.gray(if action { 150 } else { 230 }),
     );
     if action {
         let left = right.x - galley.size().x;
@@ -284,8 +298,8 @@ fn key_cap(ui: &egui::Ui, cap: &str, right: Pos2) -> f32 {
     ui.painter().rect(
         cap_rect,
         4.,
-        theme::gray(46),
-        Stroke::new(1., theme::gray(62)),
+        palette.gray(46),
+        Stroke::new(1., palette.gray(62)),
         egui::StrokeKind::Inside,
     );
     ui.painter().galley(
@@ -298,11 +312,12 @@ fn key_cap(ui: &egui::Ui, cap: &str, right: Pos2) -> f32 {
 
 /// A small borderless icon button, as in the top bar.
 pub(super) fn icon_button(ui: &mut egui::Ui, icon: Icon, hover: &str) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(26.), Sense::click());
     if response.hovered() {
-        ui.painter().rect_filled(rect, 4., theme::gray(45));
+        ui.painter().rect_filled(rect, 4., palette.gray(45));
     }
-    let color = theme::gray(if response.hovered() { 235 } else { 160 });
+    let color = palette.gray(if response.hovered() { 235 } else { 160 });
     icons::paint_at(ui.painter(), icon, rect.center(), 15., color);
     response
         .on_hover_text(hover)

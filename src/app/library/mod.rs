@@ -1,72 +1,98 @@
 //! Catalog browsing; thumbnail work is bounded and independent of RAW development.
-use crate::catalog::{Catalog, Collection, Folder, Photo};
+use crate::catalog::{Catalog, FolderId, Photo, PhotoId, RootId};
+use crate::catalog_session::{CatalogSession, Committed, Opened};
 use anyhow::Result;
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Action {
+pub(crate) enum Action {
     None,
-    Develop(i64),
-    RelinkRoot(i64),
-    RelinkFolder(i64),
+    Develop(PhotoId),
+    RelinkRoot(RootId),
+    RelinkFolder(FolderId),
     AddFolder,
 }
 impl Action {
     /// Combines the actions of panels drawn in turn: a later panel's action
     /// replaces an earlier one, and none keeps it.
-    pub fn then(self, later: Action) -> Action {
+    pub(crate) fn then(self, later: Action) -> Action {
         match later {
             Action::None => self,
             later => later,
         }
     }
 }
+/// A folder of the Folders panel, with its subfolders, to remove from the
+/// catalog.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FolderRemoval {
+    /// The catalog it was chosen in; its folder ids name nothing elsewhere.
+    pub(crate) catalog: crate::catalog::CatalogLocation,
+    pub(crate) name: String,
+    pub(crate) folders: HashSet<FolderId>,
+    /// Photos in it and its subfolders, as the panel counts them.
+    pub(crate) photos: usize,
+}
 /// Where the Library was: its source, filter bar and selection, for undo to
 /// return to.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Place {
+pub(crate) struct Place {
     filters: filter::Filters,
-    folder: String,
+    folders: folder_selection::FolderSelection,
     selection: selection::Selection,
 }
+impl Place {
+    /// Leaves a photo now removed out of the selection to return to.
+    pub(in crate::app) fn forget_photo(&mut self, id: PhotoId) {
+        self.selection.forget_photo(id);
+    }
+}
 pub(in crate::app) use cell::copy_suffix;
-pub use descriptive::{DescriptiveCommand, DescriptiveEdit};
-pub use filmstrip::{DraggedPhoto, Module, Pick};
-pub use metadata::{Metadata, MetadataCommand};
+pub(crate) use descriptive::DescriptiveCommand;
+pub(crate) use filmstrip::{DraggedPhoto, Module, Pick};
+pub(crate) use metadata::{Metadata, MetadataCommand};
 pub(in crate::app) use previews::EditSource;
-pub use quick::CollectionCommand;
+pub(crate) use quick::CollectionCommand;
 /// Lightroom's virtual copy commands, carried out by the editor so the open
 /// edit is saved first.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CopyAction {
-    Create(i64),
-    SetMaster(i64),
+pub(crate) enum CopyAction {
+    Create(PhotoId),
+    SetMaster(PhotoId),
     /// Asks first, as Lightroom does.
-    Remove(i64),
+    Remove(PhotoId),
 }
-pub struct Library {
-    pub catalog: Catalog,
-    pub photos: Vec<Photo>,
+/// The thumbnail menu's preview commands, for the photos chosen.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PreviewsRequest {
+    Build(Vec<PhotoId>, crate::catalog::preview_cache::PreviewKind),
+    Discard(
+        Vec<PhotoId>,
+        Vec<crate::catalog::preview_cache::PreviewKind>,
+    ),
+}
+pub(crate) struct Library {
+    /// The open catalog and the photos, folders and collections read from it.
+    pub session: CatalogSession,
     /// The active photo and the photos selected with it.
     selection: selection::Selection,
     /// Grid columns last frame, for Up and Down.
     grid_columns: usize,
     /// Scroll the grid to the active photo, after a key moved it.
     scroll_to_active: bool,
-    folders: Vec<Folder>,
-    collections: Vec<Collection>,
-    /// Each collection's photos, limited to the ones the Library shows.
-    collection_photos: HashMap<i64, HashSet<i64>>,
-    roots: Vec<(i64, String, Option<String>)>,
     /// Whether the folders missing on this computer were reported since the
     /// catalog opened.
     missing_noted: bool,
     volumes: volumes::Volumes,
+    /// The sidebar's folder and collection trees, built once per change to
+    /// the catalog's lists rather than every frame: the sidebar draws in
+    /// Develop too, whose frames come fast while a slider moves.
+    sidebar_trees: Option<std::sync::Arc<sidebar::Trees>>,
     /// The source and filter bar; `visible` is their result.
     filters: filter::Filters,
-    /// The folder shown, as a tree key ("" is All Photographs).
-    selected_folder: String,
+    /// The folders shown, as tree keys (none is All Photographs).
+    selected_folders: folder_selection::FolderSelection,
     expanded: HashSet<String>,
     thumb_size: f32,
     /// How grid cells show their photos (J).
@@ -81,7 +107,7 @@ pub struct Library {
     drawn_style: cell::Style,
     /// Grid cells' photo info, read once per photo while expanded cells
     /// show it.
-    cell_info: HashMap<i64, Option<crate::metadata::PhotoInfo>>,
+    cell_info: HashMap<PhotoId, Option<crate::metadata::PhotoInfo>>,
     strip: filmstrip::State,
     /// Counts changes to the photos shown, their order or their metadata,
     /// so the filmstrip notices a change made after it was drawn.
@@ -93,6 +119,14 @@ pub struct Library {
     cache: textures::PreviewTextures,
     /// A virtual copy command from a thumbnail menu, for the editor.
     copy_request: Option<CopyAction>,
+    /// A folder chosen in the Folders panel to be removed, for the editor
+    /// to confirm.
+    removal_request: Option<FolderRemoval>,
+    /// Synchronize Folder chosen in the Folders panel, for the editor.
+    sync_request: Option<(crate::catalog::folder_sync::SyncScope, String)>,
+    /// After a synchronization added photos, the status bar offers to show
+    /// them.
+    pub(in crate::app) offer_previous_import: bool,
     copy_names: copy_name::CopyNames,
     /// Title, caption and the other descriptive fields being shown or typed.
     fields: metadata_fields::Fields,
@@ -110,27 +144,21 @@ pub struct Library {
     collection_done: Vec<quick::CollectionCommand>,
     /// Descriptive metadata changes not yet handed to the shared undo log.
     descriptive_done: Vec<DescriptiveCommand>,
-    /// Reads capture times for photos added from folders.
-    capture: Option<background::Reader<capture::Read>>,
-    /// Reads camera settings and sizes for photos added from folders.
-    info_reader: Option<background::Reader<Option<Option<crate::metadata::PhotoInfo>>>>,
     /// The Loupe's Info overlay.
     loupe_info: photo_info::Overlay,
-    /// Photo info was asked for while it was being read.
-    info_again: bool,
     /// Times photo info read from files was saved, so views know to refresh.
     info_saves: u64,
     /// The hovered grid photo's info, for its tooltip.
-    hover_info: Option<(i64, Option<crate::metadata::PhotoInfo>)>,
+    hover_info: Option<(PhotoId, Option<crate::metadata::PhotoInfo>)>,
     /// The active photo's info, as last read from the catalog.
-    info: Option<(i64, Option<crate::metadata::PhotoInfo>)>,
-    /// Photos the capture-time backfill tried since the last online check.
-    capture_tried: HashSet<i64>,
+    info: Option<(PhotoId, Option<crate::metadata::PhotoInfo>)>,
     /// A photo to keep in place in the grid after a re-sort, with its
     /// position before it.
-    keep_in_place: Option<(i64, usize)>,
+    keep_in_place: Option<(PhotoId, usize)>,
     /// The grid's scroll offset last frame.
     grid_offset: f32,
+    /// The grid's glide after a trackpad swipe.
+    grid_kinetic: kinetic::Kinetic,
     /// Positions in `visible` the grid drew last frame; all until it is drawn.
     grid_shown: std::ops::Range<usize>,
     /// External volumes attached at the last check, to notice one returning;
@@ -141,43 +169,48 @@ pub struct Library {
     /// message is: (message, detail).
     message_detail: (String, String),
     /// Photos to Read Metadata from Files for, once confirmed.
-    read_request: Option<Vec<i64>>,
+    read_request: Option<Vec<PhotoId>>,
+    /// A thumbnail menu's Build or Discard Previews, for the editor to carry out.
+    previews_request: Option<PreviewsRequest>,
+    /// The offline RAW in the Loupe and its stored preview's identity, as the
+    /// editor works it out.
+    loupe_stored: Option<(PhotoId, String)>,
+    /// The photo whose refusal the right panel last showed, and that refusal.
+    refusal_shown: Option<((PhotoId, std::path::PathBuf, bool), Option<Refusal>)>,
     /// Read Metadata from Files while it reads.
     reread: Option<descriptive::Reread>,
     /// Read Metadata from Files finished since the editor last asked.
     reread_finished: bool,
     /// What photos without an edit are previewed with (see `set_defaults`).
-    defaults: std::sync::Arc<crate::develop::defaults::DevelopDefaults>,
+    defaults: std::sync::Arc<crate::raw_defaults::DevelopDefaults>,
 }
 impl Library {
-    pub fn load(path: &std::path::Path, ctx: egui::Context) -> Result<Self> {
-        crate::platform::network::prepare_filesystem_bridge();
-        let mut catalog = Catalog::open(path)?;
-        // Catalogs imported before history was kept: recover it from the
-        // stored Lightroom catalog. Best effort; a failure only hides history.
-        let _ = catalog.backfill_lightroom_history();
-        let _ = catalog.backfill_lightroom_snapshots();
-        let _ = catalog.backfill_lightroom_info();
-        let _ = catalog.backfill_lightroom_metadata();
-        // Unlike those, a failure here could export keywords Lightroom keeps
-        // out, so it is said; it is tried again on the next open.
-        let keyword_options = catalog.backfill_keyword_export().err();
+    /// Ends the preview workers at exit: the renders under way are cancelled and the
+    /// results dropped, so none waits for the grid. They are then waited for.
+    pub(in crate::app) fn close_previews(&mut self) -> Vec<crate::app::task::Stopping> {
+        let mut stopping = Vec::from(self.cache.close());
+        stopping.extend(self.screen.close());
+        stopping
+    }
+    /// The Library over a catalog read with [`CatalogSession::open`].
+    pub(crate) fn new(opened: Opened, ctx: egui::Context) -> Self {
+        let Opened {
+            mut session,
+            keyword_export,
+        } = opened;
+        session.wake_with(wake(&ctx));
         let loupe = loupe::Loupe::new(&ctx);
         let screen = screen::ScreenPreviews::new(&ctx);
         let mut s = Self {
-            catalog,
-            photos: Vec::new(),
+            session,
             selection: Default::default(),
             grid_columns: 1,
             scroll_to_active: false,
-            folders: Vec::new(),
-            collections: Vec::new(),
-            collection_photos: HashMap::new(),
-            roots: Vec::new(),
             missing_noted: false,
             volumes: Default::default(),
+            sidebar_trees: None,
             filters: Default::default(),
-            selected_folder: String::new(),
+            selected_folders: Default::default(),
             expanded: HashSet::new(),
             thumb_size: 190.,
             cell_style: Default::default(),
@@ -192,6 +225,9 @@ impl Library {
             cache: textures::PreviewTextures::new(&ctx),
             ctx,
             copy_request: None,
+            removal_request: None,
+            sync_request: None,
+            offer_previous_import: false,
             copy_names: Default::default(),
             fields: Default::default(),
             done: Vec::new(),
@@ -204,82 +240,121 @@ impl Library {
             defaults: Default::default(),
             stamps: Default::default(),
             loupe_direction: 1,
-            capture: None,
-            info_reader: None,
             info: None,
-            info_again: false,
             info_saves: 0,
             hover_info: None,
             loupe_info: Default::default(),
-            capture_tried: HashSet::new(),
             keep_in_place: None,
             grid_offset: 0.,
+            grid_kinetic: Default::default(),
             grid_shown: 0..usize::MAX,
             attached: None,
             message: String::new(),
             message_detail: Default::default(),
             read_request: None,
+            previews_request: None,
+            loupe_stored: None,
+            refusal_shown: None,
             reread: None,
             reread_finished: false,
         };
-        s.refresh()?;
-        if let Some(e) = keyword_options {
+        s.reloaded();
+        s.check_files();
+        if let Some(e) = keyword_export {
             s.message = format!(
                 "Lightroom's keyword export options could not be read: {e:#}. \
                  Exports include every keyword's parents until they are."
             );
         }
         // Start with a selection, as Lightroom does, so the side panels are filled.
-        s.select(s.visible.first().map(|i| s.photos[*i].id));
-        Ok(s)
+        s.select(s.visible.first().map(|i| s.session.photos[*i].id));
+        s
     }
-    pub fn refresh(&mut self) -> Result<()> {
+    /// Opens the catalog at `path`, for tests.
+    #[cfg(test)]
+    pub(crate) fn load(path: &std::path::Path, ctx: egui::Context) -> Result<Self> {
+        Ok(Self::new(CatalogSession::open(&path.into())?, ctx))
+    }
+    /// Reads the catalog again and checks which files are online, for tests.
+    #[cfg(test)]
+    pub(crate) fn refresh(&mut self) -> Result<()> {
         self.reload()?;
-        self.availability.start(&self.photos, &self.ctx);
+        self.check_files();
+        Ok(())
+    }
+    /// Checks which files are online again, after the catalog was read.
+    fn check_files(&mut self) {
+        self.availability.start(&self.session.photos, &self.ctx);
         self.cache.failed.clear();
         self.screen.retry_failed();
         self.filter();
+    }
+    /// After a change made through another connection that could not be
+    /// shown by opening the catalog again: forgets the previews of the
+    /// photos `removed` (new photos may have their ids) and reads the
+    /// catalog again. If that fails too, no photo is shown, so none can be
+    /// changed under an id that now names another; the catalog stays open,
+    /// for an edit still to be saved.
+    pub(in crate::app) fn reread_after(&mut self, removed: &[PhotoId]) -> Result<()> {
+        for id in removed {
+            self.cache.forget(*id);
+            self.screen.forget(*id);
+        }
+        let reread = self.reload();
+        match &reread {
+            // Moved and added photos are looked for where they are now.
+            Ok(()) => self.check_files(),
+            Err(_) => {
+                // Neither photos nor folders: a folder removed may have
+                // given its id to a new one.
+                self.session.photos.clear();
+                self.session.folders.clear();
+                self.session.roots.clear();
+                self.session.collection_photos.clear();
+                self.session.previous_import.clear();
+                self.filters.folder_scope = None;
+                self.selected_folders.clear();
+                self.reloaded();
+            }
+        }
+        reread
+    }
+    /// Reads the catalog again into the lists shown.
+    fn reload(&mut self) -> Result<()> {
+        self.session.reload()?;
+        self.reloaded();
         Ok(())
     }
-    /// Reads the catalog again without checking which files are online,
-    /// for changes that add or remove no file, such as virtual copies.
-    fn reload(&mut self) -> Result<()> {
+    /// Brings what the Library shows in step with a catalog just read.
+    fn reloaded(&mut self) {
         self.cell_info.clear();
         self.sort_keys = None;
-        // Earlier imports could pick up macOS "._" metadata files; never show them.
-        self.photos = self.catalog.photos()?;
         self.shown_version += 1;
-        self.photos
-            .retain(|p| !crate::storage::is_hidden(std::path::Path::new(&p.filename)));
-        self.folders = self.catalog.folders()?;
-        for folder in &mut self.folders {
-            folder.count = self.photos.iter().filter(|p| p.folder == folder.id).count();
-        }
-        self.collections = self.catalog.collections()?;
-        let ids: HashSet<i64> = self.photos.iter().map(|p| p.id).collect();
-        self.collection_photos = self.catalog.collection_photos()?;
-        for members in self.collection_photos.values_mut() {
-            members.retain(|id| ids.contains(id));
+        if self.filters.previous_import {
+            self.filters.members = self.session.previous_import.clone();
         }
         if let Some(id) = self.filters.collection {
-            if self.collections.iter().any(|c| c.id == id) {
-                self.filters.members = self.collection_photos.get(&id).cloned().unwrap_or_default();
+            if self.session.collections.iter().any(|c| c.id == id) {
+                self.filters.members = self
+                    .session
+                    .collection_photos
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
             } else {
                 self.filters.collection = None;
                 self.filters.members.clear();
             }
         }
-        self.roots = self.catalog.roots()?;
         // Copy commands save a name being typed before they run, and so
         // does anything else that reads the catalog again.
         self.copy_names.clear();
         self.fields.clear();
         self.filter();
-        Ok(())
     }
     /// Waits for the online check, for callers that report on it.
-    pub fn wait_for_availability(&mut self) {
-        if self.availability.poll(true, &self.photos) {
+    pub(crate) fn wait_for_availability(&mut self) {
+        if self.availability.poll(true, &self.session.photos) {
             self.availability_known();
         }
     }
@@ -302,12 +377,16 @@ impl Library {
             Some(before) => attached.iter().any(|mount| !before.contains(mount)),
             None => {
                 self.availability.checking()
-                    || self.photos.iter().any(|p| !self.is_available(&p.path))
+                    || self
+                        .session
+                        .photos
+                        .iter()
+                        .any(|p| !self.is_available(&p.path))
             }
         };
         self.attached = Some(attached);
         if returned {
-            self.availability.start(&self.photos, &self.ctx);
+            self.availability.start(&self.session.photos, &self.ctx);
         }
     }
     /// Checks again, in the background, which photos are online when one
@@ -315,33 +394,61 @@ impl Library {
     /// drive that stayed attached.
     pub(in crate::app) fn found(&mut self, path: &std::path::Path) {
         if !self.is_available(path) {
-            self.availability.start(&self.photos, &self.ctx);
+            self.availability.start(&self.session.photos, &self.ctx);
         }
+    }
+    /// Asks for a repaint, for a background read with something to show.
+    fn wake(&self) -> crate::catalog_session::Wake {
+        wake(&self.ctx)
     }
     fn is_available(&self, path: &std::path::Path) -> bool {
         self.availability.is_available(path)
     }
-    /// Why photo `id` can't be exported, if it can't: what keeps Develop from
-    /// opening it.
+    /// Why photo `id` can't be exported or built, if it can't, for work over many
+    /// photos: [`availability_refusal`], as no file is read for it. A file Develop
+    /// can't edit fails as that photo's export or build, with the reason.
     /// The file is looked at directly: the availability scan counts every photo
     /// as there until it has checked.
-    pub(in crate::app) fn export_refusal(&self, id: i64) -> Option<Refusal> {
+    pub(in crate::app) fn export_refusal(&self, id: PhotoId) -> Option<Refusal> {
         let photo = self.photo(id)?;
-        develop_refusal(photo, photo.path.is_file())
+        availability_refusal(photo.path.is_file())
     }
-    pub fn available_count(&self) -> usize {
-        self.availability.count(&self.photos)
+    /// Whether Develop could open photo `id`, by what the Library last found
+    /// online rather than by asking the file system: a file Develop can't read
+    /// is found when it is opened.
+    pub(in crate::app) fn known_developable(&self, id: PhotoId) -> bool {
+        self.photo(id).is_some_and(|p| self.is_available(&p.path))
+    }
+    /// Why Develop cannot open `photo`, for the Library to show: as
+    /// [`develop_refusal`] finds, with a file's header read once while it stays
+    /// selected and online.
+    pub(super) fn shown_refusal(&mut self, photo: &Photo) -> Option<Refusal> {
+        let available = self.is_available(&photo.path);
+        let key = (photo.id, photo.path.clone(), available);
+        match &self.refusal_shown {
+            Some((shown, refusal)) if *shown == key => refusal.clone(),
+            _ => {
+                let refusal = develop_refusal(photo, available);
+                self.refusal_shown = Some((key, refusal.clone()));
+                refusal
+            }
+        }
+    }
+    pub(crate) fn available_count(&self) -> usize {
+        self.availability.count(&self.session.photos)
     }
     fn filter(&mut self) {
         // What the order needs from the catalog, read once until it changes.
         let sort = self.filters.sort;
         if self.sort_keys.as_ref().is_none_or(|(of, _)| *of != sort) {
-            self.sort_keys = Some((sort, sort.keys(&self.catalog)));
+            self.sort_keys = Some((sort, sort.keys(&self.session.catalog)));
         }
         let keys = &self.sort_keys.as_ref().unwrap().1;
         self.shown_version += 1;
+        // Filtering follows every change to the photos, so the count does too.
+        self.availability.forget_count();
         self.visible = self.filters.visible(
-            &self.photos,
+            &self.session.photos,
             |path| self.availability.is_available(path),
             keys,
         );
@@ -354,7 +461,7 @@ impl Library {
         let anchor = self.selected().and_then(|id| {
             self.visible
                 .iter()
-                .position(|i| self.photos[*i].id == id)
+                .position(|i| self.session.photos[*i].id == id)
                 .map(|at| (id, at))
         });
         // A selected photo scrolled out of view is no anchor: the view stays.
@@ -366,23 +473,28 @@ impl Library {
             self.keep_in_place = anchor;
         }
     }
-    pub fn photo(&self, id: i64) -> Option<&Photo> {
-        self.photos.iter().find(|p| p.id == id)
+    pub(crate) fn photo(&self, id: PhotoId) -> Option<&Photo> {
+        self.session.photos.iter().find(|p| p.id == id)
     }
     /// What photo `id` is developed from, as Develop would open it: its saved edit
     /// (checked as Develop checks it), else its Lightroom edit, else the defaults;
     /// for Develop's Reference View. Why not, for a photo Develop cannot open; None
     /// for a photo no longer in the catalog.
-    pub(in crate::app) fn develop_source(&self, id: i64) -> Option<Result<DevelopSource, Refusal>> {
+    pub(in crate::app) fn develop_source(
+        &self,
+        id: PhotoId,
+        demosaic: crate::camera_data::Demosaic,
+    ) -> Option<Result<DevelopSource, Refusal>> {
         let photo = self.photo(id)?;
         if let Some(refusal) = develop_refusal(photo, photo.path.is_file()) {
             return Some(Err(refusal));
         }
-        let edit = match self.catalog.load_edit(id, &photo.path) {
+        let edit = match self.session.catalog.load_edit(id, &photo.path) {
             Ok(Some(saved)) => serde_json::to_string(&saved.recipe)
                 .ok()
                 .map(EditSource::Recipe),
             Ok(None) => self
+                .session
                 .catalog
                 .edit_texts(id)
                 .ok()
@@ -395,17 +507,19 @@ impl Library {
         // The file and the demosaic too: a RAW replaced in place, or decoded another
         // way, is developed again.
         let file = crate::storage::Stamp::read(&photo.path).ok();
-        let demosaic = crate::raw::demosaic();
         Some(Ok(DevelopSource {
             path: photo.path.clone(),
             tag: format!("{}-{file:?}-{demosaic:?}", edit.tag()),
             edit,
         }))
     }
-    pub fn navigate(&self, id: i64, delta: i32) -> Option<i64> {
-        let at = self.visible.iter().position(|i| self.photos[*i].id == id)?;
+    pub(crate) fn navigate(&self, id: PhotoId, delta: i32) -> Option<PhotoId> {
+        let at = self
+            .visible
+            .iter()
+            .position(|i| self.session.photos[*i].id == id)?;
         let n = (at as i32 + delta).clamp(0, self.visible.len().saturating_sub(1) as i32) as usize;
-        self.visible.get(n).map(|i| self.photos[*i].id)
+        self.visible.get(n).map(|i| self.session.photos[*i].id)
     }
     fn labels(&self) -> Vec<String> {
         let mut labels: Vec<String> = crate::app::photo_metadata::LABELS
@@ -413,6 +527,7 @@ impl Library {
             .map(|s| (*s).into())
             .collect();
         let mut custom: Vec<_> = self
+            .session
             .photos
             .iter()
             .map(|p| &p.label)
@@ -430,15 +545,18 @@ impl Library {
         self.filter();
     }
     #[cfg(test)]
-    pub(in crate::app) fn select_range_to(&mut self, id: i64) {
+    pub(in crate::app) fn select_range_to(&mut self, id: PhotoId) {
         self.click(id, egui::Modifiers::SHIFT);
     }
     #[cfg(test)]
-    pub(in crate::app) fn shown(&self) -> Vec<i64> {
-        self.visible.iter().map(|i| self.photos[*i].id).collect()
+    pub(in crate::app) fn shown(&self) -> Vec<PhotoId> {
+        self.visible
+            .iter()
+            .map(|i| self.session.photos[*i].id)
+            .collect()
     }
     /// Edits written elsewhere (Sync, its Undo): their previews render again.
-    pub(in crate::app) fn edits_changed(&mut self, ids: impl IntoIterator<Item = i64>) {
+    pub(in crate::app) fn edits_changed(&mut self, ids: impl IntoIterator<Item = PhotoId>) {
         for id in ids {
             self.cache.forget(id);
         }
@@ -446,17 +564,17 @@ impl Library {
         self.resort_in_place(|l| l.sort_keys = None);
     }
     /// Whether `id` is selected, shown or hidden by the filters.
-    pub(in crate::app) fn is_selected(&self, id: i64) -> bool {
+    pub(in crate::app) fn is_selected(&self, id: PhotoId) -> bool {
         self.selection.selected.contains(&id)
     }
     /// The selected photos in display order.
-    pub(in crate::app) fn selected_photos(&self) -> Vec<i64> {
+    pub(in crate::app) fn selected_photos(&self) -> Vec<PhotoId> {
         self.selected_ids()
     }
     pub(in crate::app) fn place(&self) -> Place {
         Place {
             filters: self.filters.clone(),
-            folder: self.selected_folder.clone(),
+            folders: self.selected_folders.clone(),
             selection: self.selection.clone(),
         }
     }
@@ -464,14 +582,22 @@ impl Library {
     /// there, and scrolls to its active photo.
     pub(in crate::app) fn go_to_place(&mut self, place: &Place) {
         self.filters = place.filters.clone();
-        self.selected_folder = place.folder.clone();
+        self.selected_folders = place.folders.clone();
         // The source as the catalog has it now, e.g. after a folder gained
         // subfolders since.
-        if let Some(scope) = self.folder_scope(&place.folder) {
+        if let Some(scope) = self
+            .folders_scope(&place.folders)
+            .filter(|scope| !scope.is_empty())
+        {
             self.filters.folder_scope = Some(scope);
         }
         if let Some(id) = self.filters.collection {
-            self.filters.members = self.collection_photos.get(&id).cloned().unwrap_or_default();
+            self.filters.members = self
+                .session
+                .collection_photos
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
         }
         self.selection = place.selection.clone();
         self.filter();
@@ -489,53 +615,198 @@ impl Library {
     }
     /// Photos Read Metadata from Files was chosen for, for the editor to
     /// confirm.
-    pub(in crate::app) fn take_read_request(&mut self) -> Option<Vec<i64>> {
+    pub(in crate::app) fn take_read_request(&mut self) -> Option<Vec<PhotoId>> {
         self.read_request.take()
     }
     /// A virtual copy command chosen from a thumbnail menu since last asked.
+    pub(in crate::app) fn take_previews_request(&mut self) -> Option<PreviewsRequest> {
+        self.previews_request.take()
+    }
+    /// The grid's latest request for the photo's edited thumbnail, if any.
+    pub(in crate::app) fn edited_ticket(&self, id: PhotoId) -> Option<u64> {
+        self.cache.edited_ticket(id)
+    }
+    /// A built preview, as the photo's edited thumbnail; the caller has checked
+    /// it is still the photo's latest.
+    pub(in crate::app) fn show_built_preview(
+        &mut self,
+        ctx: &egui::Context,
+        id: PhotoId,
+        image: &image::RgbImage,
+    ) {
+        self.cache.insert_edited(ctx, id, image);
+    }
     pub(super) fn take_copy_request(&mut self) -> Option<CopyAction> {
         self.copy_request.take()
     }
+    pub(in crate::app) fn take_sync_request(
+        &mut self,
+    ) -> Option<(crate::catalog::folder_sync::SyncScope, String)> {
+        self.sync_request.take()
+    }
+    /// What Synchronize Folder covers for the folder selected in the
+    /// Folders panel, and its name; none for All Photographs, a collection
+    /// or several folders.
+    pub(in crate::app) fn selected_sync_scope(
+        &self,
+    ) -> Option<(crate::catalog::folder_sync::SyncScope, String)> {
+        use crate::catalog::folder_sync::SyncScope;
+        let rest = self.selected_folders.single()?.strip_prefix("root:")?;
+        let (root, relative) = rest.split_once('/').unwrap_or((rest, ""));
+        let root = root.parse::<i64>().ok().map(RootId)?;
+        if relative.is_empty() {
+            let name = self
+                .session
+                .roots
+                .iter()
+                .find(|(id, ..)| *id == root)
+                .map(|(_, original, _)| {
+                    std::path::Path::new(original)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .unwrap_or_default();
+            return Some((SyncScope::Root(root), name));
+        }
+        let folder = self
+            .session
+            .folders
+            .iter()
+            .find(|f| f.root == root && f.relative.trim_end_matches('/') == relative)?;
+        let name = relative.rsplit('/').next().unwrap_or(relative).to_string();
+        Some((SyncScope::Folder(folder.id), name))
+    }
+    pub(in crate::app) fn take_removal_request(&mut self) -> Option<FolderRemoval> {
+        self.removal_request.take()
+    }
     /// Creates a virtual copy of `id` and selects it.
-    pub(super) fn create_virtual_copy(&mut self, id: i64) -> Result<i64> {
-        let copy = self.catalog.create_virtual_copy(id)?;
-        self.reload()?;
-        self.show(copy);
-        if let Some(p) = self.photo(copy) {
-            self.message = format!("Created {} of {}", p.copy_name, p.filename);
+    pub(super) fn create_virtual_copy(&mut self, id: PhotoId) -> Result<Committed<PhotoId>> {
+        let made = self.session.create_virtual_copy(id)?;
+        if self.listed_after(&made.listed, "Copy made") {
+            self.show(made.value);
+            if let Some(p) = self.photo(made.value) {
+                self.message = format!("Created {} of {}", p.copy_name, p.filename);
+            }
         }
-        Ok(copy)
+        Ok(made)
     }
-    pub(super) fn set_copy_as_master(&mut self, id: i64) -> Result<()> {
-        self.catalog.set_copy_as_master(id)?;
-        self.reload()?;
-        self.show(id);
-        if let Some(p) = self.photo(id) {
-            self.message = format!("This copy is now the master of {}", p.filename);
+    pub(super) fn set_copy_as_master(&mut self, id: PhotoId) -> Result<Committed<()>> {
+        let made = self.session.set_copy_as_master(id)?;
+        if self.listed_after(&made.listed, "Master changed") {
+            self.show(id);
+            if let Some(p) = self.photo(id) {
+                self.message = format!("This copy is now the master of {}", p.filename);
+            }
         }
-        Ok(())
+        Ok(made)
     }
-    /// Removes virtual copy `id`; returns its master, which is selected.
-    pub(super) fn remove_virtual_copy(&mut self, id: i64) -> Result<Option<i64>> {
+    /// Brings what is shown in step after a change to the catalog, and says
+    /// so when the catalog could not be read again after `done`. Returns
+    /// whether it was.
+    fn listed_after(&mut self, listed: &Result<()>, done: &str) -> bool {
+        match listed {
+            Ok(()) => {
+                self.reloaded();
+                true
+            }
+            Err(e) => {
+                self.message = format!("{done}, but the catalog could not be read again: {e:#}");
+                false
+            }
+        }
+    }
+    /// Removes `folders` and their photos from the catalog, leaving the files;
+    /// returns the photos removed. The Library shows All Photographs if it
+    /// showed one of them. An error means nothing was removed.
+    pub(in crate::app) fn remove_folders(
+        &mut self,
+        folders: &HashSet<FolderId>,
+        name: &str,
+    ) -> Result<Committed<Vec<PhotoId>>> {
+        // Forgotten first: once removed, their ids can be reused, so their
+        // previews must go even if removing or reading the catalog again
+        // fails. Copies of these photos are kept with them.
+        let going: Vec<PhotoId> = self
+            .session
+            .photos
+            .iter()
+            .filter(|p| folders.contains(&p.folder))
+            .map(|p| p.id)
+            .collect();
+        for photo in &self.session.photos {
+            if going.contains(&photo.id) || photo.master.is_some_and(|m| going.contains(&m)) {
+                self.cache.forget(photo.id);
+                self.screen.forget(photo.id);
+            }
+        }
+        let ids: Vec<FolderId> = folders.iter().copied().collect();
+        let removed = self.session.remove_folders(&ids)?;
+        if self
+            .filters
+            .folder_scope
+            .as_ref()
+            .is_some_and(|scope| scope.iter().any(|f| folders.contains(f)))
+        {
+            self.selected_folders.clear();
+            self.filters.folder_scope = None;
+        }
+        for id in &removed.value {
+            self.selection.forget_photo(*id);
+        }
+        if self.listed_after(&removed.listed, "Folder removed") {
+            let n = removed.value.len();
+            self.message = format!(
+                "Removed {name} and its {n} photo{} from the catalog. The files are still on disk.",
+                if n == 1 { "" } else { "s" }
+            );
+        } else {
+            // The session dropped the removed photos from its lists anyway;
+            // what is shown follows them before anything reads those lists.
+            self.reloaded();
+        }
+        self.start_capture_times();
+        self.start_photo_info();
+        self.start_checksums();
+        Ok(removed)
+    }
+    /// Removes virtual copy `id`; returns its master, which is selected. An
+    /// error means the copy is still there.
+    pub(super) fn remove_virtual_copy(
+        &mut self,
+        id: PhotoId,
+    ) -> Result<Committed<Option<PhotoId>>> {
         let photo = self.photo(id).cloned();
-        self.catalog.remove_virtual_copy(id)?;
+        // Forgotten first: once the copy is removed its id can be reused, so its
+        // previews must go even if reading the catalog again fails.
         self.cache.forget(id);
         self.screen.forget(id);
-        self.reload()?;
+        let removed = self.session.remove_virtual_copy(id)?;
         let master = photo.as_ref().and_then(|p| p.master);
-        if let Some(master) = master {
-            self.show(master);
+        if self.listed_after(&removed.listed, "Copy removed") {
+            if let Some(master) = master {
+                self.show(master);
+            }
+            if let Some(p) = photo {
+                self.message = format!("Removed {} of {}", p.copy_name, p.filename);
+            }
         }
-        if let Some(p) = photo {
-            self.message = format!("Removed {} of {}", p.copy_name, p.filename);
-        }
-        Ok(master)
+        Ok(Committed {
+            value: master,
+            listed: removed.listed,
+        })
     }
     /// Selects `id`, leaving filters that would hide it so it stays in view.
-    fn show(&mut self, id: i64) {
-        if !self.visible.iter().any(|i| self.photos[*i].id == id) {
+    fn show(&mut self, id: PhotoId) {
+        if !self
+            .visible
+            .iter()
+            .any(|i| self.session.photos[*i].id == id)
+        {
             if !self.filters.members.contains(&id) {
                 self.filters.collection = None;
+                self.filters.previous_import = false;
             }
             // Filters turned off with Cmd+L hide nothing, and are kept.
             if self.filters.enabled {
@@ -544,22 +815,28 @@ impl Library {
             self.filter();
         }
         // Outside the folder shown, or no longer offline: All Photographs.
-        if !self.visible.iter().any(|i| self.photos[*i].id == id) {
+        if !self
+            .visible
+            .iter()
+            .any(|i| self.session.photos[*i].id == id)
+        {
             self.filters.folder_scope = None;
             self.filters.collection = None;
+            self.filters.previous_import = false;
             self.filters.only_missing = false;
-            self.selected_folder.clear();
+            self.selected_folders.clear();
             self.filter();
         }
         self.select(Some(id));
     }
     /// Drain in every workspace so the bounded worker never waits for the grid.
     pub(super) fn poll_previews(&mut self, ctx: &egui::Context) {
-        if self.availability.poll(false, &self.photos) {
+        if self.availability.poll(false, &self.session.photos) {
             self.availability_known();
         }
         self.poll_capture_times();
         self.poll_photo_info();
+        self.poll_checksums();
         self.poll_reread();
         self.cache.poll(ctx);
         self.screen.poll(ctx);
@@ -575,7 +852,7 @@ impl Library {
     }
     /// Queues the previews a shown photo needs; its edit comes from the catalog.
     fn request_previews(&mut self, photo: &Photo, ctx: &egui::Context) {
-        let catalog = &self.catalog;
+        let catalog = &self.session.catalog;
         self.cache
             .request(photo, ctx, || edit_source(catalog, photo.id));
     }
@@ -584,7 +861,7 @@ impl Library {
     pub(super) fn update_edited(
         &mut self,
         ctx: &egui::Context,
-        id: i64,
+        id: PhotoId,
         image: image::RgbImage,
         recipe_json: String,
     ) {
@@ -596,9 +873,9 @@ impl Library {
     /// The selected photo, or else the first one shown in the current
     /// folder or filter (which then becomes selected), as Lightroom does
     /// when switching to Develop.
-    pub(super) fn selected_or_first(&mut self) -> Option<i64> {
+    pub(super) fn selected_or_first(&mut self) -> Option<PhotoId> {
         if self.selection.active.is_none() {
-            self.select(self.visible.first().map(|i| self.photos[*i].id));
+            self.select(self.visible.first().map(|i| self.session.photos[*i].id));
         }
         self.selection.active
     }
@@ -606,27 +883,27 @@ impl Library {
     /// shown with the previous defaults are made again.
     pub(in crate::app) fn set_defaults(
         &mut self,
-        defaults: std::sync::Arc<crate::develop::defaults::DevelopDefaults>,
+        defaults: std::sync::Arc<crate::raw_defaults::DevelopDefaults>,
     ) {
         self.defaults = defaults;
         self.screen.clear();
         // Develop's renders of photos without an edit: back to the embedded
         // preview until Develop shows one with the new defaults.
-        let unedited: Vec<i64> = self
+        let unedited: Vec<PhotoId> = self
             .cache
             .edited_ids()
-            .filter(|id| edit_source(&self.catalog, *id).is_none())
+            .filter(|id| edit_source(&self.session.catalog, *id).is_none())
             .collect();
         for id in unedited {
             self.cache.forget(id);
         }
     }
     /// Whether the photo's thumbnail already shows its edit (crop included).
-    pub(super) fn has_edited_thumbnail(&self, id: i64) -> bool {
+    pub(super) fn has_edited_thumbnail(&self, id: PhotoId) -> bool {
         self.cache.has_edited(id)
     }
     /// The Library's cached preview for a photo, if one is loaded.
-    pub(super) fn thumbnail(&self, id: i64) -> Option<&egui::TextureHandle> {
+    pub(super) fn thumbnail(&self, id: PhotoId) -> Option<&egui::TextureHandle> {
         self.texture(self.photo(id)?)
     }
     pub(super) fn preview_progress_active(&self) -> bool {
@@ -641,14 +918,18 @@ impl Library {
     /// Library panel goes away before the field loses focus. On failure it
     /// stays pending, to be saved again or discarded.
     pub(super) fn commit_drafts(&mut self) -> Result<()> {
-        if self.copy_names.commit(&self.catalog, &mut self.photos)? {
+        if self.copy_names.commit(&mut self.session)? {
             self.filter();
         }
         self.commit_fields()
     }
     #[cfg(test)]
-    pub(super) fn set_copy_name_draft(&mut self, id: i64, name: &str) {
+    pub(super) fn set_copy_name_draft(&mut self, id: PhotoId, name: &str) {
         self.copy_names.draft = Some((id, name.into()));
+    }
+    /// Whether a Copy Name or metadata field holds typing not saved yet.
+    pub(super) fn has_drafts(&self) -> bool {
+        self.copy_names.is_unsaved(&self.session.photos) || self.has_unsaved_fields()
     }
     /// Drops a Copy Name or metadata field that could not be saved, e.g.
     /// closing without saving.
@@ -657,20 +938,40 @@ impl Library {
         self.fields.clear();
     }
 }
-/// Why Develop cannot open a photo: it edits camera RAW files that are
-/// online.
+/// Why Develop cannot open a photo: it edits RAW, JPEG, PNG, TIFF, WebP, AVIF
+/// and JPEG XL files that are online and whose pixels it can read.
 #[derive(Clone, Debug, PartialEq)]
 pub(in crate::app) enum Refusal {
     Offline,
-    /// Not a camera RAW: the file's format, e.g. "JPEG".
-    NotRaw(String),
+    /// A JPEG, PNG, TIFF, WebP, AVIF or JPEG XL of a kind Develop can't edit: its `format` (e.g. "JPG")
+    /// and the `reason` (e.g. "CMYK").
+    Unsupported {
+        format: String,
+        reason: String,
+    },
 }
 impl Refusal {
+    /// What opening `path` failed with, when it is a refusal rather than an error:
+    /// a JPEG, PNG, TIFF, WebP, AVIF or JPEG XL of a kind Develop can't edit.
+    pub(in crate::app) fn opening(path: &std::path::Path, error: &anyhow::Error) -> Option<Self> {
+        error
+            .downcast_ref::<crate::raster::Unsupported>()
+            .map(|unsupported| Self::unsupported(path, unsupported))
+    }
+    fn unsupported(path: &std::path::Path, unsupported: &crate::raster::Unsupported) -> Self {
+        Self::Unsupported {
+            format: path
+                .extension()
+                .map(|e| e.to_string_lossy().to_ascii_uppercase())
+                .unwrap_or_default(),
+            reason: unsupported.0.clone(),
+        }
+    }
     /// A word or two, shown beside a greyed-out Open in Develop.
     pub(in crate::app) fn label(&self) -> String {
         match self {
             Self::Offline => "Offline".into(),
-            Self::NotRaw(format) => format!("{format} file"),
+            Self::Unsupported { format, .. } => format!("{format} file"),
         }
     }
     /// The reason in full, with what to do about it.
@@ -680,9 +981,7 @@ impl Refusal {
                 "The photo is offline. Use Locate root folder or right-click its folder to relink it."
                     .into()
             }
-            Self::NotRaw(format) => format!(
-                "{format} files can be browsed in Library; Develop edits camera RAW files."
-            ),
+            Self::Unsupported { reason, .. } => format!("RAWmakase can't edit {reason} images"),
         }
     }
 }
@@ -695,20 +994,32 @@ pub(in crate::app) struct DevelopSource {
     /// changes whenever any of them does.
     pub tag: String,
 }
+/// Why Develop cannot open a photo whose file is `available` or not, by what is
+/// known without reading the file: for work over many photos (export, preview
+/// builds), where reading every file's header first would hold the app up. Such
+/// work meets a file Develop can't edit when it opens it, as that photo's failure.
+pub(in crate::app) fn availability_refusal(available: bool) -> Option<Refusal> {
+    (!available).then_some(Refusal::Offline)
+}
 /// Why Develop cannot open `photo`, if it cannot, given whether its file is
-/// `available`.
+/// `available`: [`availability_refusal`], or a JPEG, PNG, TIFF, WebP, AVIF or JPEG XL whose header
+/// says Develop can't edit its pixels (`raster::probe`). It reads the file (a
+/// whole JPEG), so it is for one photo at a time: opening it, or showing why it
+/// can't be. A RAW's file is not read.
 pub(in crate::app) fn develop_refusal(photo: &Photo, available: bool) -> Option<Refusal> {
-    if !available {
-        Some(Refusal::Offline)
-    } else if !crate::storage::is_raw(&photo.path) {
-        Some(Refusal::NotRaw(photo.format.clone()))
-    } else {
-        None
+    if let Some(refusal) = availability_refusal(available) {
+        return Some(refusal);
     }
+    if crate::storage::is_raw(&photo.path) {
+        return None;
+    }
+    crate::raster::probe(&photo.path)
+        .err()
+        .map(|unsupported| Refusal::unsupported(&photo.path, &unsupported))
 }
 /// The edit a photo's previews are rendered with: its RAWmakase recipe, or
 /// else its Lightroom settings.
-fn edit_source(catalog: &Catalog, id: i64) -> Option<previews::EditSource> {
+fn edit_source(catalog: &Catalog, id: PhotoId) -> Option<previews::EditSource> {
     let (recipe, lightroom) = catalog.edit_texts(id).ok()?;
     recipe
         .map(previews::EditSource::Recipe)
@@ -716,20 +1027,22 @@ fn edit_source(catalog: &Catalog, id: i64) -> Option<previews::EditSource> {
 }
 
 mod availability;
-mod background;
 mod capture;
 /// Lightroom-style grid cells: the label tints the cell, while selection uses
 /// a lighter surround instead of the app's blue button fill.
 mod cell;
+mod checksums;
 mod collections;
 mod compare;
 mod copy_name;
 mod descriptive;
-pub mod filmstrip;
+pub(crate) mod filmstrip;
 mod filter;
 mod filter_bar;
+mod folder_selection;
 mod grid;
 mod info;
+mod kinetic;
 mod layout;
 mod loupe;
 mod metadata;
@@ -765,4 +1078,10 @@ impl Library {
         let (message, detail) = &self.message_detail;
         (*message == self.message && !detail.is_empty()).then_some(detail.as_str())
     }
+}
+
+/// Asks `ctx` for a repaint, for a background read with something to show.
+fn wake(ctx: &egui::Context) -> crate::catalog_session::Wake {
+    let ctx = ctx.clone();
+    std::sync::Arc::new(move || ctx.request_repaint())
 }

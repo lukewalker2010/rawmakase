@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Measure Camera Raw's Color Grading on the synthetic chart and write
-src/develop/color_grade_curves.bin.
+crates/rawmakase-engine/src/develop/color_grade_curves.bin.
 
 `render` has Photoshop 2026 (Camera Raw) render synthetic-d65.dng with each fitting
 case (about 750: every region at twelve hues and four saturations, Shadows, Midtones
@@ -13,7 +13,7 @@ refuses to start while Photoshop has documents open.
 far the fitted operator is from every render (mean CIEDE2000 over the chart, with
 Camera Raw's own default render as input, so only the grading's error is measured).
 
-What the renders show (see docs/color-mixer.md#color-grading-engine-4):
+What the renders show (see docs/color-mixer.md#color-grading):
 - Color grading is a curve per channel of linear ProPhoto RGB: a channel's output
   depends only on that channel's input (predicting every patch from the gray ramp's
   per-channel curves leaves 0.1-0.2 ΔE00; the same curves in sRGB, Display P3,
@@ -210,7 +210,7 @@ def fit_tables(data):
     return {'grid': grid, 'global': globals_, 'coef': coef, 'lum': lum}, gain
 
 
-# The operator, as src/develop/color_grade.rs renders it, for checking the fit.
+# The operator, as crates/rawmakase-engine/src/develop/color_grade.rs renders it, for checking the fit.
 def _interp(xs, x):
     x = min(max(x, xs[0]), xs[-1])
     i = min(int(np.searchsorted(xs, x, 'right')) - 1, len(xs) - 2)
@@ -348,7 +348,7 @@ def fit(refs):
     data = json.loads(refs.read_text())
     t, _ = fit_tables(data)
     out = np.concatenate([t[k].astype('<f4').ravel() for k in ('grid', 'global', 'coef', 'lum')])
-    path = ROOT / 'src/develop/color_grade_curves.bin'
+    path = ROOT / 'crates/rawmakase-engine/src/develop/color_grade_curves.bin'
     path.write_bytes(out.tobytes())
     print(f'{path.relative_to(ROOT)}: {out.size} values')
     report(t, data)

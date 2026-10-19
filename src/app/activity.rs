@@ -4,40 +4,54 @@ pub(super) enum Activity {
     #[default]
     Idle,
     ChoosingFile,
+    /// A folder change (relink, clear or add) is writing the catalog. It ends as a
+    /// dialog does, once the catalog has opened again.
+    ChangingFolder,
     /// Sync Settings is writing other photos' edits: moving to another photo or
     /// catalog waits for it.
     Syncing,
 }
 impl Activity {
-    pub fn is_busy(&self) -> bool {
+    pub(crate) fn is_busy(&self) -> bool {
         !matches!(self, Self::Idle)
     }
-    pub fn is_dialog(&self) -> bool {
-        matches!(self, Self::ChoosingFile)
+    pub(crate) fn is_dialog(&self) -> bool {
+        matches!(self, Self::ChoosingFile | Self::ChangingFolder)
     }
-    pub fn begin_dialog(&mut self) -> bool {
+    /// A folder change is writing the catalog: closing waits for it.
+    pub(crate) fn is_changing_folder(&self) -> bool {
+        matches!(self, Self::ChangingFolder)
+    }
+    pub(crate) fn begin_folder_change(&mut self) -> bool {
+        if self.is_busy() {
+            return false;
+        }
+        *self = Self::ChangingFolder;
+        true
+    }
+    pub(crate) fn begin_dialog(&mut self) -> bool {
         if self.is_busy() {
             return false;
         }
         *self = Self::ChoosingFile;
         true
     }
-    pub fn begin_sync(&mut self) -> bool {
+    pub(crate) fn begin_sync(&mut self) -> bool {
         if self.is_busy() {
             return false;
         }
         *self = Self::Syncing;
         true
     }
-    pub fn is_syncing(&self) -> bool {
+    pub(crate) fn is_syncing(&self) -> bool {
         matches!(self, Self::Syncing)
     }
-    pub fn finish_sync(&mut self) {
+    pub(crate) fn finish_sync(&mut self) {
         if self.is_syncing() {
             *self = Self::Idle;
         }
     }
-    pub fn finish_dialog(&mut self) {
+    pub(crate) fn finish_dialog(&mut self) {
         if self.is_dialog() {
             *self = Self::Idle;
         }
@@ -51,6 +65,15 @@ mod tests {
         let mut activity = Activity::default();
         assert!(activity.begin_dialog());
         assert!(!activity.begin_dialog());
+        activity.finish_dialog();
+        assert!(!activity.is_busy());
+    }
+    #[test]
+    fn a_folder_change_ends_as_a_dialog_does() {
+        let mut activity = Activity::default();
+        assert!(activity.begin_folder_change());
+        assert!(activity.is_changing_folder() && activity.is_dialog());
+        assert!(!activity.begin_dialog() && !activity.begin_folder_change());
         activity.finish_dialog();
         assert!(!activity.is_busy());
     }

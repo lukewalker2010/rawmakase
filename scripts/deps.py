@@ -4,8 +4,10 @@
 Production code in `src/<module>` may use another top-level module only when
 `scripts/deps-allowed.txt` lists that edge. `check` fails on an edge missing
 from the list, so no new dependency appears unnoticed, and on a listed edge the
-code no longer has, so a removed dependency cannot quietly come back. The
-target layering is in docs/architecture.md.
+code no longer has, so a removed dependency cannot quietly come back. It also
+fails on a cycle, and on a module reaching, through any chain, one that
+`scripts/deps-closures.txt` says it never may (the edit's values never reach
+the RAW decoders or the renderer). The target layering is in docs/architecture.md.
 
     python3 scripts/deps.py check    # what CI runs
     python3 scripts/deps.py report   # every edge with its sites, and the cycles
@@ -24,6 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 ALLOWED = ROOT / "scripts" / "deps-allowed.txt"
+CLOSURES = ROOT / "scripts" / "deps-closures.txt"
 
 
 def blank(text):
@@ -132,6 +135,17 @@ def top_level_modules():
     return sorted(re.findall(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;", code, re.M))
 
 
+def crate_modules():
+    """Modules src/lib.rs re-exports from the workspace's crates (`pub use
+    rawmakase_engine::develop;`). Cargo builds those crates on their own, so they are
+    no nodes of the allow-listed graph, but closure rules may still forbid them."""
+    code = strip_comments_and_literals((SRC / "lib.rs").read_text(encoding="utf-8"))
+    names = []
+    for m in re.finditer(r"^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+rawmakase_\w+\s*::\s*(\{[^}]*\}|\w+)\s*;", code, re.M):
+        names += re.findall(r"\w+", m.group(1))
+    return sorted(set(names) - {"self"})
+
+
 def inline_module_depth(code):
     """For each position, how many inline `mod name { ... }` blocks enclose it."""
     opens = {m.end() - 1 for m in re.finditer(r"\bmod\s+\w+\s*\{", code)}
@@ -175,9 +189,11 @@ ROOT_PATH = re.compile(r"(?<![\w$])crate\s*::\s*(?:(?P<group>\{)|(?P<name>\w+))"
 SUPER_PATH = re.compile(r"(?<![\w:])(?P<supers>(?:super\s*::\s*)+)(?:(?P<group>\{)|(?P<name>\w+))")
 
 
-def production_edges():
-    """{(from, to): [site, ...]} for every production use of another module."""
+def production_edges(with_crates=False):
+    """{(from, to): [site, ...]} for every production use of another module, and
+    with `with_crates` of a module re-exported from a workspace crate."""
     modules = set(top_level_modules())
+    targets = modules | set(crate_modules()) if with_crates else modules
     test_paths = test_module_files()
     edges = defaultdict(list)
     for path in sorted(SRC.rglob("*.rs")):
@@ -197,7 +213,7 @@ def production_edges():
             if m.group("supers").count("super") == len(parts) + depths[m.start()]:
                 hits += [(m.start(), head) for head in heads_after(code, m)]
         for position, target in hits:
-            if target == source or target not in modules:
+            if target == source or target not in targets:
                 continue
             if any(start <= position < end for start, end in excluded):
                 continue
@@ -247,6 +263,67 @@ def read_allowed():
     return {tuple(part.strip() for part in e.split("->")) for e in entries if e}
 
 
+def reaches(edges, module):
+    """Every module `module` uses, directly or through others."""
+    graph = defaultdict(set)
+    for source, target in edges:
+        graph[source].add(target)
+    seen, todo = set(), [module]
+    while todo:
+        for target in graph[todo.pop()]:
+            if target not in seen:
+                seen.add(target)
+                todo.append(target)
+    return seen
+
+
+def read_closures():
+    """(module, forbidden modules) from deps-closures.txt: `catalog never raw develop`."""
+    rules = []
+    for line in CLOSURES.read_text(encoding="utf-8").splitlines():
+        words = line.split("#")[0].split()
+        if words:
+            if len(words) < 3 or words[1] != "never":
+                sys.exit(f"{CLOSURES.relative_to(ROOT)}: expected `module never other...`: {line}")
+            rules.append((words[0], words[2:]))
+    return rules
+
+
+def path_to(edges, source, target):
+    """One chain of modules from `source` to `target`, for the message."""
+    graph = defaultdict(set)
+    for a, b in edges:
+        graph[a].add(b)
+    previous, todo = {source: None}, [source]
+    while todo:
+        node = todo.pop(0)
+        for next_node in sorted(graph[node]):
+            if next_node not in previous:
+                previous[next_node] = node
+                todo.append(next_node)
+    chain, node = [], target
+    while node is not None:
+        chain.append(node)
+        node = previous[node]
+    return " -> ".join(reversed(chain))
+
+
+def check_closures(edges):
+    broken = 0
+    known = set(top_level_modules()) | set(crate_modules())
+    for module, forbidden in read_closures():
+        for name in [module, *forbidden]:
+            if name not in known:
+                print(f"{CLOSURES.relative_to(ROOT)} names {name}, which is no top-level module")
+                broken += 1
+        reached = reaches(edges, module)
+        for other in forbidden:
+            if other in reached:
+                print(f"{module} must not reach {other}, but does: {path_to(edges, module, other)}")
+                broken += 1
+    return broken
+
+
 def check(edges):
     allowed = read_allowed()
     new = sorted(set(edges) - allowed)
@@ -262,9 +339,14 @@ def check(edges):
             "\nA new edge between top-level modules needs a reason. If it fits the layering in\n"
             "docs/architecture.md, add it to the allow-list in the same pull request."
         )
-    if not new and not stale:
-        print(f"{len(edges)} module dependencies, all allowed; {len(cycles(edges))} cycle(s) remain.")
-    return 1 if new or stale else 0
+    found = cycles(edges)
+    for component in found:
+        print("Cycle between " + ", ".join(component))
+    broken = check_closures(production_edges(with_crates=True))
+    if not new and not stale and not found and not broken:
+        rules = len(read_closures())
+        print(f"{len(edges)} module dependencies, all allowed; no cycles; {rules} closure rules hold.")
+    return 1 if new or stale or found or broken else 0
 
 
 def report(edges):

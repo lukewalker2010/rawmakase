@@ -11,11 +11,15 @@ build:
 
 check:
 	python3 scripts/deps.py check
+	python3 -m unittest discover -s scripts/corpus
+	scripts/crate-closures.sh
 	cargo fmt --check
-	cargo clippy --locked --all-targets -- -D warnings
+	cargo clippy --locked --workspace --all-targets -- -D warnings
 	cargo clippy --locked --all-targets --no-default-features -- -D warnings
-	cargo test --locked
-	cargo clippy --locked --all-targets -p rawmakase-protocol -p rawmakase-ctl -- -D warnings
+	cargo test --locked -p rawmakase -p rawmakase-decode -p rawmakase-export
+	cargo clippy --locked --all-targets -p rawmakase-tiff -p rawmakase-raw -p rawmakase-model -p rawmakase-interop -p rawmakase-catalog -p rawmakase-engine -p rawmakase-protocol -p rawmakase-ctl -- -D warnings
+	cargo test --locked -p rawmakase-model --all-features
+	cargo test --locked -p rawmakase-tiff -p rawmakase-raw -p rawmakase-interop -p rawmakase-catalog -p rawmakase-engine
 	cargo test --locked -p rawmakase-protocol -p rawmakase-ctl
 
 # Install does not rebuild, so `make && sudo make install PREFIX=/usr` never compiles as root.

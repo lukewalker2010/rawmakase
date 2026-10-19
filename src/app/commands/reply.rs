@@ -1,5 +1,6 @@
 //! Typed application results. Transports choose how to encode these snapshots.
 use super::output::OutputState;
+use crate::catalog::PhotoId;
 use crate::color::curve::ToneCurve;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -10,10 +11,15 @@ pub(in crate::app) struct State {
     pub message: String,
     pub mode: &'static str,
     pub photo: Option<String>,
-    pub photo_id: Option<i64>,
+    pub photo_id: Option<PhotoId>,
     pub generation: u64,
     pub revision: u64,
     pub loaded: bool,
+    /// The photo Develop could not open: it will not load, so a client waiting
+    /// for `loaded` stops.
+    pub open_failed: Option<PhotoId>,
+    /// Why it could not be opened, kept while `message` moves on.
+    pub open_error: Option<String>,
     pub busy: bool,
     pub modal: bool,
     pub black_and_white: bool,
@@ -25,9 +31,19 @@ pub(in crate::app) struct State {
     pub tone_curve: Curves,
     pub selected_mask: Option<usize>,
     pub exporting: bool,
+    /// Previews being built: how many are done of how many queued.
+    pub building_previews: Option<BuildProgress>,
     pub auto_running: bool,
     pub treatment_pending: bool,
     pub save_state: &'static str,
+    /// Which of the open module's panels show: `left`, `right` and `filmstrip`,
+    /// each `shown` or `hidden`.
+    pub panels: crate::app::panels::PanelLayout,
+}
+#[derive(Debug, Serialize)]
+pub(in crate::app) struct BuildProgress {
+    pub done: usize,
+    pub total: usize,
 }
 #[derive(Debug, Serialize)]
 pub(in crate::app) struct MaskState {
@@ -75,10 +91,15 @@ pub(in crate::app) enum Outcome {
         saved: bool,
     },
     Output(OutputState),
+    /// Previews queued by `build_previews`; queueing is not building.
+    Previews {
+        queued: usize,
+        skipped: usize,
+    },
 }
 #[derive(Debug, Serialize)]
 pub(in crate::app) struct PhotoIdentity {
-    pub id: i64,
+    pub id: PhotoId,
     pub filename: String,
     pub path: std::path::PathBuf,
 }

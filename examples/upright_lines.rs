@@ -4,16 +4,15 @@
 //! line, in centred long-edge units of the displayed photo, after a `#` line with the
 //! corrections for each Upright mode.
 use anyhow::{Context, Result};
-use rawmakase::{
-    develop::{Recipe, upright},
-    raw,
-};
+use rawmakase::model::recipe::Recipe;
+use rawmakase::{camera_data, develop::upright};
 use std::sync::atomic::AtomicBool;
 
 fn main() -> Result<()> {
     let path = std::env::args().nth(1).context("Supply a RAW path")?;
     let cancel = AtomicBool::new(false);
-    let image = raw::Raw::open(std::path::Path::new(&path))?.develop(raw::Decode::Half, &cancel)?;
+    let image = rawmakase::photo::open(std::path::Path::new(&path))?
+        .develop(camera_data::Decode::Half, &cancel)?;
     let r = Recipe::with_profiles(&image.metadata, &[]);
     let (lum, w, h) = upright::analysis_image(&image, &r);
     let segments = upright::segments(&lum, w, h);

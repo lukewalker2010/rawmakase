@@ -4,6 +4,8 @@ mod output;
 mod parameter;
 mod preset;
 mod reply;
+use crate::app::Module;
+use crate::app::panels::{PanelChange, WorkspacePanel};
 use reply::{
     Capabilities, CurveCapabilities, Curves, MaskState, PhotoIdentity, PhotoSummary, State,
 };
@@ -12,9 +14,28 @@ pub(super) use reply::{Outcome, Reply};
 #[derive(Default)]
 pub(super) struct Automation {
     pub revision: u64,
-    observed: Option<(u64, crate::develop::Recipe)>,
+    observed: Option<(u64, crate::model::recipe::Recipe)>,
     outputs: output::Outputs,
     turn: Option<(std::time::Instant, TurnScope)>,
+}
+impl Automation {
+    /// Whether output job `id` has finished, or does not exist.
+    pub(super) fn job_finished(&self, id: u64) -> bool {
+        self.outputs.finished(id)
+    }
+    /// Whether an export or preview job a command started is still running, and
+    /// not cancelled.
+    pub(super) fn outputs_running(&self) -> bool {
+        self.outputs.any_running()
+    }
+    /// Cancels the export and preview jobs commands started.
+    pub(super) fn cancel_outputs(&self) {
+        self.outputs.cancel_all();
+    }
+    /// The export and preview jobs commands started, cancelled, to wait for at exit.
+    pub(super) fn stop_outputs(&mut self) -> Vec<super::task::Stopping> {
+        self.outputs.stop()
+    }
 }
 pub(super) use parameter::Param;
 pub(super) use preset::PresetTarget;
@@ -41,16 +62,16 @@ impl Automation {
 }
 
 use super::{Editor, state::Tool};
-use crate::catalog::Photo;
+use crate::catalog::{Photo, PhotoId};
 use eframe::egui;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 pub(super) use rawmakase_protocol::PROTOCOL;
 
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// A command's [`rawmakase_protocol::Target`], its photo id typed.
+#[derive(Clone, Debug, Default)]
 pub(super) struct Target {
-    pub photo_id: Option<i64>,
+    pub photo_id: Option<PhotoId>,
     pub generation: Option<u64>,
     pub revision: Option<u64>,
     /// A mask index from state. Requires generation and revision guards, since
@@ -58,14 +79,17 @@ pub(super) struct Target {
     pub mask: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(super) enum CurveChannel {
-    Rgb,
-    Red,
-    Green,
-    Blue,
+impl From<rawmakase_protocol::Target> for Target {
+    fn from(t: rawmakase_protocol::Target) -> Self {
+        Self {
+            photo_id: t.photo_id.map(PhotoId),
+            generation: t.generation,
+            revision: t.revision,
+            mask: t.mask,
+        }
+    }
 }
+pub(super) use rawmakase_protocol::CurveChannel;
 
 #[derive(Clone, Debug)]
 pub(super) struct Command {
@@ -73,7 +97,7 @@ pub(super) struct Command {
     pub target: Target,
 }
 impl Command {
-    pub fn new(operation: Operation) -> Self {
+    pub(crate) fn new(operation: Operation) -> Self {
         Self {
             operation,
             target: Target::default(),
@@ -115,12 +139,26 @@ pub(super) enum Operation {
         max_edge: u32,
     },
     Job(u64),
+    /// Builds previews of the selection, as the thumbnail menu does.
+    BuildPreviews(crate::catalog::preview_cache::PreviewKind),
+    /// Answers once `Until` holds, or after the time given, so a client waiting
+    /// for a photo or an output is woken rather than polling.
+    Wait(Until, std::time::Duration),
+}
+
+/// What a `wait` command waits for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Until {
+    /// The photo is loaded, or no longer the one opened (another replaced it).
+    Loaded(PhotoId),
+    /// The output job has finished, or does not exist.
+    Job(u64),
 }
 
 #[derive(Clone, Debug)]
 pub(super) enum PhotoTarget {
     Name(String),
-    Id(i64),
+    Id(PhotoId),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,6 +197,8 @@ pub(super) enum Action {
     Loupe,
     Next,
     Previous,
+    /// Hides or shows the open module's panels, as Tab, Shift+Tab and F6–F8 do.
+    Panels(PanelChange),
 }
 impl Action {
     const NAMED: &[(&'static str, Self)] = &[
@@ -215,6 +255,24 @@ impl Action {
         ("loupe", Self::Loupe),
         ("next", Self::Next),
         ("previous", Self::Previous),
+        ("panels:sides", Self::Panels(PanelChange::Sides)),
+        ("panels:all", Self::Panels(PanelChange::All)),
+        (
+            "panels:left",
+            Self::Panels(PanelChange::Toggle(WorkspacePanel::Left)),
+        ),
+        (
+            "panels:right",
+            Self::Panels(PanelChange::Toggle(WorkspacePanel::Right)),
+        ),
+        (
+            "panels:filmstrip",
+            Self::Panels(PanelChange::Toggle(WorkspacePanel::Filmstrip)),
+        ),
+        (
+            "panels:presets",
+            Self::Panels(PanelChange::Toggle(WorkspacePanel::Presets)),
+        ),
     ];
     pub(super) fn metadata(self) -> Option<super::photo_metadata::Edit> {
         use super::photo_metadata::{Edit, LABELS};
@@ -228,20 +286,20 @@ impl Action {
             _ => return None,
         })
     }
-    pub fn parse(name: &str) -> Option<Self> {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
         Self::NAMED
             .iter()
             .find(|(n, _)| *n == name)
             .map(|(_, action)| *action)
     }
-    pub fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         Self::NAMED
             .iter()
             .find(|(_, action)| *action == self)
             .expect("named action")
             .0
     }
-    pub fn names() -> Vec<&'static str> {
+    pub(crate) fn names() -> Vec<&'static str> {
         Self::NAMED.iter().map(|(name, _)| *name).collect()
     }
 }
@@ -252,7 +310,7 @@ pub(super) struct Error {
     pub message: String,
 }
 impl Error {
-    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -268,19 +326,19 @@ impl Editor {
         let generation = self.load.id();
         if let Some((seen_generation, recipe)) = &self.automation.observed
             && *seen_generation == generation
-            && *recipe == self.document.recipe
+            && *recipe == *self.document.edit.recipe()
         {
             return;
         }
         if self.automation.observed.is_some() {
             self.automation.revision = self.automation.revision.wrapping_add(1);
         }
-        self.automation.observed = Some((generation, self.document.recipe.clone()));
+        self.automation.observed = Some((generation, self.document.edit.recipe().clone()));
     }
     pub(super) fn command_state(&mut self) -> State {
         self.sync_command_revision();
-        let develop = !self.library_mode && self.document.metadata.is_some();
-        let mut recipe = self.document.recipe.clone();
+        let develop = self.module == Module::Develop && self.document.metadata.is_some();
+        let mut recipe = self.document.edit.recipe().clone();
         let mut values = std::collections::BTreeMap::new();
         if develop {
             for (name, param) in Param::all() {
@@ -312,7 +370,7 @@ impl Editor {
         State {
             protocol: PROTOCOL,
             message: self.status.clone(),
-            mode: if self.library_mode {
+            mode: if self.module == Module::Library {
                 "library"
             } else {
                 "develop"
@@ -324,6 +382,10 @@ impl Editor {
             generation: self.load.id(),
             revision: self.automation.revision,
             loaded: develop && self.document.full().is_some() && !self.load.is_running(),
+            open_failed: self.open_failed(),
+            open_error: self
+                .open_failed()
+                .and_then(|_| self.document.failed.clone()),
             busy: self.activity.is_busy(),
             modal: self.command_modal(),
             black_and_white: develop && recipe.effects.monochrome,
@@ -349,9 +411,18 @@ impl Editor {
             },
             selected_mask: self.view.masking.selected,
             exporting: self.exporting(),
+            building_previews: self
+                .preview_builds
+                .progress()
+                .filter(super::preview_build::Progress::running)
+                .map(|p| super::commands::reply::BuildProgress {
+                    done: p.done,
+                    total: p.total,
+                }),
             auto_running: self.document.auto.is_running(),
             treatment_pending: self.document.pending_treatment.is_some(),
-            save_state: match self.document.save {
+            panels: self.panels.of(self.module),
+            save_state: match self.document.edit.save_state() {
                 super::save_state::SaveState::Clean => "saved",
                 super::save_state::SaveState::Pending(_) => "pending",
                 super::save_state::SaveState::Saving { .. } => "saving",
@@ -360,18 +431,23 @@ impl Editor {
             },
         }
     }
+    /// The photo Develop shows as one it could not open.
+    pub(super) fn open_failed(&self) -> Option<crate::catalog::PhotoId> {
+        (self.module == Module::Develop
+            && self.document.failed.is_some()
+            && !self.load.is_running())
+        .then_some(self.document.catalog_photo)
+        .flatten()
+    }
     pub(super) fn command_modal(&self) -> bool {
         self.preferences.open
             || self.export_modal()
-            || self.remove_copy.is_some()
-            || self.read_metadata.is_some()
+            || self.modal.is_some()
             || self.not_editable.is_some()
-            || self.folder_question.is_some()
             || self.view.shortcuts
-            || self.copy_dialog.is_some()
-            || self.preset_rename.is_some()
             || self.onboarding.visible
             || self.curve_save_open()
+            || self.folder_sync.is_reviewing()
     }
     fn check_target(&self, target: &Target) -> Result<()> {
         if target
@@ -402,7 +478,7 @@ impl Editor {
         Ok(())
     }
     fn require_develop(&self) -> Result<()> {
-        if self.library_mode || self.document.metadata.is_none() {
+        if self.module == Module::Library || self.document.metadata.is_none() {
             return Err(Error::new("no_document", "Open a photo in Develop first"));
         }
         if self.load.is_running() || self.document.full().is_none() {
@@ -429,7 +505,8 @@ impl Editor {
         self.sync_command_revision();
         let Command { operation, target } = command;
         match operation {
-            Operation::State => return Ok(Outcome::Empty),
+            // A wait sent by a device answers at once; the control socket keeps it.
+            Operation::State | Operation::Wait(..) => return Ok(Outcome::Empty),
             Operation::Job(id) => return self.automation.outputs.state(id).map(Outcome::Output),
             Operation::Capabilities => {
                 return Ok(Outcome::Capabilities(Capabilities {
@@ -454,12 +531,14 @@ impl Editor {
                         "export",
                         "preview",
                         "job",
+                        "wait",
+                        "build_previews",
                     ],
                     tone_curve: CurveCapabilities {
                         channels: ["rgb", "red", "green", "blue"],
-                        point_count: [2, 32],
+                        point_count: rawmakase_protocol::curve::POINT_COUNT,
                         coordinate_range: [0, 1],
-                        minimum_input_spacing: 0.00049,
+                        minimum_input_spacing: rawmakase_protocol::curve::MINIMUM_INPUT_SPACING,
                         interpolation: "natural_cubic",
                     },
                     target_fields: &["photo_id", "generation", "revision", "mask"],
@@ -479,6 +558,7 @@ impl Editor {
                     .ok_or_else(|| Error::new("no_catalog", "No catalog is open"))?;
                 let query = query.to_lowercase();
                 let all: Vec<_> = library
+                    .session
                     .photos
                     .iter()
                     .filter(|p| query.is_empty() || p.filename.to_lowercase().contains(&query))
@@ -495,10 +575,33 @@ impl Editor {
                     photos,
                 });
             }
+            Operation::BuildPreviews(kind) => {
+                if self.activity.is_busy() || self.command_modal() {
+                    return Err(Error::new(
+                        "busy",
+                        "Close the dialog or wait for the current operation",
+                    ));
+                }
+                let ids = self.preview_command_scope();
+                if ids.is_empty() {
+                    return Err(Error::new(
+                        "no_selection",
+                        "Select photos to build previews of",
+                    ));
+                }
+                let queued = self
+                    .build_previews(&ids, kind)
+                    .map_err(|e| Error::new("not_queued", e))?;
+                self.status = super::preview_build::queued_message(queued);
+                return Ok(Outcome::Previews {
+                    queued: queued.queued,
+                    skipped: queued.skipped,
+                });
+            }
             Operation::Presets { group } => {
                 self.require_presets()?;
                 // The issues are the open photo's, and the Library has none open.
-                let develop = !self.library_mode && self.document.metadata.is_some();
+                let develop = self.module == Module::Develop && self.document.metadata.is_some();
                 let issues = if develop {
                     &self.presets.issues[..]
                 } else {
@@ -514,7 +617,7 @@ impl Editor {
             }
             _ => {}
         }
-        let library_metadata = self.library_mode
+        let library_metadata = self.module == Module::Library
             && matches!(operation, Operation::Action(a) if a.metadata().is_some());
         let mut checked = target.clone();
         if library_metadata && let Some(id) = target.photo_id {
@@ -565,7 +668,9 @@ impl Editor {
         self.finish_edit_frame(frame, ctx);
         self.sync_undo();
         if save && result.is_ok() {
-            if !self.flush() || self.document.save.needs_save() || self.document.save.is_protected()
+            if !self.flush()
+                || self.document.edit.save_state().needs_save()
+                || self.document.edit.save_state().is_protected()
             {
                 return Err(Error::new("save_failed", "The edit could not be saved"));
             }
@@ -581,20 +686,21 @@ impl Editor {
     ) -> Result<Outcome> {
         match operation {
             Operation::Set(param, value) => {
+                let param = self.for_photo(param, target);
                 self.command_parameter(param, Some(value), 0, target, ctx)?
             }
             Operation::Preset(target) => {
                 self.require_develop()?;
                 self.require_presets()?;
                 let i = preset::find(&self.presets.library.presets, &target)?;
-                let before = self.document.recipe.clone();
+                let before = self.document.edit.recipe().clone();
                 let applied = self
                     .apply_preset(i)
                     .map_err(|e| Error::new("not_applied", format!("{e:#}")))?;
                 // Named here: applying the preset already applied, after other edits,
                 // changes no preset name for History to recognize it by. Only a change
                 // is named, or the name would be left for the next edit.
-                if self.document.recipe != before {
+                if *self.document.edit.recipe() != before {
                     super::widgets::name_frame_step(ctx, "Preset".into(), applied.name.clone());
                 }
                 return Ok(Outcome::Preset { applied });
@@ -609,10 +715,10 @@ impl Editor {
                     .validate()
                     .map_err(|e| Error::new("invalid_curve", e.to_string()))?;
                 let current = match channel {
-                    CurveChannel::Rgb => &mut self.document.recipe.curve,
-                    CurveChannel::Red => &mut self.document.recipe.effects.channels[0],
-                    CurveChannel::Green => &mut self.document.recipe.effects.channels[1],
-                    CurveChannel::Blue => &mut self.document.recipe.effects.channels[2],
+                    CurveChannel::Rgb => &mut self.document.edit.recipe_mut().curve,
+                    CurveChannel::Red => &mut self.document.edit.recipe_mut().effects.channels[0],
+                    CurveChannel::Green => &mut self.document.edit.recipe_mut().effects.channels[1],
+                    CurveChannel::Blue => &mut self.document.edit.recipe_mut().effects.channels[2],
                 };
                 if *current != curve {
                     *current = curve;
@@ -624,6 +730,7 @@ impl Editor {
                 }
             }
             Operation::ControlValue(param, value) => {
+                let param = self.for_photo(param, target);
                 self.command_parameter(
                     param,
                     Some(param.control_value(value, target.mask.is_some())),
@@ -634,6 +741,7 @@ impl Editor {
                 ctx.request_repaint_after(std::time::Duration::from_millis(450));
             }
             Operation::Adjust(param, ticks) => {
+                let param = self.for_photo(param, target);
                 self.command_parameter(param, None, ticks, target, ctx)?;
                 ctx.request_repaint_after(std::time::Duration::from_millis(450));
             }
@@ -656,7 +764,9 @@ impl Editor {
             Operation::Module(develop) => return self.command_module(develop),
             Operation::Navigate(step) => return self.command_navigate(step),
             Operation::DeviceNavigate(step) => {
-                if !self.library_mode || self.library.as_ref().is_some_and(|l| l.loupe_open()) {
+                if self.module == Module::Develop
+                    || self.library.as_ref().is_some_and(|l| l.loupe_open())
+                {
                     return self.command_navigate(step);
                 }
             }
@@ -680,7 +790,7 @@ impl Editor {
             }
             Operation::Save => {
                 self.require_develop()?;
-                if self.document.save.is_protected() {
+                if self.document.edit.save_state().is_protected() {
                     return Err(Error::new(
                         "protected",
                         "This edit is protected from saving",
@@ -701,9 +811,21 @@ impl Editor {
             | Operation::Capabilities
             | Operation::Photos { .. }
             | Operation::Presets { .. }
-            | Operation::Job(_) => unreachable!(),
+            | Operation::Job(_)
+            | Operation::BuildPreviews(_)
+            | Operation::Wait(..) => unreachable!(),
         }
         Ok(Outcome::Empty)
+    }
+    /// `param` as the open photo holds it (see `ParameterId::for_photo`): a JPEG,
+    /// PNG or TIFF's Temp and Tint are relative. A mask's are its own.
+    fn for_photo(&self, param: Param, target: &Target) -> Param {
+        match param {
+            Param::Setting(id) if target.mask.is_none() => {
+                Param::Setting(id.for_photo(self.document.metadata.as_ref()))
+            }
+            other => other,
+        }
     }
     fn command_parameter(
         &mut self,
@@ -717,50 +839,49 @@ impl Editor {
         if value.is_some_and(|v| !v.is_finite()) {
             return Err(Error::new("invalid_value", "Value must be finite"));
         }
-        let before_recipe = self.document.recipe.clone();
+        let before_recipe = self.document.edit.recipe().clone();
         let channel = self.view.mixer_adjust.min(2);
         let shown = if let Some(index) = target.mask {
             let mask = self
                 .document
-                .recipe
+                .edit
+                .recipe_mut()
                 .masks
                 .get_mut(index)
                 .ok_or_else(|| Error::new("unknown_mask", "The mask does not exist"))?;
             param.local_set(&mut mask.adjust, value, ticks)?
         } else {
-            let recipe = &mut self.document.recipe;
-            let before = *param.value(recipe, channel);
-            let shown = if let Some(value) = value {
-                param.set(recipe, value, channel)
-            } else {
-                param.turn(recipe, ticks, channel)
+            let recipe = self.document.edit.recipe_mut();
+            let change = |recipe: &mut crate::model::recipe::Recipe| match value {
+                Some(value) => param.set(recipe, value, channel),
+                None => param.turn(recipe, ticks, channel),
             };
-            if param.is_white_balance() && before != *param.value(recipe, channel) {
-                recipe.update_wb(self.document.metadata.as_ref().expect("checked above"));
-                recipe.auto_white_balance = None;
+            match param {
+                Param::Setting(id) => {
+                    let photo = self.document.metadata.as_ref();
+                    crate::model::edit::change_setting(recipe, id, photo, change)
+                }
+                _ => change(recipe),
             }
-            if param == Param::Clarity {
-                recipe.adopt_measured_clarity(before);
-            }
-            if param == Param::Texture {
-                recipe.adopt_measured_texture(before);
-            }
-            shown
         };
         let label = if let Some(index) = target.mask {
             format!("Mask {} {}", index + 1, param.label(channel))
         } else {
             param.label(channel)
         };
-        if before_recipe != self.document.recipe {
+        if before_recipe != *self.document.edit.recipe() {
             ctx.data_mut(|d| d.insert_temp(super::widgets::history_step_id(), (label, shown)));
         }
         Ok(())
     }
-    pub(super) fn execute_action(&mut self, action: Action, photo: Option<i64>) -> Result<Outcome> {
+    pub(super) fn execute_action(
+        &mut self,
+        action: Action,
+        photo: Option<PhotoId>,
+    ) -> Result<Outcome> {
         use Action::*;
         if let Some(edit) = action.metadata() {
-            if self.library_mode && photo.is_none() {
+            if self.module == Module::Library && photo.is_none() {
                 return Err(Error::new(
                     "target_required",
                     "Library metadata actions require an explicit photo_id; use photos to find it",
@@ -782,6 +903,11 @@ impl Editor {
             Develop => return self.command_module(true),
             Next => return self.command_navigate(1),
             Previous => return self.command_navigate(-1),
+            Panels(change) => {
+                if !self.request_panels(change) {
+                    return Err(Error::new("save_failed", self.status.clone()));
+                }
+            }
             Loupe => {
                 self.command_module(false)?;
                 if let Some(library) = &mut self.library {
@@ -847,9 +973,9 @@ impl Editor {
                     ExportPrevious => self.export_with_previous(),
                     ToggleMono => self.toggle_treatment(),
                     Treatment(bw) => self.set_treatment(if bw {
-                        crate::develop::Treatment::BlackWhite
+                        crate::model::recipe::Treatment::BlackWhite
                     } else {
-                        crate::develop::Treatment::Color
+                        crate::model::recipe::Treatment::Color
                     }),
                     Compare => self.set_compare(
                         self.view
@@ -876,21 +1002,21 @@ impl Editor {
     pub(super) fn command_metadata(
         &mut self,
         edit: super::photo_metadata::Edit,
-        photo: Option<i64>,
+        photo: Option<PhotoId>,
         advance: bool,
     ) -> Result<()> {
         let library = self
             .library
             .as_mut()
             .ok_or_else(|| Error::new("no_catalog", "No catalog is open"))?;
-        let id = photo.or(if self.library_mode {
+        let id = photo.or(if self.module == Module::Library {
             None
         } else {
             self.document.catalog_photo
         });
         let next = if let Some(id) = id {
             library.edit_metadata(id, edit, advance)
-        } else if self.library_mode {
+        } else if self.module == Module::Library {
             library.edit_shown(edit, advance).map(|_| None)
         } else {
             return Err(Error::new("no_document", "No catalog photo is open"));
@@ -910,7 +1036,7 @@ impl Editor {
     }
     fn command_module(&mut self, develop: bool) -> Result<Outcome> {
         if develop {
-            if !self.library_mode {
+            if self.module == Module::Develop {
                 return Ok(Outcome::Empty);
             }
             let id = self
@@ -926,7 +1052,7 @@ impl Editor {
             if !self.flush() {
                 return Err(Error::new("save_failed", "The edit could not be saved"));
             }
-            self.library_mode = true;
+            self.module = Module::Library;
             if let Some(library) = &mut self.library {
                 library.show_grid();
             }
@@ -938,15 +1064,21 @@ impl Editor {
             .library
             .as_ref()
             .ok_or_else(|| Error::new("no_catalog", "No catalog is open"))?;
-        let current = if self.library_mode {
+        let current = if self.module == Module::Library {
             library.selected()
         } else {
             self.document.catalog_photo
         };
         let next = current
-            .and_then(|id| library.navigate(id, step))
+            .and_then(|id| {
+                if self.module == Module::Library {
+                    library.navigate(id, step)
+                } else {
+                    self.develop_step(id, step)
+                }
+            })
             .ok_or_else(|| Error::new("end_of_list", "No next photo in this direction"))?;
-        if self.library_mode {
+        if self.module == Module::Library {
             self.library
                 .as_mut()
                 .expect("checked above")
@@ -962,7 +1094,7 @@ impl Editor {
             .ok_or_else(|| Error::new("no_catalog", "No catalog is open"))?;
         let id = match target {
             PhotoTarget::Id(id) => id,
-            PhotoTarget::Name(name) => match find_photos(&library.photos, &name)[..] {
+            PhotoTarget::Name(name) => match find_photos(&library.session.photos, &name)[..] {
                 [] => return Err(Error::new("not_found", "No photo matches this name")),
                 [photo] => photo.id,
                 ref many => {
@@ -984,7 +1116,7 @@ impl Editor {
             return Err(Error::new("save_failed", "The edit could not be saved"));
         }
         self.develop_catalog_photo(id);
-        if self.library_mode || self.document.catalog_photo != Some(id) {
+        if self.module == Module::Library || self.document.catalog_photo != Some(id) {
             return Err(Error::new(
                 "open_failed",
                 "The requested photo could not be opened",

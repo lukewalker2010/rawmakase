@@ -1,9 +1,10 @@
 use super::{
     Event, Latest, Pane, Preview, RenderJob, RenderStage, RetiredTextures, TaskKind, send,
 };
+use crate::model::recipe::Recipe;
 use crate::{
+    color_management,
     develop::{self, gpu, quality::Output},
-    raw,
 };
 use eframe::{egui, egui_wgpu};
 use std::{
@@ -14,6 +15,8 @@ use std::{
 };
 #[derive(Clone)]
 pub(in crate::app) enum RenderBackend {
+    /// The CPU, for headless tests.
+    #[cfg(test)]
     Cpu,
     /// The GPU; with the UI's render state, previews are presented into textures
     /// the viewport draws, and otherwise read back from a device of their own.
@@ -22,29 +25,45 @@ pub(in crate::app) enum RenderBackend {
 /// Long edges of the Navigator's and the library thumbnail's copies.
 const NAVIGATOR: u32 = 360;
 const THUMBNAIL: u32 = 640;
-/// A full 100% region presented within this needs no reduced preview first.
-const QUICK_REGION: std::time::Duration = std::time::Duration::from_millis(40);
+/// A full render presented within this needs no reduced preview first.
+const QUICK: std::time::Duration = std::time::Duration::from_millis(40);
+/// A reduced whole-photo preview halves the render's long edge until it has at most
+/// this many pixels.
+const DRAFT_PIXELS: f32 = 1_000_000.;
+
+/// The long edge of a reduced preview of a `width` by `height` render (after crop,
+/// as `max_edge` applies to it), or None when the render is small enough already.
+fn draft_edge(width: u32, height: u32) -> Option<u32> {
+    let aspect = width.min(height) as f32 / width.max(height).max(1) as f32;
+    let mut edge = width.max(height) as f32;
+    let mut halved = 0;
+    while edge * edge * aspect > DRAFT_PIXELS && halved < 4 {
+        edge /= 2.;
+        halved += 1;
+    }
+    (halved > 0).then_some(edge.round() as u32)
+}
 
 /// A finished render and the view it shows.
 struct Shown {
-    image: Arc<crate::raw::CameraImage>,
-    recipe: develop::Recipe,
+    image: Arc<crate::camera_data::CameraImage>,
+    recipe: Recipe,
     max_edge: u32,
     region: Option<[u32; 4]>,
-    clipping: develop::ClipOverlay,
+    clipping: crate::rendered::ClipOverlay,
     monitor: Option<PathBuf>,
     navigator: bool,
     overlay: super::Overlay,
     out: Shot,
 }
 enum Shot {
-    Pixels(develop::Rendered),
+    Pixels(crate::rendered::Rendered),
     /// A presented frame, valid while its texture still holds `generation`.
     Frame {
         texture: wgpu::Texture,
         generation: u64,
         preview: Presented,
-        histogram: Box<develop::Histogram>,
+        histogram: Box<crate::rendered::Histogram>,
     },
 }
 impl Shown {
@@ -130,19 +149,39 @@ impl Textures {
 
 /// The preview renderer: one thread, with a lane for the edit and one for Before, so
 /// each keeps its latest job and the edit's goes first.
-pub struct Renderer(Latest<RenderJob>);
+pub(crate) struct Renderer(Latest<RenderJob>);
 impl Renderer {
-    pub fn submit(&self, job: RenderJob) {
+    /// Stops rendering once the current job is done.
+    pub(in crate::app) fn stop(&mut self) -> crate::app::task::Stopping {
+        self.0.stop()
+    }
+    /// Queues `job` as its pane's latest. Returns the id of the pane's job it replaced,
+    /// which never runs and so never reports.
+    pub(crate) fn submit(&self, job: RenderJob) -> Option<u64> {
         let lane = match job.pane {
             Pane::After => 0,
             Pane::Before => 1,
         };
-        self.0.submit_to(lane, job);
+        self.0.submit_to(lane, job).map(|replaced| replaced.id)
     }
 }
 
-/// CPU-only compatibility entry point, also suitable for headless UI tests.
-pub fn renderer(tx: Sender<Event>, ctx: egui::Context) -> Renderer {
+/// A renderer that takes each job, reports its id to `taken` and holds it until
+/// `release` sends or closes, rendering nothing: for tests of what the UI asks for.
+#[cfg(test)]
+pub(in crate::app) fn holding(
+    taken: Sender<u64>,
+    release: std::sync::mpsc::Receiver<()>,
+) -> Renderer {
+    Renderer(Latest::with_lanes(2, move |job: RenderJob| {
+        let _ = taken.send(job.id);
+        let _ = release.recv();
+    }))
+}
+
+/// A CPU-only renderer, for headless tests.
+#[cfg(test)]
+pub(crate) fn renderer(tx: Sender<Event>, ctx: egui::Context) -> Renderer {
     renderer_with_backend(tx, ctx, RenderBackend::Cpu)
 }
 pub(in crate::app) fn renderer_with_backend(
@@ -208,9 +247,11 @@ struct PaneState {
     /// Whether the last full 100% region was presented on the GPU quickly enough that a
     /// reduced preview before it would only add work and a blurry frame.
     quick_region: bool,
+    /// The same for the last full whole-photo render.
+    quick_fit: bool,
     /// The whole photo's histogram for the last edit shown at 100%, so panning
     /// there does not render the whole photo again.
-    whole_shown: Option<(Arc<crate::raw::CameraImage>, develop::Recipe, Histogram)>,
+    whole_shown: Option<(Arc<crate::camera_data::CameraImage>, Recipe, Histogram)>,
 }
 
 fn render(
@@ -232,6 +273,7 @@ fn render(
         zoomed,
         showing_region,
         quick_region,
+        quick_fit,
         whole_shown,
     } = match job.pane {
         Pane::After => after,
@@ -243,6 +285,7 @@ fn render(
     };
     {
         let processor = processor.get_or_insert_with(|| match backend {
+            #[cfg(test)]
             RenderBackend::Cpu => develop::PreviewRenderer::default(),
             RenderBackend::Gpu(None) => develop::PreviewRenderer::with_gpu(),
             RenderBackend::Gpu(Some(state)) => {
@@ -262,9 +305,11 @@ fn render(
         let monitor = match (&job.monitor, textures.is_some()) {
             (Some(path), true) => {
                 if lut.as_ref().is_none_or(|(p, _)| p != path) {
-                    let built = gpu::MonitorLut::new(path)
-                        .map(Arc::new)
-                        .map_err(|e| e.to_string());
+                    let built = gpu::MonitorLut::sample(|rgb| {
+                        color_management::display_transform(path, rgb)
+                    })
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string());
                     *lut = Some((path.clone(), built));
                 }
                 match &lut.as_ref().unwrap().1 {
@@ -298,6 +343,7 @@ fn render(
             })
         };
         let whole = display(whole_slot, job.navigator, job.thumbnail);
+        let whole_draft = display(whole_slot, false, false);
         let zoomed_display = display(region_slot, false, false);
         let status = |stage: RenderStage, backend: &str, warning: &str| {
             format!(
@@ -307,7 +353,7 @@ fn render(
             )
         };
         // CPU pixels: display bytes, overlays and reduced copies here, off the UI thread.
-        let publish_pixels = |out: develop::Rendered, stage: RenderStage, gpu: bool| {
+        let publish_pixels = |out: crate::rendered::Rendered, stage: RenderStage, gpu: bool| {
             if job.cancel.load(Ordering::Relaxed) {
                 return;
             }
@@ -330,7 +376,7 @@ fn render(
                 .flatten();
             let mut warning = String::new();
             if let Some(p) = &job.monitor
-                && let Err(e) = raw::display_transform(p, &mut rgb)
+                && let Err(e) = color_management::display_transform(p, &mut rgb)
             {
                 warning = format!(" • ICC failed: {e}");
             }
@@ -470,22 +516,18 @@ fn render(
                 return Ok(());
             }
             if let Some(region) = job.region {
-                let out = if job.recipe.engine < 3 {
-                    Output::Pixels(develop::render_region(&job.image, &job.recipe, region)?)
-                } else {
+                let out = {
                     // While editing at 100%, a reduced preview keeps sliders responsive;
                     // a newer job cancels the full-resolution render that follows.
                     // Zooming in goes straight to the full region, over the enlarged Fit.
-                    if *showing_region
-                        && !*quick_region
-                        && let Some(out) = processor.render_region_preview_to(
+                    if *showing_region && !*quick_region {
+                        let out = processor.render_region_preview_to(
                             &job.image,
                             &job.recipe,
                             region,
                             &job.cancel,
                             zoomed_display.as_ref(),
-                        )?
-                    {
+                        )?;
                         let gpu = processor.used_gpu();
                         publish(out, RenderStage::Draft, false, gpu);
                     }
@@ -498,8 +540,7 @@ fn render(
                         &job.cancel,
                         zoomed_display.as_ref(),
                     )?;
-                    *quick_region =
-                        matches!(out, Output::Frame(_)) && started.elapsed() < QUICK_REGION;
+                    *quick_region = matches!(out, Output::Frame(_)) && started.elapsed() < QUICK;
                     out
                 };
                 let gpu = processor.used_gpu();
@@ -512,6 +553,33 @@ fn render(
                 }
                 return Ok(());
             }
+            // While the whole photo is edited, a reduced preview keeps sliders
+            // responsive on a GPU slower than they change; the full render follows.
+            // Opening a photo or changing the view goes straight to the full render.
+            let editing = !*showing_region
+                && fit.as_ref().is_some_and(|s| {
+                    Arc::ptr_eq(&s.image, &job.image) && s.max_edge == job.max_edge
+                });
+            let draft = || {
+                let g = develop::Geometry::new(&job.image, &job.recipe, job.max_edge);
+                draft_edge(g.width, g.height)
+            };
+            if editing
+                && !*quick_fit
+                && let Some(edge) = draft()
+            {
+                let out = processor.render_to(
+                    &job.image,
+                    &job.recipe,
+                    edge,
+                    None,
+                    &job.cancel,
+                    whole_draft.as_ref(),
+                )?;
+                let gpu = processor.used_gpu();
+                publish(out, RenderStage::Draft, false, gpu);
+            }
+            let started = Instant::now();
             let out = processor.render_to(
                 &job.image,
                 &job.recipe,
@@ -520,6 +588,7 @@ fn render(
                 &job.cancel,
                 whole.as_ref(),
             )?;
+            *quick_fit = matches!(out, Output::Frame(_)) && started.elapsed() < QUICK;
             let gpu = processor.used_gpu();
             *fit = publish(out, RenderStage::Fit, true, gpu).map(|out| Shown::new(&job, out));
             *showing_region = false;
@@ -541,7 +610,7 @@ fn render(
     }
 }
 
-type Histogram = Box<develop::Histogram>;
+type Histogram = Box<crate::rendered::Histogram>;
 
 /// At 100% the view shows a region, but the histogram describes the whole
 /// photo, as Lightroom's does: from the Fit render of the same edit when there
@@ -551,11 +620,11 @@ fn whole_histogram(
     job: &RenderJob,
     processor: &mut develop::PreviewRenderer,
     fit: &Option<Shown>,
-    whole: &mut Option<(Arc<crate::raw::CameraImage>, develop::Recipe, Histogram)>,
+    whole: &mut Option<(Arc<crate::camera_data::CameraImage>, Recipe, Histogram)>,
     tx: &Sender<Event>,
     ctx: &egui::Context,
 ) -> anyhow::Result<()> {
-    let same = |image: &Arc<crate::raw::CameraImage>, recipe: &develop::Recipe| {
+    let same = |image: &Arc<crate::camera_data::CameraImage>, recipe: &Recipe| {
         Arc::ptr_eq(image, &job.image) && *recipe == job.recipe
     };
     let histogram = if let Some((.., histogram)) = whole.as_ref().filter(|(i, r, _)| same(i, r)) {
@@ -593,10 +662,12 @@ fn whole_histogram(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::raw::{CameraImage, Metadata};
+    use crate::camera_data::{CameraImage, Metadata};
     use std::sync::{Arc, atomic::AtomicBool};
     fn image() -> Arc<CameraImage> {
-        let (w, h) = (240, 160);
+        image_of(240, 160)
+    }
+    fn image_of(w: u32, h: u32) -> Arc<CameraImage> {
         Arc::new(CameraImage {
             recovered: Default::default(),
             width: w,
@@ -625,7 +696,7 @@ mod tests {
         rx: &std::sync::mpsc::Receiver<Event>,
         id: u64,
         image: &Arc<CameraImage>,
-        recipe: &develop::Recipe,
+        recipe: &Recipe,
         region: Option<[u32; 4]>,
     ) -> Vec<(RenderStage, Vec<[f32; 3]>)> {
         run_in(worker, rx, Pane::After, id, image, recipe, region)
@@ -637,19 +708,33 @@ mod tests {
         pane: Pane,
         id: u64,
         image: &Arc<CameraImage>,
-        recipe: &develop::Recipe,
+        recipe: &Recipe,
         region: Option<[u32; 4]>,
+    ) -> Vec<(RenderStage, Vec<[f32; 3]>)> {
+        run_at(worker, rx, pane, id, image, recipe, region, 60)
+    }
+    /// `run_in`, for a view whose Fit has the long edge `max_edge`.
+    #[expect(clippy::too_many_arguments)]
+    fn run_at(
+        worker: &Renderer,
+        rx: &std::sync::mpsc::Receiver<Event>,
+        pane: Pane,
+        id: u64,
+        image: &Arc<CameraImage>,
+        recipe: &Recipe,
+        region: Option<[u32; 4]>,
+        max_edge: u32,
     ) -> Vec<(RenderStage, Vec<[f32; 3]>)> {
         worker.submit(RenderJob {
             id,
             pane,
             image: image.clone(),
-            max_edge: 60,
+            max_edge,
             cancel: Arc::new(AtomicBool::new(false)),
             recipe: recipe.clone(),
             region,
             monitor: None,
-            clipping: develop::ClipOverlay::NONE,
+            clipping: crate::rendered::ClipOverlay::NONE,
             navigator: region.is_none(),
             thumbnail: false,
             samples: false,
@@ -681,7 +766,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = renderer(tx, egui::Context::default());
         let image = image();
-        let mut recipe = develop::Recipe::default();
+        let mut recipe = Recipe::default();
         let region = Some([10, 10, 80, 60]);
         let fit = run(&worker, &rx, 1, &image, &recipe, None);
         assert_eq!(fit.len(), 1);
@@ -703,12 +788,51 @@ mod tests {
         assert_ne!(back[0].1, fit[0].1);
     }
     #[test]
+    fn a_reduced_preview_halves_the_edge_to_at_most_a_megapixel() {
+        // A 3:2 photo's Fit on a large HiDPI view.
+        assert_eq!(draft_edge(2360, 1573), Some(1180));
+        assert_eq!(draft_edge(1200, 800), None);
+        // Cropped square, the same long edge has more pixels.
+        assert_eq!(draft_edge(1200, 1200), Some(600));
+        // Four halvings at most.
+        assert_eq!(draft_edge(20000, 13333), Some(1250));
+    }
+    #[test]
+    fn editing_the_whole_photo_shows_a_reduced_preview_first() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = renderer(tx, egui::Context::default());
+        let image = image_of(1800, 1200);
+        let mut recipe = Recipe::default();
+        let fit = |id, recipe: &Recipe, edge| {
+            run_at(&worker, &rx, Pane::After, id, &image, recipe, None, edge)
+        };
+        // Opening the photo renders the full Fit directly.
+        assert_eq!(fit(1, &recipe, 1500).len(), 1);
+        // Editing it: a reduced preview, then the full Fit (the CPU is never quick).
+        recipe.exposure = 0.5;
+        let edited = fit(2, &recipe, 1500);
+        assert_eq!(edited.len(), 2);
+        assert_eq!(edited[0].0, RenderStage::Draft);
+        assert_eq!(edited[1].0, RenderStage::Fit);
+        // A view of another size, the window resized say, goes straight to the full render.
+        recipe.exposure = 0.7;
+        assert_eq!(fit(3, &recipe, 1100).len(), 1);
+        // At that size the whole photo is under a megapixel: no reduced preview.
+        recipe.exposure = 0.6;
+        assert_eq!(fit(4, &recipe, 1100).len(), 1);
+        // Cropped square, the same long edge renders more than a megapixel.
+        recipe.crop = [1. / 6., 0., 5. / 6., 1.];
+        let cropped = fit(5, &recipe, 1100);
+        assert_eq!(cropped.len(), 2);
+        assert_eq!(cropped[0].0, RenderStage::Draft);
+    }
+    #[test]
     fn before_renders_beside_the_edit_keep_the_edits_views() {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = renderer(tx, egui::Context::default());
         let image = image();
-        let mut recipe = develop::Recipe::default();
-        let before = develop::Recipe {
+        let mut recipe = Recipe::default();
+        let before = Recipe {
             exposure: -1.,
             ..Default::default()
         };
@@ -731,7 +855,7 @@ mod tests {
     fn a_panicking_render_fails_and_the_next_one_succeeds() {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = renderer(tx, egui::Context::default());
-        let recipe = develop::Recipe::default();
+        let recipe = Recipe::default();
         // Fewer pixels than its size says: indexing it panics.
         let mut broken = (*image()).clone();
         broken.pixels.truncate(10);
@@ -744,7 +868,7 @@ mod tests {
             recipe: recipe.clone(),
             region: None,
             monitor: None,
-            clipping: develop::ClipOverlay::NONE,
+            clipping: crate::rendered::ClipOverlay::NONE,
             navigator: true,
             thumbnail: false,
             samples: false,
@@ -768,10 +892,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = renderer(tx, egui::Context::default());
         let image = image();
-        let mut recipe = develop::Recipe::default();
+        let mut recipe = Recipe::default();
         let region = Some([10, 10, 80, 60]);
         // The histogram each job ends with, as the app keeps it.
-        let histogram = |id: u64, recipe: &develop::Recipe, region: Option<[u32; 4]>| {
+        let histogram = |id: u64, recipe: &Recipe, region: Option<[u32; 4]>| {
             worker.submit(RenderJob {
                 id,
                 pane: Pane::After,
@@ -781,7 +905,7 @@ mod tests {
                 recipe: recipe.clone(),
                 region,
                 monitor: None,
-                clipping: develop::ClipOverlay::NONE,
+                clipping: crate::rendered::ClipOverlay::NONE,
                 navigator: region.is_none(),
                 thumbnail: false,
                 samples: false,

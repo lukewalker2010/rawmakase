@@ -9,7 +9,7 @@ use super::{Action, Library, thumbnails};
 use crate::app::navigator::Zoom;
 use crate::app::theme;
 use crate::app::worker::Latest;
-use crate::catalog::Photo;
+use crate::catalog::{Photo, PhotoId};
 use eframe::egui::{self, Color32, Vec2};
 use std::path::PathBuf;
 use std::sync::{
@@ -25,7 +25,7 @@ const EDGE_STEP: u32 = 512;
 const PREFETCHED_BYTES: usize = 64 << 20;
 
 /// A preview as asked for: photo, file (photo ids can be reused) and edge.
-type Key = (i64, PathBuf, u32);
+type Key = (PhotoId, PathBuf, u32);
 
 struct Job {
     ticket: u64,
@@ -34,6 +34,9 @@ struct Job {
     path: PathBuf,
     /// Longest side, in pixels, of the image wanted.
     edge: u32,
+    /// For an offline RAW: the identity of its stored Standard preview, read
+    /// from the preview cache instead of the file.
+    stored: Option<String>,
     cancel: Arc<AtomicBool>,
 }
 struct Done {
@@ -75,7 +78,7 @@ pub(super) struct Loupe {
     view: Vec2,
     /// The zoom before the last click toggled it, and when, for a
     /// double-click to undo.
-    before_click: Option<(bool, f64, Option<i64>)>,
+    before_click: Option<(bool, f64, Option<PhotoId>)>,
     pub state: State,
 }
 impl Loupe {
@@ -95,7 +98,11 @@ impl Loupe {
                     ctx.request_repaint();
                 };
                 let prepared = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    thumbnails::raster(&job.path).map(|image| Prepared {
+                    let image = match &job.stored {
+                        Some(identity) => stored(&job.path, identity),
+                        None => crate::raster::decode(&job.path),
+                    };
+                    image.map(|image| Prepared {
                         full: image.dimensions(),
                         image: thumbnails::downscale(&image, job.edge),
                     })
@@ -127,8 +134,9 @@ impl Loupe {
             state: State::Loading,
         }
     }
-    /// Asks for `photo` at `edge` pixels, unless that is already on its way.
-    fn request(&mut self, ctx: &egui::Context, photo: &Photo, edge: u32) {
+    /// Asks for `photo` at `edge` pixels, unless that is already on its way;
+    /// from its stored preview with that identity when `stored` says so.
+    fn request(&mut self, ctx: &egui::Context, photo: &Photo, edge: u32, stored: Option<String>) {
         let wanted = key(photo, edge);
         let asked = self.requested.as_ref() == Some(&wanted);
         if asked && self.state == State::Ready {
@@ -164,6 +172,7 @@ impl Loupe {
             ahead: None,
             path: photo.path.clone(),
             edge,
+            stored,
             cancel: self.cancel.clone(),
         });
     }
@@ -183,6 +192,7 @@ impl Loupe {
             ahead: Some(wanted.clone()),
             path: photo.path.clone(),
             edge: wanted.2,
+            stored: None,
             cancel: self.ahead_cancel.clone(),
         });
     }
@@ -261,6 +271,17 @@ impl Loupe {
     }
 }
 
+/// The stored Standard preview of an offline RAW, else its 1:1 preview.
+fn stored(path: &std::path::Path, identity: &str) -> anyhow::Result<image::RgbImage> {
+    use crate::catalog::preview_cache::{PreviewCache, PreviewKind};
+    let cache = PreviewCache::open(&PreviewCache::path())?;
+    match cache.load_sized(path, identity, PreviewKind::Standard)? {
+        Some(image) => Ok(image),
+        None => cache
+            .load_sized(path, identity, PreviewKind::OneToOne)?
+            .ok_or_else(|| anyhow::anyhow!("No stored preview")),
+    }
+}
 fn key(photo: &Photo, edge: u32) -> Key {
     (
         photo.id,
@@ -270,13 +291,13 @@ fn key(photo: &Photo, edge: u32) -> Key {
 }
 
 impl Library {
-    pub fn loupe_open(&self) -> bool {
+    pub(crate) fn loupe_open(&self) -> bool {
         self.loupe.open
     }
     /// E, Return or a double-click: the active photo, large.
-    pub fn open_loupe(&mut self) {
+    pub(crate) fn open_loupe(&mut self) {
         if self.selection.active.is_none() {
-            self.select(self.visible.first().map(|i| self.photos[*i].id));
+            self.select(self.visible.first().map(|i| self.session.photos[*i].id));
         }
         self.loupe.open = self.selection.active.is_some();
         if self.loupe.open {
@@ -286,13 +307,35 @@ impl Library {
         self.loupe.before_click = None;
         self.scroll_to_active = true;
     }
-    /// The RAW the Loupe shows through Develop's pipeline: the active photo,
-    /// when it is a RAW and online. JPEG, TIFF, PNG and offline photos are
-    /// shown by the Loupe's own preview instead.
-    pub fn loupe_develops(&self) -> Option<i64> {
+    /// The offline photo the Loupe shows that a stored preview can stand in for:
+    /// one it would develop (see [`Self::loupe_develops`]).
+    pub(in crate::app) fn loupe_offline_developed(&self) -> Option<PhotoId> {
         let photo = self.selection.active.and_then(|id| self.photo(id))?;
-        (self.loupe.open && crate::storage::is_raw(&photo.path) && self.is_available(&photo.path))
+        (self.loupe.open && !self.is_available(&photo.path) && self.develops(photo))
             .then_some(photo.id)
+    }
+    /// The identity of the stored preview the Loupe shows for an offline photo it
+    /// would develop.
+    pub(in crate::app) fn set_loupe_stored(&mut self, stored: Option<(PhotoId, String)>) {
+        self.loupe_stored = stored;
+    }
+    pub(in crate::app) fn loupe_stored(&self) -> Option<&(PhotoId, String)> {
+        self.loupe_stored.as_ref()
+    }
+    /// The photo the Loupe shows through Develop's pipeline: the active photo,
+    /// when it is online and a RAW or an edited JPEG, TIFF or PNG. An unedited
+    /// one, which its defaults reproduce, and offline photos are shown by the
+    /// Loupe's own, quicker preview instead.
+    pub(crate) fn loupe_develops(&self) -> Option<PhotoId> {
+        let photo = self.selection.active.and_then(|id| self.photo(id))?;
+        (self.loupe.open && self.is_available(&photo.path) && self.develops(photo))
+            .then_some(photo.id)
+    }
+    /// Whether `photo` is shown developed: a RAW always, a JPEG, TIFF or PNG once
+    /// it has an edit of its own.
+    pub(super) fn develops(&self, photo: &Photo) -> bool {
+        crate::storage::is_raw(&photo.path)
+            || self.session.catalog.has_edit(photo.id).unwrap_or(false)
     }
     /// The zoom level at which the photo in the Loupe's own view fits, for
     /// stepping through the levels from it.
@@ -350,7 +393,7 @@ impl Library {
         before
     }
     /// G or Esc: back to the grid, at the active photo.
-    pub fn close_loupe(&mut self) {
+    pub(crate) fn close_loupe(&mut self) {
         self.loupe.before_click = None;
         if self.loupe.open {
             self.loupe.open = false;
@@ -360,15 +403,17 @@ impl Library {
     }
     /// The Loupe in place of the grid, with its toolbar below.
     pub(super) fn loupe(&mut self, ui: &mut egui::Ui, zoom: &mut Zoom) -> Action {
+        let palette = theme::palette(ui.ctx());
         self.loupe.poll(ui.ctx());
         let Some(id) = self.selection.active else {
             self.close_loupe();
             return Action::None;
         };
+        // On the photo's backdrop, as the view above it.
         egui::Panel::bottom("library-loupe-toolbar")
             .frame(
                 egui::Frame::new()
-                    .fill(theme::gray(38))
+                    .fill(palette.photo_backdrop())
                     .inner_margin(egui::Margin::symmetric(10, 4)),
             )
             .show_separator_line(false)
@@ -376,21 +421,29 @@ impl Library {
         let Some(photo) = self.photo(id).cloned() else {
             return Action::None;
         };
-        // An online RAW is drawn by the editor, through Develop's viewport.
+        // A photo developed is drawn by the editor, through Develop's viewport.
         if self.loupe_develops().is_some() {
             self.loupe.idle();
             return Action::None;
         }
         let (rect, response) =
             ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
-        ui.painter().rect_filled(rect, 0., theme::gray(36));
+        ui.painter().rect_filled(rect, 0., palette.photo_backdrop());
         let ppp = ui.ctx().pixels_per_point();
         // The photo fits within the margin, as drawn below.
-        self.loupe.view = rect.shrink(16.).size() * ppp;
+        self.loupe.view = rect.shrink(crate::app::workspace::PHOTO_MARGIN).size() * ppp;
         let available = self.is_available(&photo.path);
         let edge = (rect.width().max(rect.height()) * ppp) as u32;
-        if available {
-            self.loupe.request(ui.ctx(), &photo, edge);
+        // An offline RAW with a stored Standard preview shows it.
+        let stored = self
+            .loupe_stored
+            .as_ref()
+            .filter(|(id, _)| !available && *id == photo.id)
+            .map(|(_, identity)| identity.clone());
+        if let Some(identity) = stored.clone() {
+            self.loupe.request(ui.ctx(), &photo, edge, Some(identity));
+        } else if available {
+            self.loupe.request(ui.ctx(), &photo, edge, None);
             // Once this photo is ready, the next one along is prepared.
             if self.loupe.state == State::Ready
                 && let Some(next) = self
@@ -398,8 +451,8 @@ impl Library {
                     .filter(|n| *n != photo.id)
                     .and_then(|n| self.photo(n).cloned())
                 && self.is_available(&next.path)
-                // A RAW opens through Develop's pipeline, which prefetches it.
-                && !crate::storage::is_raw(&next.path)
+                // A photo developed opens through Develop's pipeline instead.
+                && !self.develops(&next)
             {
                 self.loupe.prepare_ahead(&next, edge);
             }
@@ -407,13 +460,21 @@ impl Library {
             self.loupe.reset();
         }
         self.request_previews(&photo, ui.ctx());
-        let inset = rect.shrink(16.);
+        let inset = rect.shrink(crate::app::workspace::PHOTO_MARGIN);
         // Until its own preview is in, the grid's stands in, enlarged.
+        let own = available
+            || stored.is_some()
+                && self.loupe.state == State::Ready
+                && self
+                    .loupe
+                    .requested
+                    .as_ref()
+                    .is_some_and(|r| r.0 == photo.id);
         let texture = self
             .loupe
             .texture
             .clone()
-            .filter(|_| available)
+            .filter(|_| own)
             .or_else(|| self.texture(&photo).cloned());
         let fit = texture.as_ref().map(|t| {
             let size = t.size_vec2();
@@ -428,7 +489,9 @@ impl Library {
             .zip(fit)
             .is_some_and(|(pos, fit)| fit.contains(pos));
         let double = response.double_clicked() || response.triple_clicked();
-        if response.clicked() && !double && available && (zoom.on || on_photo) {
+        // An offline RAW zooms into its stored 1:1 preview.
+        let zoomable = available || stored.is_some();
+        if response.clicked() && !double && zoomable && (zoom.on || on_photo) {
             if let Some((pos, fit)) = response
                 .interact_pointer_pos()
                 .zip(fit)
@@ -456,7 +519,7 @@ impl Library {
         let regions = &mut self.loupe.regions;
         let full = regions
             .full
-            .filter(|_| zoom.on && available && regions.photo == Some(photo.id));
+            .filter(|_| zoom.on && zoomable && regions.photo == Some(photo.id));
         let shown = match full {
             Some(full) => {
                 // `level` screen pixels per image pixel.
@@ -483,11 +546,12 @@ impl Library {
             }
             None => fit,
         };
-        if zoom.on && available {
+        if zoom.on && zoomable {
             // The image pixels that fill the view at this level.
             let size =
                 [rect.width(), rect.height()].map(|side| (side * ppp / zoom.level).ceil() as u32);
-            regions.request(photo.id, &photo.path, zoom.pan, size, zoom.level);
+            let stored = stored.as_deref().filter(|_| !available);
+            regions.request(photo.id, &photo.path, stored, zoom.pan, size, zoom.level);
         }
         let painter = ui.painter().with_clip_rect(rect);
         let uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1., 1.));
@@ -504,7 +568,7 @@ impl Library {
             );
             painter.image(region.id(), place, uv, Color32::WHITE);
         }
-        if zoom.on && available {
+        if zoom.on && zoomable {
             ui.ctx().set_cursor_icon(if response.dragged() {
                 egui::CursorIcon::Grabbing
             } else {
@@ -512,6 +576,11 @@ impl Library {
             });
         }
         let note = match (&self.loupe.state, available, texture.is_some()) {
+            _ if zoom.on && stored.is_some() => match &self.loupe.regions.error {
+                Some(e) => format!("Zoom unavailable offline: {e}"),
+                None if self.loupe.regions.pending || full.is_none() => "Loading…".into(),
+                None => "Offline: showing the 1:1 preview".into(),
+            },
             (_, false, true) => {
                 "Offline: showing the cached preview. Full detail needs the original.".into()
             }
@@ -531,7 +600,7 @@ impl Library {
                 egui::Align2::LEFT_BOTTOM,
                 note,
                 egui::FontId::proportional(11.),
-                theme::gray(170),
+                palette.gray(170),
             );
         }
         self.loupe_overlay(ui.painter(), rect);

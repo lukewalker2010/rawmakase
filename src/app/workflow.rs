@@ -1,9 +1,23 @@
-use super::Editor;
-use super::state::Picture;
 use super::worker::{LoadJob, RenderJob};
-use crate::develop::{Geometry, Recipe};
+use super::{Editor, state::Picture};
+use crate::model::recipe::Recipe;
+use crate::{
+    app::Module,
+    catalog::{CatalogLocation, PhotoId},
+    develop::Geometry,
+};
 use eframe::egui::{self, Vec2};
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc, time::Instant};
+
+/// How saving the edit before closing ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Flushed {
+    Saved,
+    /// Not saved: the error is on the status line.
+    Failed,
+    /// Still being saved when time ran out.
+    Late,
+}
 
 impl Editor {
     pub(super) fn open(&mut self, path: PathBuf) {
@@ -24,34 +38,41 @@ impl Editor {
             self.status =
                 "Use Library → Import Lightroom catalog to select a new RAWmakase catalog destination"
                     .into();
-            self.library_mode = true;
+            self.module = Module::Library;
         }
     }
-    pub(super) fn open_raw(&mut self, path: PathBuf, photo: Option<i64>) {
+    pub(super) fn open_raw(&mut self, path: PathBuf, photo: Option<PhotoId>) {
         if self.load_raw(path, photo) {
-            self.library_mode = false;
+            self.module = Module::Develop;
         }
     }
     /// Starts loading a RAW as the document, staying in the module shown:
     /// the Library's Loupe shows it through the same pipeline as Develop.
     /// False when work in progress or an unsaved edit prevents it.
-    pub(super) fn load_raw(&mut self, path: PathBuf, photo: Option<i64>) -> bool {
+    pub(super) fn load_raw(&mut self, path: PathBuf, photo: Option<PhotoId>) -> bool {
         if self.activity.is_busy() {
             return false;
         }
         if !self.flush() {
             return false;
         }
+        // The photo left, saved with another edit: its built previews follow it.
+        if let Some(left) = self.document.catalog_photo
+            && self.left_edited(left)
+        {
+            self.refresh_previews(&[left]);
+        }
         // Moving on cancels the previous photo's prefetch.
         self.prefetch_cancel
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.prefetch_cancel = Default::default();
+        let neighbour = photo.and_then(|id| self.neighbour_of(id));
         let prefetch = photo
             .and_then(|id| self.prefetch_neighbour(id))
             .map(|path| super::worker::Prefetch {
                 path,
                 cancel: self.prefetch_cancel.clone(),
-                demosaic: crate::raw::demosaic(),
+                demosaic: self.demosaic,
             });
         // The photo being left is Paste from Previous's source; opening the same photo
         // again (as a new demosaic setting does) leaves Previous as it was.
@@ -72,14 +93,23 @@ impl Editor {
         }
         self.presets.clear_document();
         self.view.clear_document();
-        self.status = "Reading RAW…".into();
+        self.selection.clear_document();
+        if let Some(photo) = photo {
+            self.request_stand_ins(id, photo, neighbour);
+        }
+        self.status = if crate::storage::is_raw(&path) {
+            "Reading RAW…"
+        } else {
+            "Reading photo…"
+        }
+        .into();
         self.loader.submit(LoadJob {
             id,
             path,
             cancel,
             prefetch,
             defaults: self.raw_defaults.clone(),
-            demosaic: crate::raw::demosaic(),
+            demosaic: self.demosaic,
         });
         // The photo left may be the reference, or its edit may have changed.
         self.load_reference();
@@ -87,15 +117,18 @@ impl Editor {
     }
     /// The photo to decode ahead of time while `id` is shown: the next one in
     /// the filmstrip, or the previous one after stepping back.
-    pub(super) fn prefetch_neighbour(&self, id: i64) -> Option<PathBuf> {
+    pub(super) fn prefetch_neighbour(&self, id: PhotoId) -> Option<PathBuf> {
+        let photo = self.library.as_ref()?.photo(self.neighbour_of(id)?)?;
+        photo.path.is_file().then(|| photo.path.clone())
+    }
+    /// The photo next to `id` in the direction of travel.
+    fn neighbour_of(&self, id: PhotoId) -> Option<PhotoId> {
         let library = self.library.as_ref()?;
         let step = match self.document.catalog_photo {
             Some(previous) if previous != id && library.navigate(previous, -1) == Some(id) => -1,
             _ => 1,
         };
-        let neighbour = library.navigate(id, step).filter(|n| *n != id)?;
-        let photo = library.photo(neighbour)?;
-        (photo.path.is_file() && crate::storage::is_raw(&photo.path)).then(|| photo.path.clone())
+        library.navigate(id, step).filter(|n| *n != id)
     }
     /// Saves a Copy Name or metadata field still being typed in the Library;
     /// false, with the error on the status line, if it could not be saved.
@@ -111,6 +144,11 @@ impl Editor {
     /// Saves the edit now, after any background save in flight; false if
     /// it could not be saved.
     pub(super) fn flush(&mut self) -> bool {
+        // A Sync may be writing the open photo: nothing is saved over it until it is
+        // done (see `autosave`).
+        if self.activity.is_syncing() {
+            return false;
+        }
         if !self.commit_library_drafts() {
             return false;
         }
@@ -122,42 +160,48 @@ impl Editor {
         // A slider or histogram drag still held when the photo is left (Left or Right
         // with the button down) is saved as a step of its own; History records it
         // once the save succeeds.
-        if self.document.history.in_gesture() {
-            self.document.save.mark_changed();
+        if self.document.edit.history().in_gesture() {
+            self.document.edit.save_state_mut().mark_changed();
         }
-        if !self.document.save.needs_save() {
-            self.finish_gesture();
+        if !self.document.edit.save_state().needs_save() {
+            self.finish_saved_gesture();
             return true;
         }
         if let (Some(path), Some(l), Some(id)) = (
             &self.document.path,
-            &self.library,
+            &mut self.library,
             self.document.catalog_photo,
         ) {
-            let history = self.document.history.saved(&self.document.recipe);
+            let history = self
+                .document
+                .edit
+                .history()
+                .saved(self.document.edit.recipe());
             let saved = l
+                .session
                 .catalog
                 .save_edit(
                     id,
                     path,
-                    &self.document.recipe,
+                    self.document.edit.recipe(),
                     &self.document.export,
-                    history.update(),
+                    crate::catalog::HistoryUpdate::of(&history),
                 )
-                .map(|()| l.catalog.path.clone());
+                .map(|()| l.session.catalog.location().clone());
             match saved {
                 Ok(p) => {
                     self.saved_to(&p);
-                    self.document.save.saved();
+                    self.document.edit.save_state_mut().saved();
                 }
                 Err(e) => {
-                    self.document.save.failed(e.to_string());
+                    self.document.edit.save_state_mut().failed(e.to_string());
                     self.status = format!("Edits not saved: {e}");
                     return false;
                 }
             }
         }
-        self.finish_gesture();
+        // Its state was just saved with History: nothing new to save.
+        self.finish_saved_gesture();
         true
     }
     /// Autosave: collects a finished background save and, once the edit
@@ -166,36 +210,104 @@ impl Editor {
         if let Some(completion) = self.autosave.poll() {
             self.background_saved(completion);
         }
-        if !self.document.save.ready() || self.document.history.in_gesture() || self.autosave.busy()
+        // A Sync may be writing the open photo (a target, from the Library): what an
+        // analysis landing meanwhile changed is not saved over it. The photo opens
+        // again once the Sync is done, or saves then if it was not a target.
+        if !self.document.edit.save_state().ready()
+            || self.document.edit.history().in_gesture()
+            || self.autosave.busy()
+            || self.activity.is_syncing()
         {
             return;
         }
-        let Some(raw) = self.document.path.clone() else {
+        let Some(job) = self.save_job() else {
             return;
-        };
-        let (Some(l), Some(photo)) = (&self.library, self.document.catalog_photo) else {
-            return;
-        };
-        let job = super::autosave::Job {
-            catalog: l.catalog.path.clone(),
-            photo,
-            raw,
-            recipe: self.document.recipe.clone(),
-            export: self.document.export.clone(),
-            history: self.document.history.saved(&self.document.recipe),
         };
         match self.autosave.submit(job, ctx) {
-            Ok(()) => self.document.save.saving(),
+            Ok(()) => self.document.edit.save_state_mut().saving(),
             // No saver thread: save here, as before.
             Err(_) => {
                 self.flush();
             }
         }
     }
+    /// The edit as it stands, to save to the catalog photo it belongs to.
+    fn save_job(&self) -> Option<super::autosave::Job> {
+        let raw = self.document.path.clone()?;
+        let (Some(l), Some(photo)) = (&self.library, self.document.catalog_photo) else {
+            return None;
+        };
+        Some(super::autosave::Job {
+            catalog: l.session.catalog.location().clone(),
+            photo,
+            raw,
+            recipe: self.document.edit.recipe().clone(),
+            export: self.document.export.clone(),
+            history: self
+                .document
+                .edit
+                .history()
+                .saved(self.document.edit.recipe()),
+        })
+    }
+    /// Saves the edit as [`flush`](Self::flush) does, but on the autosave thread,
+    /// giving up at `until`: a catalog on a stalled network share must not hold up
+    /// closing. A save still running then goes on, and the edit stays unsaved.
+    pub(super) fn flush_by(&mut self, until: Instant) -> Flushed {
+        // Saved once a Sync, which may be writing the open photo, is done.
+        if self.activity.is_syncing() {
+            return Flushed::Late;
+        }
+        if !self.commit_library_drafts() {
+            return Flushed::Failed;
+        }
+        self.commit_snapshot_rename();
+        if self.document.edit.history().in_gesture() {
+            self.document.edit.save_state_mut().mark_changed();
+        }
+        // An edit closed without saving leaves the save in flight to finish alone.
+        if self.document.edit.save_state().needs_save() {
+            if let Some(completion) = self.autosave.wait_until(until) {
+                self.background_saved(completion);
+            }
+            if self.autosave.busy() {
+                return Flushed::Late;
+            }
+        }
+        if self.document.edit.save_state().needs_save()
+            && let Some(job) = self.save_job()
+        {
+            // A saver lost since the last save is started again by a second
+            // submit; saving here instead could stall as long as the catalog does.
+            let submitted = self
+                .autosave
+                .submit(job, &self.context)
+                .or_else(|job| self.autosave.submit(*job, &self.context));
+            if submitted.is_err() {
+                let error = "the autosave thread could not start".to_string();
+                self.document.edit.save_state_mut().failed(error.clone());
+                self.status = format!("Edits not saved: {error}");
+                return Flushed::Failed;
+            }
+            self.document.edit.save_state_mut().saving();
+            if let Some(completion) = self.autosave.wait_until(until) {
+                self.background_saved(completion);
+            }
+            if self.autosave.busy() {
+                return Flushed::Late;
+            }
+            if self.document.edit.save_state().needs_save() {
+                return Flushed::Failed;
+            }
+        }
+        // Its state was just saved with History: nothing new to save.
+        self.finish_saved_gesture();
+        Flushed::Saved
+    }
     fn background_saved(&mut self, completion: super::autosave::Completion) {
         let saved = completion.into_result();
         let result = saved.as_ref().map(|_| ()).map_err(Clone::clone);
-        if !self.document.save.finished(result) {
+        if !self.document.edit.save_state_mut().finished(result) {
             return;
         }
         match saved {
@@ -203,17 +315,12 @@ impl Editor {
             Err(e) => self.status = format!("Edits not saved: {e}"),
         }
     }
-    fn saved_to(&mut self, path: &std::path::Path) {
+    fn saved_to(&mut self, location: &CatalogLocation) {
+        let CatalogLocation::File(path) = location;
         self.status = format!(
             "Saved {}",
             path.file_name().unwrap_or_default().to_string_lossy()
         );
-    }
-    pub(super) fn history(&mut self, old: Recipe) {
-        if self.document.history.record(old, &self.document.recipe) {
-            self.sync_command_revision();
-            self.document.save.mark_changed();
-        }
     }
     pub(super) fn effective_recipe(&self) -> Recipe {
         let mut r = if self.view.compare.before_only() {
@@ -222,7 +329,7 @@ impl Editor {
             self.presets
                 .preview
                 .as_ref()
-                .unwrap_or(&self.document.recipe)
+                .unwrap_or(self.document.edit.recipe())
                 .clone()
         };
         if self.view.is(super::state::Tool::Crop) {
@@ -247,7 +354,7 @@ impl Editor {
             && !self.view.picks_color()
             && !self.view.compare.before_only();
         pc.selected
-            .filter(|i| shown && *i < self.document.recipe.point_colors.len())
+            .filter(|i| shown && *i < self.document.edit.recipe().point_colors.len())
     }
     /// What the active tool draws into the rendered preview.
     pub(super) fn overlay(&self) -> super::worker::Overlay {
@@ -257,7 +364,7 @@ impl Editor {
                 Overlay::Spots(self.view.retouch.threshold)
             }
             Tool::Mask if self.view.masking.overlay => match self.view.masking.selected {
-                Some(index) if index < self.document.recipe.masks.len() => Overlay::Mask {
+                Some(index) if index < self.document.edit.recipe().masks.len() => Overlay::Mask {
                     index,
                     color: [230, 40, 40],
                     opacity: 0.5,
@@ -278,34 +385,59 @@ impl Editor {
         self.view.zoom.region(self.view.viewport, g.width, g.height)
     }
     pub(super) fn schedule(&mut self) {
+        self.schedule_render(false);
+    }
+    /// Renders an edit. While a slider moves, each change starts a render; one of
+    /// the same view already running finishes and shows on the way instead of being
+    /// cancelled, or a GPU slower than the changes would show nothing until the
+    /// slider stops.
+    pub(super) fn schedule_edit(&mut self) {
+        self.schedule_render(true);
+    }
+    fn schedule_render(&mut self, edit: bool) {
         let image = self.document.full().cloned();
         if let Some(image) = image {
             self.yield_before();
-            let (id, cancel) = self.preview.task.start();
             let region = self.region();
             self.preview.last_region = region;
             let geometry = Geometry::new(&image, &self.effective_recipe(), 0);
             let RenderEdges { fit, max_edge } = self.render_edges(&geometry);
             self.preview.last_fit_edge = fit;
-            self.preview.pending_crop = geometry.crop();
-            self.preview.pending_mode = region.map_or(
-                super::state::TextureMode::Whole,
-                super::state::TextureMode::Region,
-            );
             // Visualize Range renders the selected swatch's selection instead of its
             // adjustment; never as the photo's thumbnail.
             let mut recipe = self.effective_recipe();
-            let visualize = self.visualized_swatch().and_then(|i| {
-                crate::develop::point_color::visualize_range(&recipe.point_colors, i)
-            });
+            let visualize = self
+                .visualized_swatch()
+                .and_then(|i| crate::model::point_color::visualize_range(&recipe.point_colors, i));
             let thumbnail = region.is_none() && self.shows_library_edit() && visualize.is_none();
             if let Some(list) = visualize {
                 recipe.point_colors = list;
             }
-            // What the shown pixels were rendered with, Visualize Range included, so
-            // a picker never takes a gray preview for the photo.
-            self.preview.pending_recipe = Some(recipe.clone());
-            self.renderer.submit(RenderJob {
+            let view = super::state::RenderView {
+                image: Arc::downgrade(&image),
+                path: self.document.path.clone(),
+                photo: self.document.catalog_photo,
+                region,
+                max_edge,
+            };
+            let same_view = self
+                .preview
+                .last_view
+                .as_ref()
+                .is_some_and(|v| v.same(&view));
+            self.preview.last_view = Some(view);
+            let (id, cancel) = self.preview.start(
+                edit && same_view,
+                super::state::Pending {
+                    recipe: Some(recipe.clone()),
+                    mode: region.map_or(
+                        super::state::TextureMode::Whole,
+                        super::state::TextureMode::Region,
+                    ),
+                    crop: geometry.crop(),
+                },
+            );
+            let replaced = self.renderer.submit(RenderJob {
                 pane: super::worker::Pane::After,
                 max_edge,
                 cancel,
@@ -321,6 +453,9 @@ impl Editor {
                 overlay: self.overlay(),
                 drawn: self.preview.presented(),
             });
+            if let Some(replaced) = replaced {
+                self.preview.replaced(replaced);
+            }
         }
         self.schedule_before();
     }
@@ -341,6 +476,8 @@ impl Editor {
         let image = egui::ColorImage::from_rgb([w as usize, h as usize], data);
         if region {
             Picture::upload(&mut self.preview.region, ctx, "photo region", image);
+            // Zoomed in before the photo was decoded: the region is the live render.
+            self.preview.stand_in = None;
             return;
         }
         // Zoomed in, a whole render still fills a Navigator that has none,
@@ -355,6 +492,10 @@ impl Editor {
             Picture::upload(&mut self.preview.navigator, ctx, "navigator", small);
         }
         Picture::upload(&mut self.preview.texture, ctx, "photo", image);
+        // A live render replaces the stored preview; the embedded JPEG sets this
+        // again once shown.
+        self.preview.embedded = false;
+        self.preview.stand_in = None;
     }
     /// A GPU render, presented into textures the renderer registered.
     pub(super) fn set_presented(
@@ -366,6 +507,7 @@ impl Editor {
         let picture = Some(Picture::presented(id, size));
         if region {
             self.preview.region = picture;
+            self.preview.stand_in = None;
             return;
         }
         if (!self.view.zoom.on || self.preview.navigator.is_none())
@@ -374,12 +516,36 @@ impl Editor {
             self.preview.navigator = Some(Picture::presented(id, size));
         }
         self.preview.texture = picture;
+        self.preview.embedded = false;
+        self.preview.stand_in = None;
     }
     pub(super) fn navigate(&mut self, delta: isize) {
-        if let (Some(l), Some(id)) = (&self.library, self.document.catalog_photo)
-            && let Some(next) = l.navigate(id, delta as i32)
+        if let Some(id) = self.document.catalog_photo
+            && let Some(next) = self.develop_step(id, delta as i32)
         {
             self.develop_catalog_photo(next);
+        }
+    }
+    /// The photo `step` photos from `id` in the filmstrip that Develop can
+    /// open, passing over the ones it can't (offline, HDR, animated, CMYK):
+    /// stopping on them would leave every photo beyond out of reach of the
+    /// arrow keys. With none in that direction, the first one, so opening it
+    /// says why it can't be.
+    pub(super) fn develop_step(&self, id: PhotoId, step: i32) -> Option<PhotoId> {
+        let library = self.library.as_ref()?;
+        let first = library.navigate(id, step)?;
+        let mut at = first;
+        loop {
+            let photo = library.photo(at)?;
+            if at == id
+                || crate::app::library::develop_refusal(photo, photo.path.is_file()).is_none()
+            {
+                return Some(at);
+            }
+            match library.navigate(at, step) {
+                Some(next) if next != at => at = next,
+                _ => return Some(first),
+            }
         }
     }
 }

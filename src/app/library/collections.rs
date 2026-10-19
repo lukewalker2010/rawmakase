@@ -3,12 +3,12 @@
 //! and Lightroom's own (the Quick Collection, unsaved creations) never show.
 use crate::app::icons::{self, Icon};
 use crate::app::theme;
-use crate::catalog::{Collection, CollectionKind};
+use crate::catalog::{Collection, CollectionId, CollectionKind, PhotoId};
 use eframe::egui::{self, Vec2};
 use std::collections::{HashMap, HashSet};
 
 pub(super) struct CollectionNode {
-    pub id: i64,
+    pub id: CollectionId,
     pub name: String,
     pub set: bool,
     pub count: usize,
@@ -20,10 +20,10 @@ pub(super) struct CollectionNode {
 /// hidden, such as Lightroom's default "Smart Collections" set.
 pub(super) fn tree(
     collections: &[Collection],
-    counts: &HashMap<i64, HashSet<i64>>,
+    counts: &HashMap<CollectionId, HashSet<PhotoId>>,
 ) -> Vec<CollectionNode> {
-    let mut children: HashMap<Option<i64>, Vec<&Collection>> = HashMap::new();
-    let ids: HashSet<i64> = collections.iter().map(|c| c.id).collect();
+    let mut children: HashMap<Option<CollectionId>, Vec<&Collection>> = HashMap::new();
+    let ids: HashSet<CollectionId> = collections.iter().map(|c| c.id).collect();
     for c in collections {
         // A parent that isn't in the catalog puts the collection at the top.
         let parent = c.parent.filter(|p| ids.contains(p) && *p != c.id);
@@ -34,10 +34,10 @@ pub(super) fn tree(
 }
 
 fn nodes(
-    parent: Option<i64>,
-    children: &HashMap<Option<i64>, Vec<&Collection>>,
-    counts: &HashMap<i64, HashSet<i64>>,
-    seen: &mut HashSet<i64>,
+    parent: Option<CollectionId>,
+    children: &HashMap<Option<CollectionId>, Vec<&Collection>>,
+    counts: &HashMap<CollectionId, HashSet<PhotoId>>,
+    seen: &mut HashSet<CollectionId>,
 ) -> Vec<CollectionNode> {
     let mut out = Vec::new();
     for c in children.get(&parent).into_iter().flatten() {
@@ -75,7 +75,7 @@ fn nodes(
 }
 
 /// The key that marks a set as collapsed in the Library's expanded set.
-fn collapsed_key(id: i64) -> String {
+fn collapsed_key(id: CollectionId) -> String {
     format!("collection-set-collapsed:{id}")
 }
 
@@ -86,8 +86,9 @@ pub(super) fn collection_row(
     node: &CollectionNode,
     depth: usize,
     expanded: &mut HashSet<String>,
-    selected: Option<i64>,
-) -> Option<i64> {
+    selected: Option<CollectionId>,
+) -> Option<CollectionId> {
+    let palette = theme::palette(ui.ctx());
     use egui::{Align2, FontId, Pos2, Rect, Sense};
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.), Sense::click());
@@ -99,9 +100,9 @@ pub(super) fn collection_row(
             rect,
             3.,
             if active {
-                theme::selected_row()
+                palette.selected_row()
             } else {
-                theme::gray(43)
+                palette.gray(43)
             },
         );
     }
@@ -109,12 +110,12 @@ pub(super) fn collection_row(
         painter.rect_filled(
             Rect::from_min_size(rect.min, Vec2::new(2., rect.height())),
             0.,
-            theme::selected_marker(),
+            palette.selected_marker(),
         );
     }
     // The same columns as the folder tree.
     let indent = depth.min(12) as f32 * 14.;
-    let x = rect.left() + indent + 3.;
+    let x = rect.left() + indent + 12.;
     let y = rect.center().y;
     if node.set && !node.children.is_empty() {
         let chevron = if collapsed {
@@ -122,7 +123,7 @@ pub(super) fn collection_row(
         } else {
             Icon::ChevronDown
         };
-        icons::paint_at(painter, chevron, Pos2::new(x, y), 11., theme::gray(150));
+        icons::paint_at(painter, chevron, Pos2::new(x, y), 11., palette.gray(150));
     }
     icons::paint_at(
         painter,
@@ -133,7 +134,7 @@ pub(super) fn collection_row(
         },
         Pos2::new(x + 13., y),
         13.,
-        theme::gray(145),
+        palette.gray(145),
     );
     let label_rect = Rect::from_min_max(
         Pos2::new(x + 26., rect.top()),
@@ -148,7 +149,7 @@ pub(super) fn collection_row(
     painter.galley(
         Pos2::new(label_rect.left(), y - text.size().y / 2.),
         text,
-        theme::gray(if active { 235 } else { 190 }),
+        palette.gray(if active { 235 } else { 190 }),
     );
     // Lightroom counts collections, not sets.
     if !node.set {
@@ -157,7 +158,7 @@ pub(super) fn collection_row(
             Align2::RIGHT_CENTER,
             node.count.to_string(),
             FontId::proportional(10.),
-            theme::gray(125),
+            palette.gray(125),
         );
     }
     let mut clicked = None;

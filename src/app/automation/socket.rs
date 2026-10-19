@@ -2,9 +2,11 @@
 //! reply channel; a timed-out request still in the queue is cancelled atomically.
 use super::{Action, Msg, Sender, parse_action, shortcut_action};
 use crate::app::commands::{
-    self, Command, Error, Operation, Param, PhotoTarget, PresetTarget, Target,
+    self, Command, Error, Operation, Param, PhotoTarget, PresetTarget, Target, Until,
 };
+use crate::catalog::PhotoId;
 use eframe::egui;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -29,7 +31,7 @@ pub(super) struct Request {
     stop: Arc<AtomicBool>,
 }
 impl Request {
-    pub fn begin(&self) -> bool {
+    pub(crate) fn begin(&self) -> bool {
         if self.stop.load(Ordering::SeqCst) || Instant::now() >= self.deadline {
             let _ = self
                 .phase
@@ -46,6 +48,7 @@ fn invalid(message: impl Into<String>) -> Error {
 }
 
 fn command(request: &Value) -> commands::Result<Vec<Msg>> {
+    use rawmakase_protocol::request::{self as wire, Press, Request, Until as WireUntil};
     if request
         .get("protocol")
         .is_some_and(|v| v.as_u64() != Some(u64::from(commands::PROTOCOL)))
@@ -55,73 +58,46 @@ fn command(request: &Value) -> commands::Result<Vec<Msg>> {
             "Supported protocol version is 1",
         ));
     }
-    let text = |key: &str| {
-        request[key]
-            .as_str()
-            .ok_or_else(|| invalid(format!("{key} must be a string")))
-    };
-    let integer = |key: &str, min: i64, max: i64| {
-        request[key]
-            .as_i64()
-            .filter(|n| (min..=max).contains(n))
-            .ok_or_else(|| invalid(format!("{key} must be an integer from {min} to {max}")))
-    };
-    let param = || Param::parse(text("param")?).ok_or_else(|| invalid("Unknown parameter"));
     let target: Target = match request.get("target") {
-        Some(v) => serde_json::from_value(v.clone()).map_err(|e| invalid(e.to_string()))?,
+        Some(v) => serde_json::from_value::<rawmakase_protocol::Target>(v.clone())
+            .map_err(|e| invalid(e.to_string()))?
+            .into(),
         None => Target::default(),
     };
-    let operation = match text("cmd")? {
-        "state" => Operation::State,
-        "capabilities" => Operation::Capabilities,
-        "photos" => Operation::Photos {
-            query: request["query"].as_str().unwrap_or("").into(),
-            offset: request["offset"]
-                .as_u64()
-                .unwrap_or(0)
-                .min(usize::MAX as u64) as usize,
-            limit: request["limit"].as_u64().unwrap_or(100).clamp(1, 500) as usize,
+    // The envelope's fields sit beside the command's, which ignores them.
+    let parsed = Request::deserialize(request).map_err(|e| invalid(e.to_string()))?;
+    // A parameter for set or turn: one value, never a whole band.
+    let param = |name: &str| match Param::parse(name) {
+        None => Err(invalid("Unknown parameter")),
+        Some(Param::Band(_)) => Err(invalid("Use an explicit band channel, such as band3.sat")),
+        Some(p) => Ok(p),
+    };
+    let operation = match parsed {
+        Request::State => Operation::State,
+        Request::Capabilities => Operation::Capabilities,
+        Request::Photos {
+            query,
+            offset,
+            limit,
+        } => Operation::Photos {
+            query: query.unwrap_or_default(),
+            offset: offset.unwrap_or(0).min(usize::MAX as u64) as usize,
+            limit: limit
+                .unwrap_or(wire::DEFAULT_PHOTOS)
+                .clamp(1, wire::MAX_PHOTOS) as usize,
         },
-        "presets" => Operation::Presets {
-            group: request["group"].as_str().map(Into::into),
-        },
-        "preset" => Operation::Preset(match (request["id"].as_str(), request["name"].as_str()) {
-            (Some(id), _) => PresetTarget::Id(id.into()),
-            (None, Some(name)) => PresetTarget::Name {
-                name: name.into(),
-                group: request["group"].as_str().map(Into::into),
-            },
+        Request::Presets { group } => Operation::Presets { group },
+        Request::Preset { id, name, group } => Operation::Preset(match (id, name) {
+            (Some(id), _) => PresetTarget::Id(id),
+            (None, Some(name)) => PresetTarget::Name { name, group },
             _ => return Err(invalid("preset requires id or name")),
         }),
-        "curve" => {
-            let channel = serde_json::from_value(request["channel"].clone())
-                .map_err(|_| invalid("channel must be rgb, red, green or blue"))?;
-            let points = serde_json::from_value(request["points"].clone())
-                .map_err(|_| invalid("points must be an array of [input, output] pairs"))?;
-            Operation::Curve(channel, points)
-        }
-        "set" => {
-            let value = request["value"]
-                .as_f64()
-                .filter(|n| n.is_finite() && (*n as f32).is_finite())
-                .ok_or_else(|| invalid("value must be a finite float"))?;
-            let p = param()?;
-            if matches!(p, Param::Band(_)) {
-                return Err(invalid("Use an explicit band channel, such as band3.sat"));
-            }
-            Operation::Set(p, value as f32)
-        }
-        "turn" => {
-            let p = param()?;
-            if matches!(p, Param::Band(_)) {
-                return Err(invalid("Use an explicit band channel, such as band3.sat"));
-            }
-            Operation::Adjust(p, integer("ticks", -1000, 1000)? as i32)
-        }
-        "action" => {
-            let name = text("action")?;
-            let action = commands::Action::parse(name)
-                .or_else(|| match parse_action(name)? {
+        Request::Curve { channel, points } => Operation::Curve(channel, points),
+        Request::Set { param: name, value } => Operation::Set(param(&name)?, value as f32),
+        Request::Turn { param: name, ticks } => Operation::Adjust(param(&name)?, ticks),
+        Request::Action { action: name } => {
+            let action = commands::Action::parse(&name)
+                .or_else(|| match parse_action(&name)? {
                     Action::Key(k, m) => shortcut_action(k, m),
                     Action::Mixer(c) => Some(commands::Action::Mixer(c)),
                     Action::ToggleMono => Some(commands::Action::ToggleMono),
@@ -133,64 +109,50 @@ fn command(request: &Value) -> commands::Result<Vec<Msg>> {
                 })?;
             Operation::Action(action)
         }
-        "open" => Operation::Open(match (request["id"].as_i64(), request["name"].as_str()) {
-            (Some(id), _) => PhotoTarget::Id(id),
-            (None, Some(name)) => PhotoTarget::Name(name.into()),
+        Request::Open { id, name } => Operation::Open(match (id, name) {
+            (Some(id), _) => PhotoTarget::Id(PhotoId(id)),
+            (None, Some(name)) => PhotoTarget::Name(name),
             _ => return Err(invalid("open requires id or name")),
         }),
-        "search" => Operation::Search(text("text")?.into()),
-        "module" => Operation::Module(match text("module")? {
-            "develop" => true,
-            "library" => false,
-            _ => return Err(invalid("module must be develop or library")),
+        Request::Search { text } => Operation::Search(text),
+        Request::Module { module } => Operation::Module(module == wire::Module::Develop),
+        Request::Photo { step } => Operation::Navigate(step),
+        Request::Save => Operation::Save,
+        Request::Export { path, max_edge } => Operation::Output {
+            path,
+            max_edge: max_edge.unwrap_or(0),
+        },
+        Request::Preview { path, max_edge } => Operation::Output {
+            path,
+            max_edge: max_edge.unwrap_or(wire::DEFAULT_PREVIEW_EDGE),
+        },
+        Request::BuildPreviews { kind } => Operation::BuildPreviews(match kind {
+            wire::PreviewKind::Standard => crate::catalog::preview_cache::PreviewKind::Standard,
+            wire::PreviewKind::OneToOne => crate::catalog::preview_cache::PreviewKind::OneToOne,
         }),
-        "photo" => {
-            let step = integer("step", -1, 1)?;
-            if step == 0 {
-                return Err(invalid("step must be -1 or 1"));
-            }
-            Operation::Navigate(step as i32)
-        }
-        "save" => Operation::Save,
-        "export" | "preview" => {
-            let preview = text("cmd")? == "preview";
-            let max_edge = match request.get("max_edge") {
-                Some(_) => integer("max_edge", 1, 16384)? as u32,
-                None => {
-                    if preview {
-                        1600
-                    } else {
-                        0
-                    }
-                }
-            };
-            Operation::Output {
-                path: text("path")?.into(),
-                max_edge,
-            }
-        }
-        "job" => Operation::Job(integer("job_id", 1, i64::MAX)? as u64),
+        Request::Job { job_id } => Operation::Job(job_id),
+        // Answered once the photo is loaded or the job finished, or after
+        // timeout_ms, within clients' read timeout.
+        Request::Wait { until, timeout_ms } => Operation::Wait(
+            match until {
+                WireUntil::Loaded { photo_id } => Until::Loaded(PhotoId(photo_id)),
+                WireUntil::Job { job_id } => Until::Job(job_id),
+            },
+            Duration::from_millis(timeout_ms.unwrap_or(wire::DEFAULT_WAIT_MS)),
+        ),
         // Legacy device-level commands remain an adapter. Explicit targets
         // belong to semantic commands, never to mutable device mappings.
-        "cc" | "note" if request.get("target").is_some() => {
+        Request::Cc { .. } | Request::Note { .. } if request.get("target").is_some() => {
             return Err(invalid("Use set/turn/action for explicit targets"));
         }
-        "cc" => {
-            return Ok(vec![Msg::Cc(
-                integer("cc", 0, 127)? as u8,
-                integer("value", 0, 127)? as u8,
-            )]);
-        }
-        "note" => {
-            let note = integer("note", 0, 127)? as u8;
-            return Ok(match request["press"].as_str().unwrap_or("click") {
-                "click" => vec![Msg::Note(note, true), Msg::Note(note, false)],
-                "down" => vec![Msg::Note(note, true)],
-                "up" => vec![Msg::Note(note, false)],
-                _ => return Err(invalid("press must be click, down or up")),
+        Request::Cc { cc, value } => return Ok(vec![Msg::Cc(cc, value)]),
+        Request::Note { note, press } => {
+            return Ok(match press {
+                Press::Click => vec![Msg::Note(note, true), Msg::Note(note, false)],
+                Press::Down => vec![Msg::Note(note, true)],
+                Press::Up => vec![Msg::Note(note, false)],
             });
         }
-        _ => return Err(invalid("Unknown command")),
     };
     Ok(vec![Msg::Command(Command { operation, target })])
 }
@@ -211,6 +173,16 @@ fn handle(
         return Err(Error::new("disabled", "External control is disabled"));
     }
     let messages = command(&request)?;
+    // A wait is answered by its own time, not the usual answer's.
+    let timeout = match messages[..] {
+        [
+            Msg::Command(Command {
+                operation: Operation::Wait(_, wait),
+                ..
+            }),
+        ] => timeout + wait,
+        _ => timeout,
+    };
     let (reply, rx) = mpsc::sync_channel(1);
     let phase = Arc::new(AtomicU8::new(0));
     let queued = Request {
@@ -289,15 +261,17 @@ fn spawn(
     tx: Sender<Msg>,
     ctx: egui::Context,
     stop: Arc<AtomicBool>,
-) -> std::io::Result<()> {
+) -> std::io::Result<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("control-socket".into())
         .spawn(move || {
             let clients = Arc::new(AtomicUsize::new(0));
+            let mut connections = Vec::new();
             for stream in listener.incoming().flatten() {
                 if stop.load(Ordering::SeqCst) {
                     break;
                 }
+                connections.retain(|c: &std::thread::JoinHandle<()>| !c.is_finished());
                 if clients.fetch_add(1, Ordering::SeqCst) >= MAX_CLIENTS {
                     clients.fetch_sub(1, Ordering::SeqCst);
                     continue;
@@ -316,12 +290,19 @@ fn spawn(
                         serve(stream, &token, &tx, &ctx, &stop);
                         clients.fetch_sub(1, Ordering::SeqCst);
                     });
-                if spawned.is_err() {
-                    count.fetch_sub(1, Ordering::SeqCst);
+                match spawned {
+                    Ok(connection) => connections.push(connection),
+                    Err(_) => {
+                        count.fetch_sub(1, Ordering::SeqCst);
+                    }
                 }
             }
+            // Bounded once stopped: each connection's reply comes at once from the
+            // closed request queue, and its reads and writes time out.
+            for connection in connections {
+                let _ = connection.join();
+            }
         })
-        .map(drop)
 }
 fn new_token() -> std::io::Result<String> {
     let mut bytes = [0u8; 32];
@@ -355,14 +336,29 @@ pub(super) struct Handle {
     port: u16,
     token: String,
     path: std::path::PathBuf,
+    /// The listener, which ends after the connections it accepted.
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl Handle {
+    /// Stops accepting connections, to wait for at exit. The listener sees the stop
+    /// on the wake-up connection made here; should that fail, it is never woken,
+    /// and is left to end with the process.
+    pub(in crate::app) fn stop(&mut self) -> crate::app::task::Stopping {
+        self.signal_stop();
+        crate::app::task::Stopping::new(self.thread.take())
+    }
+    fn signal_stop(&self) {
+        if !self.stop.swap(true, Ordering::SeqCst) {
+            let _ = TcpStream::connect_timeout(
+                &(Ipv4Addr::LOCALHOST, self.port).into(),
+                Duration::from_millis(100),
+            );
+        }
+    }
 }
 impl Drop for Handle {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect_timeout(
-            &(Ipv4Addr::LOCALHOST, self.port).into(),
-            Duration::from_millis(100),
-        );
+        self.signal_stop();
         let ours = std::fs::read_to_string(&self.path)
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -391,13 +387,15 @@ fn start_at(
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
     let port = listener.local_addr()?.port();
     write_connection(&path, port, &token)?;
-    let handle = Handle {
+    // Made first, so that a listener that cannot start removes the connection file.
+    let mut handle = Handle {
         stop: stop.clone(),
         port,
         token: token.clone(),
         path,
+        thread: None,
     };
-    spawn(listener, token, tx, ctx, stop)?;
+    handle.thread = Some(spawn(listener, token, tx, ctx, stop)?);
     Ok(handle)
 }
 
@@ -432,6 +430,46 @@ mod tests {
             json!({"cmd":"state","target":{"typo":1}}),
         ] {
             assert!(command(&value).is_err(), "{value}");
+        }
+    }
+    #[test]
+    fn typed_requests_keep_their_defaults_and_codes() {
+        let operation = |value: Value| match command(&value).unwrap().remove(0) {
+            Msg::Command(Command { operation, .. }) => operation,
+            _ => panic!("{value}"),
+        };
+        assert!(matches!(
+            operation(json!({"token":"t","cmd":"wait","until":"job","job_id":2})),
+            Operation::Wait(Until::Job(2), wait) if wait == Duration::from_millis(1000)
+        ));
+        assert!(matches!(
+            operation(json!({"cmd":"photos","limit":9000})),
+            Operation::Photos {
+                offset: 0,
+                limit: 500,
+                ..
+            }
+        ));
+        assert!(matches!(
+            operation(json!({"cmd":"preview","path":"/tmp/p.jpg"})),
+            Operation::Output { max_edge: 1600, .. }
+        ));
+        assert!(matches!(
+            operation(json!({"cmd":"export","path":"/tmp/p.jpg"})),
+            Operation::Output { max_edge: 0, .. }
+        ));
+        for value in [
+            json!({"cmd":"rename"}),
+            json!({"cmd":"cc","cc":1,"value":1,"target":{}}),
+            json!({"cmd":"turn","param":"band2","ticks":1}),
+            json!({"cmd":"turn","param":"nonsense","ticks":1}),
+            json!({"cmd":"open"}),
+        ] {
+            assert_eq!(
+                command(&value).err().map(|e| e.code),
+                Some("invalid_request"),
+                "{value}"
+            );
         }
     }
     #[test]
@@ -486,7 +524,7 @@ mod tests {
             let mut editor = super::super::Editor::with_context(
                 &ctx,
                 None,
-                crate::storage::Session::default(),
+                crate::app::session::Session::default(),
                 None,
             );
             request
@@ -512,8 +550,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (tx, rx) = mpsc::sync_channel(8);
         let ctx = egui::Context::default();
-        let mut editor =
-            crate::app::Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+        let mut editor = crate::app::Editor::with_context(
+            &ctx,
+            None,
+            crate::app::session::Session::default(),
+            None,
+        );
         editor.controls = super::super::Hub::new(super::super::Settings::default(), rx);
         let handle = start_at(tx, ctx.clone(), dir.path().join("control.json")).unwrap();
         let port = handle.port;
@@ -596,5 +638,36 @@ mod tests {
         drop(handle);
         assert!(!path.exists());
         assert!(stop.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_stopped_listener_ends_after_the_connection_it_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::sync_channel(2);
+        let mut handle = start_at(
+            tx,
+            egui::Context::default(),
+            dir.path().join("control.json"),
+        )
+        .unwrap();
+        // A client whose request waits in the queue for the interface's reply.
+        let port = handle.port;
+        let token = handle.token.clone();
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+            writeln!(stream, r#"{{"token":"{token}","cmd":"state"}}"#).unwrap();
+            let mut reply = String::new();
+            let _ = BufReader::new(stream).read_line(&mut reply);
+            reply
+        });
+        let queued = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let stopping = handle.stop();
+        // Closing the queue answers the request at once.
+        drop(queued);
+        drop(rx);
+        let waited = crate::app::task::wait_for(vec![stopping], Duration::from_secs(10));
+        assert_eq!(waited.detached, 0);
+        let reply: Value = serde_json::from_str(&client.join().unwrap()).unwrap();
+        assert_eq!(reply["ok"], false);
     }
 }

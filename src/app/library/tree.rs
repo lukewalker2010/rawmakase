@@ -1,6 +1,7 @@
+use super::folder_selection::{Click, FolderSelection};
 use crate::app::icons::{self, Icon};
 use crate::app::theme;
-use crate::catalog::Folder;
+use crate::catalog::{Folder, FolderId, RootId};
 use eframe::egui::{self, Vec2};
 use std::{collections::HashSet, path::PathBuf};
 #[derive(Default)]
@@ -8,15 +9,15 @@ pub(super) struct FolderNode {
     pub(super) key: String,
     pub(super) name: String,
     pub(super) path: PathBuf,
-    pub(super) root: Option<i64>,
-    pub(super) folder: Option<i64>,
+    pub(super) root: Option<RootId>,
+    pub(super) folder: Option<FolderId>,
     pub(super) own_count: usize,
     pub(super) count: usize,
-    pub(super) ids: HashSet<i64>,
+    pub(super) ids: HashSet<FolderId>,
     pub(super) children: std::collections::BTreeMap<String, FolderNode>,
 }
 impl FolderNode {
-    pub(super) fn root(id: i64, name: String, path: PathBuf) -> Self {
+    pub(super) fn root(id: RootId, name: String, path: PathBuf) -> Self {
         Self {
             key: format!("root:{id}"),
             name,
@@ -55,32 +56,50 @@ impl FolderNode {
             self.ids.extend(&child.ids);
         }
     }
+    /// The keys of this row and the rows unfolded below it, in the order
+    /// they are drawn.
+    pub(super) fn shown_rows<'a>(&'a self, expanded: &HashSet<String>, rows: &mut Vec<&'a str>) {
+        rows.push(&self.key);
+        if expanded.contains(&self.key) {
+            for child in self.children.values() {
+                child.shown_rows(expanded, rows);
+            }
+        }
+    }
 }
 pub(super) enum TreeAction {
-    Select(String, HashSet<i64>),
-    Relink(bool, i64),
+    /// The folder's key, and how it was clicked.
+    Select(String, Click),
+    RelinkRoot(RootId),
+    RelinkFolder(FolderId),
+    /// Remove from Catalog: the folder's name, it and its subfolders, and
+    /// their photos' count.
+    Remove(String, HashSet<FolderId>, usize),
+    /// Synchronize Folder: what to synchronize, and its name.
+    Synchronize(crate::catalog::folder_sync::SyncScope, String),
 }
 pub(super) fn folder_tree_row(
     ui: &mut egui::Ui,
     node: &FolderNode,
     depth: usize,
     expanded: &mut HashSet<String>,
-    selected: &str,
+    selected: &FolderSelection,
 ) -> Option<TreeAction> {
+    let palette = theme::palette(ui.ctx());
     use egui::{Align2, FontId, Pos2, Rect, Sense};
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.), Sense::click());
     let painter = ui.painter();
-    let active = selected == node.key;
+    let active = selected.contains(&node.key);
     let open = expanded.contains(&node.key);
     if active || response.hovered() {
         painter.rect_filled(
             rect,
             3.,
             if active {
-                theme::selected_row()
+                palette.selected_row()
             } else {
-                theme::gray(43)
+                palette.gray(43)
             },
         );
     }
@@ -88,13 +107,13 @@ pub(super) fn folder_tree_row(
         painter.rect_filled(
             Rect::from_min_size(rect.min, Vec2::new(2., rect.height())),
             0.,
-            theme::selected_marker(),
+            palette.selected_marker(),
         );
     }
     let indent = depth.min(12) as f32 * 14.;
-    // Triangle in the gutter, folder icon at the same 10 px inset as the
-    // Catalog rows' text.
-    let x = rect.left() + indent + 3.;
+    // The chevron in the gutter, starting at the Catalog rows' 10 px inset
+    // under a drive's dot; the folder icon under the drive's name.
+    let x = rect.left() + indent + 12.;
     let y = rect.center().y;
     if !node.children.is_empty() {
         let chevron = if open {
@@ -102,19 +121,19 @@ pub(super) fn folder_tree_row(
         } else {
             Icon::ChevronRight
         };
-        icons::paint_at(painter, chevron, Pos2::new(x, y), 11., theme::gray(150));
+        icons::paint_at(painter, chevron, Pos2::new(x, y), 11., palette.gray(150));
     }
     icons::paint_at(
         painter,
         Icon::Folder,
         Pos2::new(x + 13., y),
         13.,
-        theme::gray(145),
+        palette.gray(145),
     );
     let can_relink = node.root.is_some() || node.folder.is_some();
     let label_rect = Rect::from_min_max(
         Pos2::new(x + 26., rect.top()),
-        Pos2::new(rect.right() - 62., rect.bottom()),
+        Pos2::new(rect.right() - 44., rect.bottom()),
     );
     let text = egui::WidgetText::from(node.name.clone()).into_galley(
         ui,
@@ -125,38 +144,32 @@ pub(super) fn folder_tree_row(
     painter.galley(
         Pos2::new(label_rect.left(), y - text.size().y / 2.),
         text,
-        theme::gray(if active { 235 } else { 190 }),
+        palette.gray(if active { 235 } else { 190 }),
     );
     painter.text(
-        Pos2::new(rect.right() - 27., y),
+        Pos2::new(rect.right() - 10., y),
         Align2::RIGHT_CENTER,
         node.count.to_string(),
         FontId::proportional(10.),
-        theme::gray(125),
+        palette.gray(125),
     );
-    if can_relink && (response.hovered() || node.root.is_some()) {
-        for dx in [-3., 0., 3.] {
-            painter.circle_filled(Pos2::new(rect.right() - 12. + dx, y), 1., theme::gray(160));
-        }
-    }
     let relink = || {
         node.root
-            .map(|id| TreeAction::Relink(true, id))
-            .or_else(|| node.folder.map(|id| TreeAction::Relink(false, id)))
+            .map(TreeAction::RelinkRoot)
+            .or_else(|| node.folder.map(TreeAction::RelinkFolder))
     };
     let mut action = None;
     if response.clicked() && !crate::app::widgets::context_clicked(&response) {
         let pointer = response.interact_pointer_pos().unwrap_or(rect.center());
-        if can_relink && pointer.x > rect.right() - 24. {
-            action = relink()
-        } else if !node.children.is_empty() && pointer.x < x + 6. {
+        if !node.children.is_empty() && pointer.x < x + 6. {
             if open {
                 expanded.remove(&node.key);
             } else {
                 expanded.insert(node.key.clone());
             }
         } else {
-            action = Some(TreeAction::Select(node.key.clone(), node.ids.clone()));
+            let click = Click::of(ui.input(|i| i.modifiers));
+            action = Some(TreeAction::Select(node.key.clone(), click));
         }
     }
     response.clone().on_hover_text(format!(
@@ -164,7 +177,7 @@ pub(super) fn folder_tree_row(
         node.path.display(),
         node.count,
         if can_relink {
-            " including subfolders\nClick … or right-click to locate"
+            " including subfolders\nRight-click to locate, synchronize or remove"
         } else {
             ""
         }
@@ -180,6 +193,25 @@ pub(super) fn folder_tree_row(
                 .clicked()
         {
             action = relink();
+            ui.close();
+        }
+        let scope = match (node.root, node.folder) {
+            (Some(root), _) => Some(crate::catalog::folder_sync::SyncScope::Root(root)),
+            (None, Some(folder)) => Some(crate::catalog::folder_sync::SyncScope::Folder(folder)),
+            _ => None,
+        };
+        if let Some(scope) = scope
+            && ui.button("Synchronize Folder…").clicked()
+        {
+            action = Some(TreeAction::Synchronize(scope, node.name.clone()));
+            ui.close();
+        }
+        if !node.ids.is_empty() && ui.button("Remove from Catalog…").clicked() {
+            action = Some(TreeAction::Remove(
+                node.name.clone(),
+                node.ids.clone(),
+                node.count,
+            ));
             ui.close();
         }
     });

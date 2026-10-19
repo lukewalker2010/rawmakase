@@ -10,20 +10,18 @@ pub(super) struct Device {
     last_photo: Option<Instant>,
     pub midi_epoch: u64,
     pub status: Arc<Mutex<Status>>,
-    stop: Arc<AtomicBool>,
-}
-impl Drop for Device {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-    }
+    /// The listener's stop: dropping it (with the device, or by starting again)
+    /// ends the listener at once.
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    listener: Option<std::thread::JoinHandle<()>>,
 }
 impl Device {
-    pub fn new(binding: DeviceConfig) -> Self {
+    pub(crate) fn new(binding: DeviceConfig) -> Self {
         #[cfg(any(test, target_os = "macos", target_os = "windows"))]
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             #[cfg(any(test, target_os = "macos", target_os = "windows"))]
-            identity: NEXT.fetch_add(1, Ordering::Relaxed),
+            identity: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             binding,
             held: Modifiers::NONE,
             photo_ticks: 0,
@@ -31,27 +29,35 @@ impl Device {
             last_photo: None,
             midi_epoch: 0,
             status: Arc::default(),
-            stop: Arc::default(),
+            stop: None,
+            listener: None,
         }
     }
-    pub fn start(
+    pub(crate) fn start(
         &mut self,
         tx: Sender<Msg>,
         ctx: egui::Context,
         claims: Arc<Mutex<std::collections::HashSet<String>>>,
     ) {
         if self.binding.enabled {
-            midi::listen(
+            let (stop, stopped) = std::sync::mpsc::channel();
+            self.stop = Some(stop);
+            self.listener = midi::listen(
                 self.binding.clone(),
                 claims,
                 tx,
                 ctx,
                 self.status.clone(),
-                self.stop.clone(),
+                stopped,
             );
         }
     }
-    pub fn sync_midi_epoch(&mut self) {
+    /// Ends the listener at once, to wait for at exit.
+    pub(in crate::app) fn stop(&mut self) -> crate::app::task::Stopping {
+        self.stop = None;
+        crate::app::task::Stopping::new(self.listener.take())
+    }
+    pub(crate) fn sync_midi_epoch(&mut self) {
         let epoch = locked(&self.status).epoch;
         if epoch != self.midi_epoch {
             self.midi_epoch = epoch;
@@ -77,7 +83,7 @@ impl Device {
         self.photo_ticks %= self.binding.mapping.photo_detent;
         step.signum()
     }
-    pub fn translate(&mut self, msg: Msg) -> commands::Result<Option<Command>> {
+    pub(crate) fn translate(&mut self, msg: Msg) -> commands::Result<Option<Command>> {
         use commands::{Action as A, Error, Operation as O};
         match &msg {
             Msg::Cc(cc, value) => {

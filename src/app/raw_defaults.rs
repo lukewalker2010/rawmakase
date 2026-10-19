@@ -1,11 +1,11 @@
-//! Preferences > Raw Defaults (see `develop::defaults`): choosing them, and keeping
+//! Preferences > Raw Defaults (see `crate::raw_defaults`): choosing them, and keeping
 //! the open photo and the Library's previews in step when they change.
 use super::Editor;
 use super::preferences::{group, hint};
 use super::state::EditOrigin;
 use super::widgets::form_row;
 use crate::app::theme;
-use crate::develop::defaults::{
+use crate::raw_defaults::{
     DefaultChoice, DevelopDefaults, RawDefaults, Resolved, camera_name, same_camera, same_name,
 };
 use crate::xmp::Preset;
@@ -46,8 +46,8 @@ impl Editor {
             if let Some(note) = &resolved.note {
                 self.status = note.clone();
             }
-            if self.document.recipe != resolved.recipe {
-                self.document.recipe = resolved.recipe.clone();
+            if *self.document.edit.recipe() != resolved.recipe {
+                self.document.edit.replace(resolved.recipe.clone());
                 changed = true;
             }
         }
@@ -63,15 +63,16 @@ impl Editor {
     fn follows_defaults(&self) -> bool {
         let saved = match (&self.library, self.document.catalog_photo) {
             (Some(l), Some(id)) => l
+                .session
                 .catalog
                 .edit_texts(id)
                 .map_or(true, |(recipe, _)| recipe.is_some()),
             _ => false,
         };
         self.document.origin == EditOrigin::Defaults
-            && self.document.history.steps().0.is_empty()
-            && !self.document.save.needs_save()
-            && !self.document.save.is_protected()
+            && self.document.edit.history().steps().0.is_empty()
+            && !self.document.edit.save_state().needs_save()
+            && !self.document.edit.save_state().is_protected()
             && !saved
     }
     /// Why the open photo shows Adobe Default instead of the raw default chosen
@@ -108,7 +109,7 @@ impl Editor {
         let mut cameras = self
             .library
             .as_ref()
-            .and_then(|l| l.catalog.cameras().ok())
+            .and_then(|l| l.session.catalog.cameras().ok())
             .unwrap_or_default();
         if let Some(m) = &self.document.metadata
             && !m.model.trim().is_empty()
@@ -201,6 +202,7 @@ impl Editor {
             settings.set_camera(&form.camera, form.choice.clone());
         }
         let mut remove = None;
+        let palette = theme::palette(ui.ctx());
         for c in &settings.cameras {
             form_row(ui, "", |ui| {
                 if remove_button(ui, on).clicked() {
@@ -213,7 +215,7 @@ impl Editor {
                             c.camera,
                             choice_text(&c.choice, presets)
                         ))
-                        .color(theme::gray(if on { 215 } else { 140 })),
+                        .color(palette.gray(if on { 215 } else { 140 })),
                     )
                     .truncate(),
                 );
@@ -254,6 +256,7 @@ fn choice_text(choice: &DefaultChoice, presets: &[Preset]) -> String {
 }
 /// A small ✕ that removes a camera's row.
 fn remove_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
     let sense = if enabled {
         egui::Sense::click()
     } else {
@@ -262,9 +265,9 @@ fn remove_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(22.), sense);
     let hovered = enabled && response.hovered();
     if hovered {
-        ui.painter().rect_filled(rect, 3., theme::gray(50));
+        ui.painter().rect_filled(rect, 3., palette.gray(50));
     }
-    let tint = theme::gray(match (enabled, hovered) {
+    let tint = palette.gray(match (enabled, hovered) {
         (false, _) => 90,
         (true, false) => 160,
         (true, true) => 235,
@@ -293,6 +296,7 @@ fn choice_combo(ui: &mut egui::Ui, id: &str, choice: &mut DefaultChoice, presets
                 let label = fixed.label();
                 ui.selectable_value(choice, fixed, label);
             }
+            let caption = theme::palette(ui.ctx()).gray(130);
             let mut last_group = None;
             for p in presets {
                 if last_group != Some(&p.group) {
@@ -302,7 +306,7 @@ fn choice_combo(ui: &mut egui::Ui, id: &str, choice: &mut DefaultChoice, presets
                     } else {
                         &p.group
                     };
-                    ui.label(egui::RichText::new(title).size(11.).color(theme::gray(130)));
+                    ui.label(egui::RichText::new(title).size(11.).color(caption));
                     last_group = Some(&p.group);
                 }
                 let value = DefaultChoice::preset(p);
@@ -316,9 +320,9 @@ fn choice_combo(ui: &mut egui::Ui, id: &str, choice: &mut DefaultChoice, presets
 mod tests {
     use super::*;
     use crate::app::worker::{Event, LoadedHeader};
+    use crate::camera_data::Metadata;
     use crate::camera_profiles::{CameraProfile, open};
-    use crate::develop::Recipe;
-    use crate::raw::Metadata;
+    use crate::model::recipe::Recipe;
 
     #[allow(clippy::approx_constant)] // Exact camera matrix coefficients, not mathematical constants.
     fn x100f() -> Metadata {
@@ -361,12 +365,12 @@ mod tests {
         let m = x100f();
         editor.document.profiles = profiles(&m);
         editor.document.metadata = Some(m.clone());
-        editor.raw_defaults = Arc::new(crate::develop::defaults::brighter_defaults());
-        editor.document.recipe.exposure = -1.;
+        editor.raw_defaults = Arc::new(crate::raw_defaults::brighter_defaults());
+        editor.document.edit.setup_mut().exposure = -1.;
         editor.reset_settings();
-        assert_eq!(editor.document.recipe.exposure, 0.7);
+        assert_eq!(editor.document.edit.recipe().exposure, 0.7);
         assert_eq!(
-            editor.document.recipe,
+            *editor.document.edit.recipe(),
             editor.raw_defaults.resolve(&m, &profiles(&m)).recipe
         );
     }
@@ -395,7 +399,6 @@ mod tests {
                     metadata: m.clone(),
                     recipe: adobe.clone(),
                     export: Default::default(),
-                    protected: false,
                     status: "Original".into(),
                 })),
                 Event::Profiles {
@@ -414,30 +417,33 @@ mod tests {
             ctx.clone(),
         )?));
         open(&mut editor);
-        assert_eq!(editor.document.recipe, adobe);
+        assert_eq!(*editor.document.edit.recipe(), adobe);
         // Changing the defaults changes the photo without an edit, and saves nothing.
         editor.set_raw_defaults(lighten()).unwrap();
         let lightened = editor.raw_defaults.resolve(&m, &profiles(&m)).recipe;
         assert_ne!(lightened, adobe);
-        assert_eq!(editor.document.recipe, lightened);
-        assert!(!editor.document.save.needs_save());
+        assert_eq!(*editor.document.edit.recipe(), lightened);
+        assert!(!editor.document.edit.save_state().needs_save());
         // Opened again, it starts from them.
         open(&mut editor);
-        assert_eq!(editor.document.recipe, lightened);
+        assert_eq!(*editor.document.edit.recipe(), lightened);
         // Once edited and saved, the edit stays as it is.
-        let before = editor.document.recipe.clone();
-        editor.document.recipe.exposure = 0.5;
-        editor.history(before);
+        let before = editor.document.edit.recipe().clone();
+        editor.document.edit.setup_mut().exposure = 0.5;
+        editor.commit_edit(before, None);
         assert!(editor.flush());
-        let edited = editor.document.recipe.clone();
+        let edited = editor.document.edit.recipe().clone();
         editor.set_raw_defaults(RawDefaults::default()).unwrap();
-        assert_eq!(editor.document.recipe, edited);
+        assert_eq!(*editor.document.edit.recipe(), edited);
         open(&mut editor);
-        assert_eq!(editor.document.recipe, edited);
+        assert_eq!(*editor.document.edit.recipe(), edited);
         editor.set_raw_defaults(lighten()).unwrap();
-        assert_eq!(editor.document.recipe, edited);
+        assert_eq!(*editor.document.edit.recipe(), edited);
         let library = editor.library.as_ref().unwrap();
-        assert_eq!(library.catalog.load_edit(id, &raw)?.unwrap().recipe, edited);
+        assert_eq!(
+            library.session.catalog.load_edit(id, &raw)?.unwrap().recipe,
+            edited
+        );
         Ok(())
     }
 
@@ -469,16 +475,15 @@ mod tests {
                 metadata: m,
                 recipe: adobe.clone(),
                 export: Default::default(),
-                protected: false,
                 status: "Original".into(),
             })))
             .unwrap();
         editor.events(&ctx);
         editor.document.export.quality = 50;
-        editor.document.save.mark_changed();
+        editor.document.edit.save_state_mut().mark_changed();
         assert!(editor.flush());
         editor.set_raw_defaults(lighten()).unwrap();
-        assert_eq!(editor.document.recipe, adobe);
+        assert_eq!(*editor.document.edit.recipe(), adobe);
         Ok(())
     }
 
@@ -494,7 +499,7 @@ mod tests {
         drop(catalog);
         rusqlite::Connection::open(&path)?.execute(
             "UPDATE photos SET lightroom_develop='s = { Exposure2012 = ' WHERE id=?",
-            [id],
+            [id.0],
         )?;
         let ctx = egui::Context::default();
         let m = x100f();
@@ -503,7 +508,7 @@ mod tests {
             &path,
             ctx.clone(),
         )?));
-        editor.raw_defaults = Arc::new(crate::develop::defaults::brighter_defaults());
+        editor.raw_defaults = Arc::new(crate::raw_defaults::brighter_defaults());
         editor.document.reset(Some(id));
         let (generation, _) = editor.load.start();
         for event in [
@@ -514,7 +519,6 @@ mod tests {
                 // As the loader resolves it.
                 recipe: editor.raw_defaults.resolve(&m, &profiles(&m)).recipe,
                 export: Default::default(),
-                protected: false,
                 status: "Original".into(),
             })),
             Event::Profiles {
@@ -528,7 +532,7 @@ mod tests {
         editor.events(&ctx);
         assert!(editor.document.lightroom_notice.contains("not applied"));
         assert_eq!(
-            editor.document.recipe,
+            *editor.document.edit.recipe(),
             Recipe::with_profiles(&m, &profiles(&m))
         );
         Ok(())
@@ -589,7 +593,7 @@ mod tests {
             .tx
             .send(Event::Ready {
                 id: generation,
-                full: Arc::new(crate::raw::CameraImage {
+                full: Arc::new(crate::camera_data::CameraImage {
                     recovered: Default::default(),
                     width: 12,
                     height: 8,
@@ -620,15 +624,19 @@ mod tests {
         let chart = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/corpus/charts/synthetic-d65.dng");
         let (tx, rx) = std::sync::mpsc::channel();
-        let loader = crate::app::worker::loader(tx, egui::Context::default());
-        let defaults = Arc::new(crate::develop::defaults::brighter_defaults());
+        let loader = crate::app::worker::Loader::new(
+            tx,
+            egui::Context::default(),
+            crate::decode_cache::DecodeCache::default(),
+        );
+        let defaults = Arc::new(crate::raw_defaults::brighter_defaults());
         loader.submit(crate::app::worker::LoadJob {
             id: 1,
             path: chart,
             cancel: Default::default(),
             prefetch: None,
             defaults: defaults.clone(),
-            demosaic: crate::raw::Demosaic::default(),
+            demosaic: crate::camera_data::Demosaic::default(),
         });
         let header = loop {
             match rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap() {

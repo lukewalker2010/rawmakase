@@ -44,7 +44,7 @@ impl Editor {
     /// Reads the open catalog photo's snapshots.
     pub(super) fn load_snapshots(&mut self) {
         let list = match (&self.library, self.document.catalog_photo) {
-            (Some(l), Some(photo)) => l.catalog.snapshots(photo).unwrap_or_default(),
+            (Some(l), Some(photo)) => l.session.catalog.snapshots(photo).unwrap_or_default(),
             _ => Vec::new(),
         };
         self.document.snapshots.list = list;
@@ -68,7 +68,7 @@ impl Editor {
                     ui.label(
                         egui::RichText::new("+ saves the photo as it is now")
                             .size(11.)
-                            .color(theme::gray(125)),
+                            .color(theme::palette(ui.ctx()).gray(125)),
                     );
                 }
                 for snapshot in &panel.list {
@@ -124,11 +124,11 @@ impl Editor {
         }
     }
     fn snapshot_action(&mut self, action: SnapshotAction) {
-        let (Some(library), Some(photo)) = (&self.library, self.document.catalog_photo) else {
+        let (Some(library), Some(photo)) = (&mut self.library, self.document.catalog_photo) else {
             return;
         };
-        let catalog = &library.catalog;
-        let recipe = &self.document.recipe;
+        let catalog = &mut library.session.catalog;
+        let recipe = self.document.edit.recipe();
         let result = match &action {
             SnapshotAction::New => {
                 let name = format!("Snapshot {}", self.document.snapshots.list.len() + 1);
@@ -196,18 +196,18 @@ impl Editor {
             return;
         };
         // Already the edit: nothing to record, and no label left for the next step.
-        if recipe == self.document.recipe {
+        if recipe == *self.document.edit.recipe() {
             return;
         }
         self.document
-            .history
-            .label(Step::new(format!("Snapshot: {name}"), ""));
-        self.document.recipe = recipe;
+            .edit
+            .name_next_step(Step::new(format!("Snapshot: {name}"), ""));
+        self.document.edit.replace(recipe);
         self.ensure_upright();
     }
     /// A snapshot's settings for this photo; one from Lightroom is converted, and
     /// what it could not render is said in the status line.
-    fn snapshot_settings(&mut self, id: i64) -> Option<crate::develop::Recipe> {
+    fn snapshot_settings(&mut self, id: i64) -> Option<crate::model::recipe::Recipe> {
         let snapshot = self.snapshot(id).cloned()?;
         let recipe = match snapshot.settings {
             SnapshotSettings::Recipe(recipe) => *recipe,
@@ -217,7 +217,10 @@ impl Editor {
                     &text,
                     m,
                     &self.document.profiles,
-                    self.document.full().map(|image| image.as_ref()),
+                    self.document
+                        .measures()
+                        .as_ref()
+                        .map(|m| m as &dyn crate::xmp::PhotoMeasures),
                 ) {
                     Ok((recipe, skipped)) => {
                         if !skipped.is_empty() {
@@ -239,10 +242,11 @@ impl Editor {
 
 /// A snapshot in the list, as History's rows look.
 fn snapshot_row(ui: &mut egui::Ui, name: &str) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.), Sense::click());
     if response.hovered() {
-        ui.painter().rect_filled(rect, 3., theme::gray(43));
+        ui.painter().rect_filled(rect, 3., palette.gray(43));
     }
     ui.painter()
         .with_clip_rect(rect.shrink2(Vec2::new(8., 0.)))
@@ -251,7 +255,7 @@ fn snapshot_row(ui: &mut egui::Ui, name: &str) -> egui::Response {
             egui::Align2::LEFT_CENTER,
             name,
             egui::FontId::proportional(12.),
-            theme::gray(205),
+            palette.gray(205),
         );
     response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
@@ -261,7 +265,8 @@ fn snapshot_row(ui: &mut egui::Ui, name: &str) -> egui::Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::develop::Recipe;
+    use crate::app::Module;
+    use crate::model::recipe::Recipe;
 
     #[test]
     fn a_snapshot_saves_names_and_restores_the_edit_as_a_history_step() -> anyhow::Result<()> {
@@ -272,12 +277,12 @@ mod tests {
         let path = d.path().join("snapshots.rawmakase");
         crate::catalog::Catalog::create(&path)?.add_folder(&photos)?;
         let ctx = egui::Context::default();
-        let mut e = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+        let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
         let library = crate::app::library::Library::load(&path, ctx.clone())?;
-        e.document.catalog_photo = Some(library.photos[0].id);
+        e.document.catalog_photo = Some(library.session.photos[0].id);
         e.library = Some(Box::new(library));
         e.document.metadata = Some(Default::default());
-        e.document.recipe.exposure = 0.8;
+        e.document.edit.setup_mut().exposure = 0.8;
         // + saves the edit as it is and starts naming it.
         e.snapshot_action(SnapshotAction::New);
         let id = e.document.snapshots.list[0].id;
@@ -288,23 +293,24 @@ mod tests {
         e.snapshot_action(SnapshotAction::Rename(id, "  ".into()));
         assert_eq!(e.document.snapshots.list[0].name, "Bright");
         // Applying it is one History step, which Undo takes back.
-        e.document.recipe = Recipe::default();
-        let before = e.document.recipe.clone();
+        e.document.edit.replace(Recipe::default());
+        let before = e.document.edit.recipe().clone();
         e.snapshot_action(SnapshotAction::Apply(id));
-        e.history(before);
-        assert_eq!(e.document.recipe.exposure, 0.8);
-        let (steps, _) = e.document.history.steps();
+        e.commit_edit(before, None);
+        assert_eq!(e.document.edit.recipe().exposure, 0.8);
+        let (steps, _) = e.document.edit.history().steps();
         assert_eq!(steps.last().unwrap().name, "Snapshot: Bright");
         // Update with Current Settings, then Delete.
-        e.document.recipe.exposure = -0.5;
+        e.document.edit.setup_mut().exposure = -0.5;
         e.snapshot_action(SnapshotAction::Update(id));
-        e.document.recipe = Recipe::default();
+        e.document.edit.replace(Recipe::default());
         e.snapshot_action(SnapshotAction::Apply(id));
-        assert_eq!(e.document.recipe.exposure, -0.5);
+        assert_eq!(e.document.edit.recipe().exposure, -0.5);
         e.snapshot_action(SnapshotAction::Delete(id));
         assert!(e.document.snapshots.list.is_empty());
         // Typing a name and pressing Return in the panel names the new snapshot.
-        e.library_mode = false;
+        e.module = Module::Develop;
+        e.set_develop_tab(crate::app::panels::DevelopTab::History);
         e.snapshot_action(SnapshotAction::New);
         let mut frame = |events: Vec<egui::Event>| {
             let mut output = ctx.run_ui(
@@ -341,6 +347,29 @@ mod tests {
         e.document.snapshots.renaming.as_mut().unwrap().name = "Kept".into();
         e.commit_snapshot_rename();
         assert_eq!(e.document.snapshots.list[0].name, "Kept");
+        // One being typed goes on while a tool's drawer opens: History stays.
+        e.snapshot_action(SnapshotAction::StartRename(e.document.snapshots.list[0].id));
+        e.document.snapshots.renaming.as_mut().unwrap().name = "Before crop".into();
+        e.view.tool = crate::app::state::Tool::Crop;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1400., 900.),
+                )),
+                ..Default::default()
+            },
+            |ui| e.draw(ui),
+        );
+        output.textures_delta.clear();
+        assert_eq!(
+            e.document
+                .snapshots
+                .renaming
+                .as_ref()
+                .map(|r| r.name.as_str()),
+            Some("Before crop")
+        );
         Ok(())
     }
 }

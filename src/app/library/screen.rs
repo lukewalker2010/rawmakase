@@ -7,15 +7,17 @@
 //! results are kept as textures, a few at a time, oldest dropped first.
 use super::previews::EditSource;
 use super::thumbnails;
-use crate::catalog::Photo;
+use crate::catalog::{Photo, PhotoId};
 use eframe::egui;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, Sender, channel},
     },
+    thread::JoinHandle,
 };
 
 /// Previews are rendered in steps of this many pixels, so resizing the
@@ -27,8 +29,9 @@ const THREADS: usize = 2;
 
 /// A preview as asked for: photo, file (photo ids can be reused), edge and
 /// the edit's stamp, so an edit saved anywhere renders it again.
-type Key = (i64, PathBuf, u32, u64);
-type Render = fn(&Path, u32, Option<&EditSource>) -> anyhow::Result<image::RgbImage>;
+type Key = (PhotoId, PathBuf, u32, u64);
+/// Renders a preview, giving up once the flag is set.
+type Render = fn(&Path, u32, Option<&EditSource>, &AtomicBool) -> anyhow::Result<image::RgbImage>;
 
 struct Job {
     key: Key,
@@ -53,6 +56,13 @@ struct Queue {
     jobs: Vec<Job>,
     closed: bool,
 }
+/// The workers' queue, and the flag that cancels the renders under way once it closes.
+#[derive(Default)]
+struct Shared {
+    queue: Mutex<Queue>,
+    ready: Condvar,
+    cancel: AtomicBool,
+}
 
 /// What a view can draw for a photo.
 pub(super) enum Shown<'a> {
@@ -62,7 +72,8 @@ pub(super) enum Shown<'a> {
 }
 
 pub(super) struct ScreenPreviews {
-    queue: Arc<(Mutex<Queue>, Condvar)>,
+    shared: Arc<Shared>,
+    threads: Vec<JoinHandle<()>>,
     results: Receiver<Done>,
     /// Previews shown this frame and last; the workers skip the rest.
     wanted: Arc<Mutex<HashSet<Key>>>,
@@ -79,15 +90,19 @@ impl ScreenPreviews {
         Self::with(ctx, render)
     }
     fn with(ctx: &egui::Context, render: Render) -> Self {
-        let queue: Arc<(Mutex<Queue>, Condvar)> = Default::default();
+        let shared: Arc<Shared> = Default::default();
         let wanted: Arc<Mutex<HashSet<Key>>> = Default::default();
         let (tx, results) = channel();
-        for _ in 0..THREADS {
-            let (queue, wanted, tx, ctx) = (queue.clone(), wanted.clone(), tx.clone(), ctx.clone());
-            std::thread::spawn(move || work(&queue, &wanted, &tx, &ctx, render));
-        }
+        let threads = (0..THREADS)
+            .map(|_| {
+                let (shared, wanted, tx, ctx) =
+                    (shared.clone(), wanted.clone(), tx.clone(), ctx.clone());
+                std::thread::spawn(move || work(&shared, &wanted, &tx, &ctx, render))
+            })
+            .collect();
         Self {
-            queue,
+            shared,
+            threads,
             results,
             wanted,
             seen: HashSet::new(),
@@ -122,13 +137,12 @@ impl ScreenPreviews {
             self.next_ticket += 1;
             self.pending.insert(key.clone(), self.next_ticket);
             self.wanted.lock().unwrap().insert(key.clone());
-            let (queue, ready) = &*self.queue;
-            queue.lock().unwrap().jobs.push(Job {
+            self.shared.queue.lock().unwrap().jobs.push(Job {
                 key: key.clone(),
                 ticket: self.next_ticket,
                 edit: edit(),
             });
-            ready.notify_one();
+            self.shared.ready.notify_one();
         }
         if let Some(texture) = self.textures.get(&key) {
             // Kept longest: the previews in use.
@@ -205,7 +219,7 @@ impl ScreenPreviews {
         self.pending.clear();
     }
     /// Forgets `id`'s previews, as it was removed.
-    pub(super) fn forget(&mut self, id: i64) {
+    pub(super) fn forget(&mut self, id: PhotoId) {
         self.textures.retain(|key, _| key.0 != id);
         self.order.retain(|key| key.0 != id);
         self.failed.retain(|key, _| key.0 != id);
@@ -220,28 +234,42 @@ impl ScreenPreviews {
         }
     }
 }
+impl ScreenPreviews {
+    /// Ends the workers, cancelling the renders under way, and drops their results;
+    /// the workers are then waited for at exit.
+    pub(super) fn close(&mut self) -> Vec<crate::app::task::Stopping> {
+        self.shut();
+        self.results = channel().1;
+        self.threads
+            .drain(..)
+            .map(|thread| crate::app::task::Stopping::new(Some(thread)))
+            .collect()
+    }
+    fn shut(&self) {
+        self.shared.queue.lock().unwrap().closed = true;
+        self.shared.cancel.store(true, Ordering::Relaxed);
+        self.shared.ready.notify_all();
+    }
+}
 impl Drop for ScreenPreviews {
     fn drop(&mut self) {
-        let (queue, ready) = &*self.queue;
-        queue.lock().unwrap().closed = true;
-        ready.notify_all();
+        self.shut();
     }
 }
 
 /// A worker thread: renders the newest job still wanted, until closed.
 fn work(
-    queue: &(Mutex<Queue>, Condvar),
+    shared: &Shared,
     wanted: &Mutex<HashSet<Key>>,
     results: &Sender<Done>,
     ctx: &egui::Context,
     render: Render,
 ) {
-    let (queue, ready) = queue;
     loop {
         let job = {
-            let mut queue = queue.lock().unwrap();
+            let mut queue = shared.queue.lock().unwrap();
             while queue.jobs.is_empty() && !queue.closed {
-                queue = ready.wait(queue).unwrap();
+                queue = shared.ready.wait(queue).unwrap();
             }
             if queue.closed {
                 return;
@@ -253,7 +281,7 @@ fn work(
             Outcome::Skipped
         } else {
             let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                render(&key.1, key.2, edit.as_ref())
+                render(&key.1, key.2, edit.as_ref(), &shared.cancel)
             }));
             match rendered {
                 Ok(Ok(image)) => Outcome::Ready(image),
@@ -273,27 +301,44 @@ fn work(
     }
 }
 
-/// `path` within `edge` pixels: a RAW developed with its edit (or the
-/// defaults Develop opens it with) from the fast half-size decode; a JPEG,
-/// TIFF or PNG as it is.
-fn render(path: &Path, edge: u32, edit: Option<&EditSource>) -> anyhow::Result<image::RgbImage> {
-    if !crate::storage::is_raw(path) {
-        return Ok(thumbnails::downscale(&thumbnails::raster(path)?, edge));
+/// `path` within `edge` pixels: developed with its edit (or, for a RAW, the
+/// defaults Develop opens it with), as `previews::develop_quickly` does; a JPEG,
+/// TIFF or PNG without an edit as it is, which its defaults reproduce.
+fn render(
+    path: &Path,
+    edge: u32,
+    edit: Option<&EditSource>,
+    cancel: &AtomicBool,
+) -> anyhow::Result<image::RgbImage> {
+    let edited = matches!(edit, Some(EditSource::Recipe(_) | EditSource::Lightroom(_)));
+    if !edited && !crate::storage::is_raw(path) {
+        return Ok(thumbnails::downscale(&crate::raster::decode(path)?, edge));
     }
-    let raw = crate::raw::Raw::open(path)?;
-    let recipe = EditSource::recipe(edit, &raw)?;
-    let cancel = std::sync::atomic::AtomicBool::new(false);
-    let image = raw.develop(crate::raw::Decode::Half, &cancel)?;
-    let out = crate::develop::render(&image, &recipe, edge)?;
-    image::RgbImage::from_raw(out.width, out.height, out.rgb8())
-        .ok_or_else(|| anyhow::anyhow!("Invalid preview size"))
+    super::previews::develop_quickly(path, edit, edge, cancel)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn photo(id: i64, path: &Path) -> Photo {
+    #[test]
+    fn a_jpeg_shows_with_its_edit_and_as_it_is_without() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("photo.jpg");
+        let edit = super::super::previews::tests::edited_jpeg(&path)?;
+        let cancel = AtomicBool::new(false);
+        let edited = render(&path, 64, Some(&edit), &cancel)?;
+        assert!(
+            edited.pixels().all(|p| p.0[1] > 75),
+            "{:?}",
+            edited.get_pixel(0, 0)
+        );
+        let unedited = render(&path, 64, None, &cancel)?;
+        assert!(unedited.pixels().all(|p| p.0[1].abs_diff(60) <= 2));
+        Ok(())
+    }
+
+    fn photo(id: PhotoId, path: &Path) -> Photo {
         Photo {
             id,
             path: path.into(),
@@ -308,7 +353,7 @@ mod tests {
         image::RgbImage::new(3000, 2000).save(&path)?;
         let ctx = egui::Context::default();
         let mut screen = ScreenPreviews::new(&ctx);
-        let a = photo(1, &path);
+        let a = photo(PhotoId(1), &path);
         assert!(matches!(screen.get(&a, 900, 0, || None), Shown::Loading));
         screen.wait(&ctx);
         // Rendered at the next step up from the size asked for.
@@ -317,14 +362,19 @@ mod tests {
             _ => panic!("not rendered"),
         }
         // Forgetting the photo renders it again.
-        screen.forget(1);
+        screen.forget(PhotoId(1));
         assert!(matches!(screen.get(&a, 900, 0, || None), Shown::Loading));
         Ok(())
     }
 
     #[test]
     fn a_failed_or_panicking_render_is_reported_and_the_rest_go_on() {
-        fn render(path: &Path, _: u32, _: Option<&EditSource>) -> anyhow::Result<image::RgbImage> {
+        fn render(
+            path: &Path,
+            _: u32,
+            _: Option<&EditSource>,
+            _: &AtomicBool,
+        ) -> anyhow::Result<image::RgbImage> {
             match path.to_str() {
                 Some("panics") => panic!("render panics"),
                 Some("fails") => anyhow::bail!("no such photo"),
@@ -333,8 +383,12 @@ mod tests {
         }
         let ctx = egui::Context::default();
         let mut screen = ScreenPreviews::with(&ctx, render);
-        let photos = [(1, "panics"), (2, "fails"), (3, "works")]
-            .map(|(id, path)| photo(id, Path::new(path)));
+        let photos = [
+            (PhotoId(1), "panics"),
+            (PhotoId(2), "fails"),
+            (PhotoId(3), "works"),
+        ]
+        .map(|(id, path)| photo(id, Path::new(path)));
         for p in &photos {
             let _ = screen.get(p, 100, 0, || None);
         }
@@ -356,17 +410,17 @@ mod tests {
     #[test]
     fn a_preview_no_longer_shown_is_skipped_and_asked_for_again() {
         let ctx = egui::Context::default();
-        let mut screen = ScreenPreviews::with(&ctx, |_, _, _| Ok(image::RgbImage::new(4, 4)));
-        let a = photo(1, Path::new("a"));
+        let mut screen = ScreenPreviews::with(&ctx, |_, _, _, _| Ok(image::RgbImage::new(4, 4)));
+        let a = photo(PhotoId(1), Path::new("a"));
         // Queued, then not shown for a frame before a worker takes it.
-        let key = (1, PathBuf::from("a"), EDGE_STEP, 0);
+        let key = (PhotoId(1), PathBuf::from("a"), EDGE_STEP, 0);
         screen.pending.insert(key.clone(), 0);
-        screen.queue.0.lock().unwrap().jobs.push(Job {
+        screen.shared.queue.lock().unwrap().jobs.push(Job {
             key,
             ticket: 0,
             edit: None,
         });
-        screen.queue.1.notify_one();
+        screen.shared.ready.notify_one();
         screen.wait(&ctx);
         assert!(screen.textures.is_empty());
         assert!(matches!(screen.get(&a, 100, 0, || None), Shown::Loading));
@@ -377,18 +431,18 @@ mod tests {
     #[test]
     fn a_render_asked_for_before_an_edit_changed_is_dropped() {
         let ctx = egui::Context::default();
-        let mut screen = ScreenPreviews::with(&ctx, |_, _, _| Ok(image::RgbImage::new(4, 4)));
-        let key = (1, PathBuf::from("a"), EDGE_STEP, 0);
+        let mut screen = ScreenPreviews::with(&ctx, |_, _, _, _| Ok(image::RgbImage::new(4, 4)));
+        let key = (PhotoId(1), PathBuf::from("a"), EDGE_STEP, 0);
         // The photo was asked for again (ticket 2) after the edit changed,
         // and the render asked for before it (ticket 1) comes in first.
         screen.pending.insert(key.clone(), 2);
         screen.wanted.lock().unwrap().insert(key.clone());
-        screen.queue.0.lock().unwrap().jobs.push(Job {
+        screen.shared.queue.lock().unwrap().jobs.push(Job {
             key: key.clone(),
             ticket: 1,
             edit: None,
         });
-        screen.queue.1.notify_one();
+        screen.shared.ready.notify_one();
         let started = std::time::Instant::now();
         while started.elapsed() < std::time::Duration::from_millis(300) {
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -401,8 +455,8 @@ mod tests {
     #[test]
     fn a_failed_preview_is_asked_for_again_once_retried() {
         let ctx = egui::Context::default();
-        let mut screen = ScreenPreviews::with(&ctx, |_, _, _| anyhow::bail!("offline"));
-        let a = photo(1, Path::new("a"));
+        let mut screen = ScreenPreviews::with(&ctx, |_, _, _, _| anyhow::bail!("offline"));
+        let a = photo(PhotoId(1), Path::new("a"));
         let _ = screen.get(&a, 100, 0, || None);
         screen.wait(&ctx);
         assert!(matches!(screen.get(&a, 100, 0, || None), Shown::Failed(_)));
@@ -413,9 +467,9 @@ mod tests {
     #[test]
     fn previews_shown_together_are_all_kept() {
         let ctx = egui::Context::default();
-        let mut screen = ScreenPreviews::with(&ctx, |_, _, _| Ok(image::RgbImage::new(4, 4)));
+        let mut screen = ScreenPreviews::with(&ctx, |_, _, _, _| Ok(image::RgbImage::new(4, 4)));
         let photos: Vec<Photo> = (1..=KEPT as i64 + 3)
-            .map(|id| photo(id, Path::new("a")))
+            .map(|id| photo(PhotoId(id), Path::new("a")))
             .collect();
         // One frame shows them all, as a survey of seven does.
         for p in &photos {
@@ -427,5 +481,34 @@ mod tests {
                 .iter()
                 .all(|p| matches!(screen.get(p, 100, 0, || None), Shown::Ready(_)))
         );
+    }
+
+    #[test]
+    fn closing_cancels_the_render_under_way_and_ends_the_workers() {
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        fn render(
+            _: &Path,
+            _: u32,
+            _: Option<&EditSource>,
+            cancel: &AtomicBool,
+        ) -> anyhow::Result<image::RgbImage> {
+            STARTED.store(true, Ordering::Relaxed);
+            // A render that only a cancel ends.
+            while !cancel.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            anyhow::bail!("Cancelled")
+        }
+        let ctx = egui::Context::default();
+        let mut screen = ScreenPreviews::with(&ctx, render);
+        let _ = screen.get(&photo(PhotoId(1), Path::new("a")), 100, 0, || None);
+        let started = std::time::Instant::now();
+        while !STARTED.load(Ordering::Relaxed) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(20));
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let stopping = screen.close();
+        let waited = crate::app::task::wait_for(stopping, std::time::Duration::from_secs(20));
+        assert_eq!(waited.detached, 0);
     }
 }

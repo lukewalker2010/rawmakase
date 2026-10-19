@@ -2,7 +2,7 @@
 use std::path::{Component, Path, PathBuf, Prefix};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Volume {
+pub(crate) struct Volume {
     /// Display name: the drive's name, a drive letter, or the startup disk.
     pub name: String,
     /// Where the volume is mounted, for external and network drives; `None`
@@ -13,7 +13,7 @@ pub struct Volume {
 /// The volume holding `path`: /Volumes/NAME on macOS, /media/USER/NAME,
 /// /run/media/USER/NAME or /mnt/NAME on Linux, a drive letter or UNC share
 /// on Windows, and otherwise the startup disk.
-pub fn volume_of(path: &Path) -> Volume {
+pub(crate) fn volume_of(path: &Path) -> Volume {
     let parts: Vec<Component> = path.components().collect();
     if let Some(Component::Prefix(prefix)) = parts.first() {
         let mount: PathBuf = parts.iter().take(2).collect();
@@ -62,6 +62,30 @@ pub fn volume_of(path: &Path) -> Volume {
         mount: None,
     })
 }
+/// Whether the volume holding `path` is mounted, for headless commands with
+/// no volume checks of their own. The startup disk always is; another only
+/// when its mount point is a directory on a device of its own, as an empty
+/// directory left where a disk was mounted is not.
+pub fn mounted(path: &Path) -> bool {
+    let Some(mount) = volume_of(path).mount else {
+        return true;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(m) = std::fs::metadata(&mount) else {
+            return false;
+        };
+        m.is_dir()
+            && mount
+                .parent()
+                .is_some_and(|p| std::fs::metadata(p).is_ok_and(|p| p.dev() != m.dev()))
+    }
+    #[cfg(not(unix))]
+    {
+        mount.is_dir()
+    }
+}
 /// The startup disk's name: on macOS the /Volumes entry that links to "/"
 /// (usually "Macintosh HD").
 fn startup_name() -> String {
@@ -86,7 +110,7 @@ fn startup_name() -> String {
 }
 /// Free and total bytes on the volume holding `path`, from `df` on macOS and
 /// Linux; `None` where that isn't available.
-pub fn space(path: &Path) -> Option<(u64, u64)> {
+pub(crate) fn space(path: &Path) -> Option<(u64, u64)> {
     if cfg!(windows) {
         return None;
     }

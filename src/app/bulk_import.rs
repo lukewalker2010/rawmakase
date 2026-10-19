@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImportKind {
+pub(crate) enum ImportKind {
     CameraProfiles,
     LensProfiles,
     Presets,
@@ -127,7 +127,7 @@ fn gather(kind: ImportKind, picks: &[PathBuf]) -> Vec<Found> {
 
 /// What an import did.
 #[derive(Debug)]
-pub struct Summary {
+pub(crate) struct Summary {
     pub(super) kind: ImportKind,
     pub(super) imported: usize,
     /// Identical to one already imported, or repeated within this import.
@@ -200,9 +200,39 @@ fn content_hash(bytes: &[u8]) -> u64 {
 fn is_look(text: &str) -> bool {
     text.contains("PresetType=\"Look\"") || text.contains(">Look</crs:PresetType>")
 }
-fn report(progress: &Mutex<String>, i: usize, total: usize, noun: &str) {
+/// What an import is doing, for the status line. Setting it wakes the interface,
+/// so the status line follows without polling.
+#[derive(Default)]
+pub(super) struct ImportProgress {
+    text: Mutex<String>,
+    ctx: Option<egui::Context>,
+}
+impl ImportProgress {
+    fn new(ctx: egui::Context) -> Self {
+        Self {
+            text: Mutex::default(),
+            ctx: Some(ctx),
+        }
+    }
+    fn set(&self, text: String) {
+        *self
+            .text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = text;
+        if let Some(ctx) = &self.ctx {
+            ctx.request_repaint();
+        }
+    }
+    pub(super) fn text(&self) -> String {
+        self.text
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+fn report(progress: &ImportProgress, i: usize, total: usize, noun: &str) {
     if i.is_multiple_of(50) {
-        *progress.lock().unwrap() = format!("Checking {noun}… {i} of {total}");
+        progress.set(format!("Checking {noun}… {i} of {total}"));
     }
 }
 
@@ -244,7 +274,7 @@ fn check_name(
     true
 }
 
-fn import_camera_profiles(found: &[Found], progress: &Mutex<String>) -> Summary {
+fn import_camera_profiles(found: &[Found], progress: &ImportProgress) -> Summary {
     let mut summary = Summary::new(ImportKind::CameraProfiles);
     let destination = crate::storage::data_dir().join("camera-profiles");
     let mut names = BTreeMap::new();
@@ -280,7 +310,7 @@ fn import_camera_profiles(found: &[Found], progress: &Mutex<String>) -> Summary 
     }
     // Every DCP was checked above, so batches only fail on a write error.
     for batch in dcps.chunks(1000) {
-        *progress.lock().unwrap() = format!("Importing profiles… {} done", summary.imported);
+        progress.set(format!("Importing profiles… {} done", summary.imported));
         match crate::camera_profiles::import_files(batch) {
             Ok(done) => summary.imported += done.len(),
             Err(e) => batch.iter().for_each(|p| summary.fail(p, format!("{e:#}"))),
@@ -303,7 +333,8 @@ fn import_camera_profiles(found: &[Found], progress: &Mutex<String>) -> Summary 
                         // Camera Raw's folder of looks covers every camera; only
                         // looks chosen by name are worth a line each.
                         Err(e)
-                            if e.to_string().contains("Missing base camera profile")
+                            if e.downcast_ref::<crate::camera_profiles::MissingBase>()
+                                .is_some()
                                 && !chosen.contains(path.as_path()) =>
                         {
                             summary.without_base += 1
@@ -323,7 +354,7 @@ fn import_camera_profiles(found: &[Found], progress: &Mutex<String>) -> Summary 
     summary
 }
 
-fn import_lens_profiles(found: &[Found], progress: &Mutex<String>) -> Summary {
+fn import_lens_profiles(found: &[Found], progress: &ImportProgress) -> Summary {
     let mut summary = Summary::new(ImportKind::LensProfiles);
     let destination = crate::storage::data_dir().join("lens-profiles");
     let mut names = BTreeMap::new();
@@ -336,7 +367,7 @@ fn import_lens_profiles(found: &[Found], progress: &Mutex<String>) -> Summary {
         };
         let parsed = std::str::from_utf8(&bytes)
             .map_err(anyhow::Error::from)
-            .and_then(crate::lens::lcp::parse);
+            .and_then(crate::optics::lcp::parse);
         if let Err(e) = parsed {
             summary.fail(&file.path, format!("not a lens profile: {e:#}"));
         } else if check_name(file, &bytes, &destination, &mut names, &mut summary) {
@@ -344,7 +375,10 @@ fn import_lens_profiles(found: &[Found], progress: &Mutex<String>) -> Summary {
         }
     }
     for batch in good.chunks(4000) {
-        *progress.lock().unwrap() = format!("Importing lens profiles… {} done", summary.imported);
+        progress.set(format!(
+            "Importing lens profiles… {} done",
+            summary.imported
+        ));
         match crate::lens::lcp::import_files(batch) {
             Ok(done) => summary.imported += done.len(),
             Err(e) => batch.iter().for_each(|p| summary.fail(p, format!("{e:#}"))),
@@ -358,13 +392,13 @@ fn import_lens_profiles(found: &[Found], progress: &Mutex<String>) -> Summary {
 /// whose name is taken by a different preset gets a numbered name.
 fn import_presets(
     found: &[Found],
-    progress: &Mutex<String>,
+    progress: &ImportProgress,
     root: &Path,
     installed: &[PathBuf],
 ) -> Summary {
     use std::io::Write;
     let mut summary = Summary::new(ImportKind::Presets);
-    *progress.lock().unwrap() = "Checking installed presets…".into();
+    progress.set("Checking installed presets…".to_string());
     let mut known: HashSet<u64> = installed
         .iter()
         .flat_map(|dir| find_files(dir, &["xmp"], &[]))
@@ -435,8 +469,8 @@ fn import_presets(
 }
 
 /// Imports what `picks` (files and folders) hold for `kind`.
-fn run(kind: ImportKind, picks: &[PathBuf], progress: &Mutex<String>) -> Summary {
-    *progress.lock().unwrap() = format!("Looking for {}…", kind.noun(2));
+fn run(kind: ImportKind, picks: &[PathBuf], progress: &ImportProgress) -> Summary {
+    progress.set(format!("Looking for {}…", kind.noun(2)));
     let found = gather(kind, picks);
     match kind {
         ImportKind::CameraProfiles => import_camera_profiles(&found, progress),
@@ -456,7 +490,7 @@ impl Editor {
         if self.importing.is_some() || picks.is_empty() {
             return;
         }
-        let progress = Arc::new(Mutex::new(String::new()));
+        let progress = Arc::new(ImportProgress::new(ctx.clone()));
         self.importing = Some(progress.clone());
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
         let first = picks[0].clone();
@@ -476,13 +510,12 @@ impl Editor {
             },
         );
     }
-    pub(super) fn import_progress(&mut self, ctx: &egui::Context) {
+    pub(super) fn import_progress(&mut self) {
         if let Some(progress) = &self.importing {
-            self.status = progress.lock().unwrap().clone();
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            self.status = progress.text();
         }
     }
-    pub(super) fn imported(&mut self, summary: Box<Summary>, ctx: &egui::Context) {
+    pub(super) fn imported(&mut self, summary: Summary, ctx: &egui::Context) {
         self.importing = None;
         if summary.imported > 0 {
             match summary.kind {
@@ -516,7 +549,7 @@ impl Editor {
             self.status.push_str(": ");
             self.status.push_str(&summary.details(1));
         }
-        self.onboarding.last_import = Some(summary);
+        self.onboarding.imported(summary);
     }
 }
 
@@ -551,7 +584,7 @@ mod tests {
         )
         .unwrap();
         let root = temp.path().join("library");
-        let progress = Mutex::new(String::new());
+        let progress = ImportProgress::default();
 
         let found = gather(ImportKind::Presets, std::slice::from_ref(&pack));
         let summary = import_presets(&found, &progress, &root, std::slice::from_ref(&root));
@@ -592,7 +625,12 @@ mod tests {
         )
         .unwrap();
         let found = gather(ImportKind::Presets, &[look]);
-        let summary = import_presets(&found, &Mutex::default(), &temp.path().join("lib"), &[]);
+        let summary = import_presets(
+            &found,
+            &ImportProgress::default(),
+            &temp.path().join("lib"),
+            &[],
+        );
         assert_eq!(summary.failed.len(), 1);
         assert!(summary.details(5).starts_with("Look.xmp: a camera profile"));
     }

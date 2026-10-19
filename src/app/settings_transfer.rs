@@ -1,13 +1,12 @@
 //! Copy Settings, Paste Settings and Paste from Previous: settings moving from one
-//! photo to another by group (see `develop::settings_groups`).
-use super::Editor;
-use super::theme;
+//! photo to another by group (see `model::settings_groups`).
 use super::widgets::{modal_frame, primary_button};
-use crate::develop::{
-    Recipe,
-    settings_groups::{self, GroupInclusion, GroupSelection, SettingGroup, Source, Target},
+use super::{Editor, theme};
+use crate::model::recipe::Recipe;
+use crate::{
+    camera_data::Metadata,
+    model::settings_groups::{self, GroupInclusion, GroupSelection, SettingGroup, Source, Target},
 };
-use crate::raw::Metadata;
 use eframe::egui::{self, Color32, Vec2};
 
 /// A photo's settings with its camera, as Copy or leaving a photo keeps them.
@@ -84,7 +83,7 @@ impl Editor {
     /// The open photo's settings, once its camera is known.
     pub(super) fn current_settings(&self) -> Option<Settings> {
         Some(Settings {
-            recipe: self.document.recipe.clone(),
+            recipe: self.document.edit.recipe().clone(),
             metadata: self.document_metadata()?,
         })
     }
@@ -105,27 +104,33 @@ impl Editor {
     }
     /// Opens Copy Settings, or Synchronize Settings, with the groups chosen last time.
     pub(super) fn open_copy_dialog(&mut self, purpose: Transfer) {
-        self.copy_dialog = Some(CopyDialog {
+        self.modal = Some(super::Modal::CopySettings(CopyDialog {
             purpose,
             groups: self.copy_groups.clone(),
             preset: PresetForm::default(),
-        });
+        }));
     }
     /// Lightroom's Copy Settings: a checkbox per group, under its section.
     pub(super) fn copy_dialog_window(&mut self, ctx: &egui::Context) {
-        let Some(dialog) = &mut self.copy_dialog else {
+        let palette = theme::palette(ctx);
+        let Some(super::Modal::CopySettings(dialog)) = &mut self.modal else {
             return;
         };
-        let mut choice = None;
+        // Return is the primary button, as in Lightroom; it is taken before the
+        // dialog draws so a focused checkbox or button does not also act on it.
+        // Space still presses the focused one, and an open group list keeps Return.
+        let confirm = !egui::Popup::is_any_open(ctx)
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        let mut choice = confirm.then_some(CopyChoice::Confirm);
         let response = egui::Modal::new(egui::Id::new("copy-settings"))
             .backdrop_color(Color32::from_black_alpha(140))
-            .frame(modal_frame().inner_margin(egui::Margin::symmetric(28, 22)))
+            .frame(modal_frame(&palette).inner_margin(egui::Margin::symmetric(28, 22)))
             .show(ctx, |ui| {
                 ui.set_width(COLUMN * 2. + GAP);
                 ui.label(
                     egui::RichText::new(dialog.purpose.title())
                         .size(17.)
-                        .color(theme::gray(235)),
+                        .color(palette.gray(235)),
                 );
                 ui.add_space(14.);
                 if dialog.purpose == Transfer::NewPreset {
@@ -189,7 +194,10 @@ impl Editor {
     /// other selected photos; both start the next dialog from that choice. A new
     /// preset's groups are its own and leave that choice as it was.
     pub(super) fn close_copy_dialog(&mut self, choice: CopyChoice) {
-        let Some(dialog) = self.copy_dialog.take() else {
+        let Some(super::Modal::CopySettings(dialog)) = self
+            .modal
+            .take_if(|m| matches!(m, super::Modal::CopySettings(_)))
+        else {
             return;
         };
         if choice == CopyChoice::Cancel {
@@ -229,7 +237,7 @@ impl Editor {
                 recipe: &from.recipe,
                 metadata: &from.metadata,
             },
-            &self.document.recipe,
+            self.document.edit.recipe(),
             groups,
             Target {
                 metadata: &metadata,
@@ -237,9 +245,9 @@ impl Editor {
             },
         );
         self.document
-            .history
-            .label(super::history::Step::new(step, ""));
-        self.document.recipe = out.recipe;
+            .edit
+            .name_next_step(super::history::Step::new(step, ""));
+        self.document.edit.replace(out.recipe);
         self.ensure_upright();
         self.status = if out.notes.is_empty() {
             "Settings pasted".into()

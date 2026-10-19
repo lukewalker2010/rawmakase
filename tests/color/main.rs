@@ -18,10 +18,11 @@ mod measure;
 mod private;
 mod red_eye;
 mod retouch;
+mod scene_probes;
 
 use chart::{Camera, Illuminant, Layout, Patch};
 use measure::{chroma, delta_e2000, hue_difference, lab};
-use rawmakase::{camera_profiles::CameraProfile, develop::Rendered, raw::CameraImage};
+use rawmakase::{camera_data::CameraImage, camera_profiles::CameraProfile, rendered::Rendered};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -209,8 +210,13 @@ pub fn cases() -> Cases {
 
 pub fn develop(path: &Path) -> CameraImage {
     charts_ready();
-    rawmakase::raw::Raw::open(path)
-        .and_then(|r| r.develop(rawmakase::raw::Decode::full(), &AtomicBool::new(false)))
+    rawmakase::photo::open(path)
+        .and_then(|r| {
+            r.develop(
+                rawmakase::camera_data::Decode::full(Default::default()),
+                &AtomicBool::new(false),
+            )
+        })
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
@@ -222,10 +228,15 @@ pub fn render(
     xmp: &str,
     max_edge: u32,
 ) -> anyhow::Result<Rendered> {
-    let base = rawmakase::develop::Recipe::with_profiles(&im.metadata, profiles);
+    let base = rawmakase::model::recipe::Recipe::with_profiles(&im.metadata, profiles);
     let preset = rawmakase::xmp::parse(Path::new("case.xmp"), xmp)?;
-    let recipe = preset.apply(&base, &im.metadata, profiles, Some(im))?;
-    rawmakase::develop::render(im, &recipe, max_edge)
+    let recipe = preset.apply(
+        &base,
+        &im.metadata,
+        profiles,
+        Some(&rawmakase::develop::Measures(im)),
+    )?;
+    rawmakase::develop::render(im, &recipe.checked()?, max_edge)
 }
 
 /// The DNG's own embedded profile, and nothing from the user's library. A DNG
@@ -580,7 +591,7 @@ fn exports_match_the_render() {
                 &source,
                 &out,
                 &im.metadata,
-                &rawmakase::export::ExportOptions::default(),
+                &rawmakase::export_settings::ExportOptions::default(),
                 rawmakase::export::Replace::NoClobber,
             )
             .unwrap();
@@ -879,7 +890,7 @@ fn auto_black_white_mix_matches_camera_raw_on_the_chart() {
     const CAMERA_RAW: [i32; 8] = [-9, -19, -23, -27, -18, 11, 16, 4];
     let im = develop(&chart_path("synthetic-d65"));
     let profiles = embedded_profiles(&im);
-    let r = rawmakase::develop::Recipe::with_profiles(&im.metadata, &profiles);
+    let r = rawmakase::model::recipe::Recipe::with_profiles(&im.metadata, &profiles);
     let spread = rawmakase::develop::ColorSpread::measure(&im);
     let auto = rawmakase::develop::AutoMix {
         spread: &spread,

@@ -1,12 +1,12 @@
 //! The Library's layout kept across launches: its view, filter bar, sort
-//! and grid (see `storage::LibraryLayout`). Each setting is saved under a
+//! and grid (see `app::session::LibraryLayout`). Each setting is saved under a
 //! stable key, so renaming one in the interface keeps what was saved.
 use super::Library;
 use super::cell::Style;
 use super::filter::{Kind, Label, RatingOp};
 use super::sort::Sort;
 use super::views::View;
-use crate::storage::LibraryLayout;
+use crate::app::session::LibraryLayout;
 
 /// A setting saved by key.
 trait Keyed: Copy + PartialEq + Default + 'static {
@@ -96,7 +96,7 @@ fn label_from_key(key: &str) -> Label {
 
 impl Library {
     /// How the Library shows its photos now, to keep.
-    pub fn layout(&self) -> LibraryLayout {
+    pub(crate) fn layout(&self) -> LibraryLayout {
         let filters = &self.filters;
         LibraryLayout {
             view: self.view().key().into(),
@@ -115,7 +115,7 @@ impl Library {
     }
     /// Returns to a layout kept from last time, after the source and
     /// selection are restored, so a Loupe, Compare or Survey has its photos.
-    pub fn apply_layout(&mut self, layout: &LibraryLayout) {
+    pub(crate) fn apply_layout(&mut self, layout: &LibraryLayout) {
         let filters = &mut self.filters;
         filters.sort = Sort::from_key(&layout.sort);
         filters.reverse = layout.reverse;
@@ -139,10 +139,11 @@ impl Library {
         // A view of one photo or more opens only on a photo still shown.
         let view = View::from_key(&layout.view);
         if view != View::Grid
-            && self
-                .selection
-                .active
-                .is_some_and(|id| self.visible.iter().any(|i| self.photos[*i].id == id))
+            && self.selection.active.is_some_and(|id| {
+                self.visible
+                    .iter()
+                    .any(|i| self.session.photos[*i].id == id)
+            })
         {
             self.set_view(view);
         }

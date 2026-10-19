@@ -7,9 +7,9 @@ from pathlib import Path
 import plistlib
 import re
 import shutil
+import sys
 import subprocess
 import tempfile
-import urllib.request
 
 
 def run(*args):
@@ -56,7 +56,6 @@ def main():
     parser.add_argument("binary", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("version")
-    parser.add_argument("native_prefix", type=Path)
     parser.add_argument("--minimum-macos", default="15.0")
     parser.add_argument("--icon-assets", type=Path,
                         help="Assets.car compiled on macOS 26 for the layered app icon")
@@ -72,7 +71,7 @@ def main():
     executable = macos / "rawmakase"
     shutil.copy2(args.binary, executable)
     notices = resources / "licenses"
-    shutil.copytree(args.native_prefix / "notices", notices)
+    notices.mkdir()
     shutil.copy2(root / "LICENSE", notices / "RAWmakase.txt")
     shutil.copy2(root / "licenses/Adobe-DNG-SDK.txt", notices)
     shutil.copy2(root / "licenses/Hack-MIT-BitstreamVera.txt", notices)
@@ -119,6 +118,16 @@ def main():
         relative = "@executable_path/../Frameworks/" if destination == executable else "@loader_path/"
         subprocess.run(["install_name_tool", "-change", old, relative + name, str(destination)], check=True)
 
+    # The ONNX Runtime that runs the subject selection model, opened lazily from
+    # here; it is signed with the rest, which hardened-runtime library validation
+    # requires of anything the app loads.
+    sys.path.insert(0, str(root / "packaging"))
+    import onnxruntime
+    runtime = onnxruntime.fetch("macos", run("lipo", "-archs", str(args.binary)).split()[0],
+                                frameworks, notices)
+    copies[runtime.resolve()] = runtime
+    subprocess.run(["install_name_tool", "-id", "@rpath/" + runtime.name, str(runtime)], check=True)
+
     # Preserve the exact Homebrew source/version metadata and upstream notices.
     for formula in sorted(formulae):
         info = json.loads(run("brew", "info", "--json=v2", formula))["formulae"][0]
@@ -129,11 +138,6 @@ def main():
         for item in prefix.iterdir():
             if item.is_file() and item.name.upper().startswith(("LICENSE", "COPYING", "COPYRIGHT", "README")):
                 shutil.copy2(item, folder)
-        if formula == "libomp":
-            version = info["versions"]["stable"]
-            for path, name in [("LICENSE.TXT", "LLVM-LICENSE.TXT"), ("openmp/LICENSE.TXT", "OpenMP-LICENSE.TXT")]:
-                url = f"https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-{version}/{path}"
-                (folder / name).write_bytes(urllib.request.urlopen(url, timeout=60).read())
 
     with (root / "packaging/macos/Info.plist").open("rb") as handle:
         metadata = plistlib.load(handle)

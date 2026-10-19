@@ -5,7 +5,7 @@
 use super::super::widgets::{modal_frame, primary_button};
 use super::Editor;
 use crate::app::theme;
-use crate::develop::unit_to_u8;
+use crate::rendered::unit_to_u8;
 use crate::watermark::{self, Align, Anchor, Size, Style, Watermark};
 use eframe::egui::{self, Color32, Sense, Vec2};
 use std::path::PathBuf;
@@ -50,10 +50,13 @@ impl Notice {
     }
 }
 impl WatermarkEditor {
-    pub(super) fn new(watermark: Watermark) -> Self {
-        // Installed fonts are listed off the interface thread.
-        std::thread::spawn(|| {
+    pub(super) fn new(watermark: Watermark, ctx: &egui::Context) -> Self {
+        // Installed fonts are listed off the interface thread, which is woken to
+        // draw them once they are.
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
             let _ = watermark::fonts::families();
+            ctx.request_repaint();
         });
         let original = (!watermark.name.is_empty()).then(|| watermark.name.clone());
         Self {
@@ -70,6 +73,7 @@ impl WatermarkEditor {
 
 impl Editor {
     pub(super) fn watermark_editor(&mut self, ctx: &egui::Context) {
+        let palette = theme::palette(ctx);
         let Some(mut state) = self.exports.watermark_editor.take() else {
             return;
         };
@@ -87,7 +91,7 @@ impl Editor {
         let mut delete = false;
         let response = egui::Modal::new(egui::Id::new("watermark-editor"))
             .backdrop_color(Color32::from_black_alpha(140))
-            .frame(modal_frame())
+            .frame(modal_frame(&palette))
             .show(ctx, |ui| {
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(WIDTH, HEIGHT), Sense::hover());
                 ui.painter().text(
@@ -95,7 +99,7 @@ impl Editor {
                     egui::Align2::LEFT_CENTER,
                     "Watermark Editor",
                     egui::FontId::proportional(16.),
-                    theme::gray(236),
+                    palette.gray(236),
                 );
                 let preview = egui::Rect::from_min_max(
                     rect.left_top() + Vec2::new(24., 52.),
@@ -143,7 +147,7 @@ impl Editor {
                         close = Some(false);
                         delete = true;
                     }
-                    ui.label(egui::RichText::new("Name").color(theme::gray(150)));
+                    ui.label(egui::RichText::new("Name").color(palette.gray(150)));
                     ui.add(
                         egui::TextEdit::singleline(&mut state.watermark.name)
                             .desired_width(200.)
@@ -164,7 +168,10 @@ impl Editor {
                 let graphic = state.watermark.style == Style::Graphic;
                 let source = state.source.clone().filter(|_| graphic);
                 if graphic && source.is_none() && state.watermark.image.is_none() {
-                    state.notice = Notice::Error("Choose a PNG or JPEG image".into());
+                    state.notice = Notice::Error(format!(
+                        "Choose a {} image",
+                        watermark::image_formats_named()
+                    ));
                     self.exports.watermark_editor = Some(state);
                     return;
                 }
@@ -230,9 +237,9 @@ impl Editor {
     fn update_previous(
         &mut self,
         name: &str,
-        change: impl FnOnce(&mut crate::export::ExportSettings),
+        change: impl FnOnce(&mut crate::export_settings::ExportSettings),
     ) {
-        if let Some(mut previous) = crate::export::ExportSettings::load()
+        if let Some(mut previous) = crate::export_settings::ExportSettings::load()
             && previous.watermark_name == name
         {
             change(&mut previous);
@@ -250,14 +257,15 @@ fn draw_preview(
     area: egui::Rect,
     photo: Option<(egui::TextureId, Vec2)>,
 ) {
-    ui.painter().rect_filled(area, 2., theme::gray(24));
+    let palette = theme::palette(ui.ctx());
+    ui.painter().rect_filled(area, 2., palette.gray(24));
     let Some((texture, size)) = photo.filter(|(_, s)| s.x > 0. && s.y > 0.) else {
         ui.painter().text(
             area.center(),
             egui::Align2::CENTER_CENTER,
             "Open a photo to preview the watermark",
             egui::FontId::proportional(12.),
-            theme::gray(130),
+            palette.gray(130),
         );
         return;
     };
@@ -315,7 +323,6 @@ fn mark_texture(
             && watermark::fonts::families_if_listed().is_none() =>
         {
             state.notice = Notice::LoadingFonts;
-            ui_repaint(ctx);
             return None;
         }
         _ => {
@@ -384,7 +391,7 @@ fn heading(ui: &mut egui::Ui, title: &str) {
         egui::Align2::LEFT_CENTER,
         title,
         egui::FontId::proportional(12.),
-        theme::gray(215),
+        theme::palette(ui.ctx()).gray(215),
     );
     ui.add_space(2.);
 }
@@ -405,7 +412,7 @@ fn row_of<R>(
         egui::Align2::RIGHT_CENTER,
         label,
         egui::FontId::proportional(12.),
-        theme::gray(150),
+        theme::palette(ui.ctx()).gray(150),
     );
     let controls = egui::Rect::from_min_max(
         egui::pos2(rect.left() + LABEL + GAP, rect.top()),
@@ -481,14 +488,17 @@ fn controls(ui: &mut egui::Ui, state: &mut WatermarkEditor, ctx: &egui::Context)
                     .and_then(|p| p.file_name())
                     .map(|n| n.to_string_lossy().into_owned())
                     .or_else(|| w.image.clone())
-                    .unwrap_or_else(|| "A PNG or JPEG image".into());
+                    .unwrap_or_else(|| format!("A {} image", watermark::image_formats_named()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Choose…").clicked() {
                         let picked = state.picked.clone();
                         let ctx = ctx.clone();
                         std::thread::spawn(move || {
                             if let Some(file) = rfd::FileDialog::new()
-                                .add_filter("PNG or JPEG", &["png", "jpg", "jpeg"])
+                                .add_filter(
+                                    watermark::image_formats_named(),
+                                    &watermark::image_extensions(),
+                                )
                                 .pick_file()
                                 && let Ok(mut slot) = picked.lock()
                             {
@@ -499,7 +509,9 @@ fn controls(ui: &mut egui::Ui, state: &mut WatermarkEditor, ctx: &egui::Context)
                     }
                     ui.add(
                         egui::Label::new(
-                            egui::RichText::new(name).size(12.).color(theme::gray(180)),
+                            egui::RichText::new(name)
+                                .size(12.)
+                                .color(theme::palette(ui.ctx()).gray(180)),
                         )
                         .truncate(),
                     );
@@ -516,9 +528,6 @@ fn controls(ui: &mut egui::Ui, state: &mut WatermarkEditor, ctx: &egui::Context)
             });
             // Installed fonts are still being listed at first: Inter until then.
             let listed = watermark::fonts::families_if_listed();
-            if listed.is_none() {
-                ui_repaint(ctx);
-            }
             let inter = [watermark::fonts::inter()];
             let families: &[watermark::fonts::Family] = listed.unwrap_or(&inter);
             row(ui, "Font", |ui| {
@@ -635,9 +644,4 @@ fn controls(ui: &mut egui::Ui, state: &mut WatermarkEditor, ctx: &egui::Context)
             w.rotation = (w.rotation + 3) % 4;
         }
     });
-}
-
-/// Asks for another frame soon, while something loads elsewhere.
-fn ui_repaint(ctx: &egui::Context) {
-    ctx.request_repaint_after(std::time::Duration::from_millis(250));
 }

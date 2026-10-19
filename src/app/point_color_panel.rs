@@ -4,38 +4,24 @@
 use super::state::{PointColorView, Tool, ViewState};
 use super::theme;
 use super::widgets::{name_history_step, set_edit_context, slider_with};
-use crate::develop::point_color::{MAX_SWATCHES, PointColor, PointColors, add_sample};
+use crate::model::point_color::{MAX_SWATCHES, PointColor};
+use crate::model::recipe::Recipe;
+use crate::{
+    app::Module,
+    develop::point_color::{PointColors, add_sample},
+};
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
-
-/// Whether the recipe's process renders Point Color (engine 4 with the measured curves).
-pub(super) fn renders_point_color(r: &crate::develop::Recipe) -> bool {
-    r.engine >= 4 && r.reference_curves
-}
-
-/// What Calibration still needs before Point Color and the targeted tools are on,
-/// worded to finish "… in Calibration to use …", or `None` when the process renders
-/// them. Its Update button is only shown below process 4, so it is named only then,
-/// and Reference tone curves whenever they are off: Update leaves them as they were.
-pub(super) fn point_color_steps(r: &crate::develop::Recipe) -> Option<&'static str> {
-    match (r.engine >= 4, r.reference_curves) {
-        (false, false) => Some("Update the process and turn on Reference tone curves"),
-        (false, true) => Some("Update the process"),
-        (true, false) => Some("Turn on Reference tone curves"),
-        (true, true) => None,
-    }
-}
 
 impl super::Editor {
     /// Whether Point Color's tab is where the photo is edited: Develop (not Before), a
     /// color photo with the current process, and the Color Mixer on its Point Color
     /// tab.
     pub(super) fn point_color_tab_shown(&self) -> bool {
-        let r = &self.document.recipe;
-        !self.library_mode
+        let r = self.document.edit.recipe();
+        self.module == Module::Develop
             && !self.view.compare.before_only()
             && self.view.mixer_tab == super::state::MixerTab::PointColor
-            && r.treatment() == crate::develop::Treatment::Color
-            && renders_point_color(r)
+            && r.treatment() == crate::model::recipe::Treatment::Color
     }
     /// Point Color's dropper at (`u`, `v`) of the shown photo: samples the color there
     /// off the UI thread (the render it needs can take a while on a large photo); the
@@ -51,7 +37,7 @@ impl super::Editor {
         }
         let (generation, cancel) = self.document.point_color_pick.start();
         let id = self.load.id();
-        let sampled = self.document.recipe.clone();
+        let sampled = self.document.edit.recipe().clone();
         let tx = self.tx.clone();
         let ctx = self.context.clone();
         std::thread::spawn(move || {
@@ -75,7 +61,7 @@ impl super::Editor {
     /// away; or says why not. A sample of a photo edited since is dropped.
     pub(super) fn point_color_sample_ready(
         &mut self,
-        sampled: &crate::develop::Recipe,
+        sampled: &Recipe,
         result: Result<[f32; 3], String>,
     ) {
         self.document.point_color_pick.invalidate();
@@ -83,7 +69,7 @@ impl super::Editor {
         if !self.view.is(Tool::PointColor) || !self.point_color_tab_shown() {
             return;
         }
-        if *sampled != self.document.recipe {
+        if *sampled != *self.document.edit.recipe() {
             self.status = "The photo changed while sampling; pick the color again".into();
             return;
         }
@@ -95,20 +81,18 @@ impl super::Editor {
             }
         };
         // A drag still under way is recorded first, so undoing it keeps the swatch.
-        if self.document.history.in_gesture() {
-            self.document.history.finish_gesture(&self.document.recipe);
-            self.document.save.mark_changed();
+        if self.document.edit.history().in_gesture() {
+            self.document.edit.finish_gesture();
         }
-        let old = self.document.recipe.clone();
-        match add_sample(&mut self.document.recipe.point_colors, source) {
+        let mut swatches = self.document.edit.recipe().point_colors.clone();
+        match add_sample(&mut swatches, source) {
             Ok(i) => {
+                // Selected, with the dropper put away, before the render is
+                // scheduled: Visualize Range shows the new swatch.
                 self.view.point_color.selected = Some(i);
                 self.view.tool = Tool::None;
-                self.document
-                    .history
-                    .label(super::history::Step::new("Point Color", "Add Swatch"));
-                self.history(old);
-                self.schedule();
+                let step = super::history::Step::new("Point Color", "Add Swatch");
+                self.change_edit(Some(step), |r| r.point_colors = swatches);
             }
             Err(refusal) => self.status = refusal.message().into(),
         }
@@ -171,6 +155,7 @@ fn swatch_row(
     pc: &mut PointColorView,
     picking: bool,
 ) -> bool {
+    let palette = theme::palette(ui.ctx());
     let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 30.), Sense::hover());
     let dropper = Rect::from_center_size(
         Pos2::new(row.left() + 70., row.center().y),
@@ -179,7 +164,7 @@ fn swatch_row(
     let response = ui.interact(dropper, ui.id().with("point-color-dropper"), Sense::click());
     if picking || response.hovered() {
         ui.painter()
-            .rect_filled(dropper, 3., theme::gray(if picking { 72 } else { 50 }));
+            .rect_filled(dropper, 3., palette.gray(if picking { 72 } else { 50 }));
     }
     let strong = picking || response.hovered();
     super::icons::paint_at(
@@ -187,7 +172,7 @@ fn swatch_row(
         super::icons::Icon::Eyedropper,
         dropper.center(),
         14.,
-        theme::gray(if strong { 235 } else { 170 }),
+        palette.gray(if strong { 235 } else { 170 }),
     );
     let toggle = response
         .on_hover_text("Point Color dropper: click a color in the photo to add a swatch")
@@ -201,7 +186,7 @@ fn swatch_row(
         );
         let Some(swatch) = list.get(slot) else {
             ui.painter()
-                .circle_stroke(center, 7., Stroke::new(1., theme::gray(60)));
+                .circle_stroke(center, 7., Stroke::new(1., palette.gray(60)));
             continue;
         };
         let rect = Rect::from_center_size(center, Vec2::splat(step));
@@ -210,7 +195,7 @@ fn swatch_row(
             .circle_filled(center, 8., display(swatch.source_prophoto()));
         if pc.selected == Some(slot) {
             ui.painter()
-                .circle_stroke(center, 10.5, Stroke::new(1.5, theme::gray(215)));
+                .circle_stroke(center, 10.5, Stroke::new(1.5, palette.gray(215)));
         }
         if response.clicked() {
             pc.selected = Some(slot);
@@ -310,6 +295,7 @@ fn range_points(
     default: [f32; 4],
     color: &dyn Fn(f32) -> Color32,
 ) {
+    let palette = theme::palette(ui.ctx());
     let before = *points;
     ui.push_id(label, |ui| {
         let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 26.), Sense::hover());
@@ -318,7 +304,7 @@ fn range_points(
             egui::Align2::RIGHT_CENTER,
             label,
             egui::FontId::proportional(11.),
-            theme::gray(190),
+            palette.gray(190),
         );
         let area = Rect::from_min_max(Pos2::new(row.left() + 88., row.top()), row.max);
         let rail = Rect::from_min_max(
@@ -362,7 +348,7 @@ fn range_points(
             Pos2::new(x(points[3]), rail.bottom() + 5.),
         ];
         ui.painter()
-            .line(shape.to_vec(), Stroke::new(1., theme::gray(215)));
+            .line(shape.to_vec(), Stroke::new(1., palette.gray(215)));
         for (k, t) in points.iter().enumerate() {
             let c = Pos2::new(x(*t), rail.bottom() + 6.);
             let triangle = vec![c, c + Vec2::new(-4., 6.), c + Vec2::new(4., 6.)];
@@ -370,11 +356,11 @@ fn range_points(
             ui.painter().add(egui::Shape::convex_polygon(
                 triangle,
                 if inner {
-                    theme::gray(215)
+                    palette.gray(215)
                 } else {
-                    theme::gray(40)
+                    palette.gray(40)
                 },
-                Stroke::new(1., theme::gray(215)),
+                Stroke::new(1., palette.gray(215)),
             ));
         }
         response.on_hover_text("Drag the outer or inner points · double-click to reset");
@@ -421,8 +407,12 @@ fn disclosure(ui: &mut egui::Ui, open: &mut bool) {
         let text = if *open { "▾ Ranges" } else { "▸ Ranges" };
         if ui
             .add(
-                egui::Label::new(egui::RichText::new(text).size(11.).color(theme::gray(190)))
-                    .sense(Sense::click()),
+                egui::Label::new(
+                    egui::RichText::new(text)
+                        .size(11.)
+                        .color(theme::palette(ui.ctx()).gray(190)),
+                )
+                .sense(Sense::click()),
             )
             .on_hover_text("Hue, Sat and Lum Range")
             .clicked()
@@ -435,13 +425,17 @@ fn disclosure(ui: &mut egui::Ui, open: &mut bool) {
 fn hint(ui: &mut egui::Ui, text: &str) {
     ui.horizontal(|ui| {
         ui.add_space(88.);
-        ui.label(egui::RichText::new(text).size(11.).color(theme::gray(150)));
+        ui.label(
+            egui::RichText::new(text)
+                .size(11.)
+                .color(theme::palette(ui.ctx()).gray(150)),
+        );
     });
 }
 
 /// HSV of linear ProPhoto RGB (hue in radians) as a display color.
 fn hsv(h: f32, s: f32, v: f32) -> Color32 {
-    display(crate::develop::point_color::hsv_to_rgb(h, s, v))
+    display(crate::color::hsv::hsv_to_rgb(h, s, v))
 }
 
 /// Linear ProPhoto RGB as an sRGB display color.
@@ -472,31 +466,5 @@ mod tests {
         assert_eq!(nearest(&stacked, 0.02), 1);
         assert_eq!(nearest(&stacked, 0.), 0);
         assert_eq!(nearest(&stacked, 0.7), 2);
-    }
-
-    /// The steps name only controls Calibration shows: Update below process 4, and
-    /// Reference tone curves while they are off, which Update does not turn on.
-    #[test]
-    fn point_color_steps_name_the_controls_that_are_there() {
-        use crate::develop::Recipe;
-        let cases = [
-            (
-                3,
-                false,
-                Some("Update the process and turn on Reference tone curves"),
-            ),
-            (3, true, Some("Update the process")),
-            (4, false, Some("Turn on Reference tone curves")),
-            (4, true, None),
-        ];
-        for (engine, reference_curves, steps) in cases {
-            let r = Recipe {
-                engine,
-                reference_curves,
-                ..Default::default()
-            };
-            assert_eq!(point_color_steps(&r), steps, "engine {engine}");
-            assert_eq!(renders_point_color(&r), steps.is_none(), "engine {engine}");
-        }
     }
 }

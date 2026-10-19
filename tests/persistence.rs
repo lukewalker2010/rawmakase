@@ -1,6 +1,11 @@
 //! Public API regressions, with relative-path work isolated in a child process.
 use anyhow::Result;
-use rawmakase::{catalog::Catalog, develop::Recipe, export::ExportOptions, presets, storage};
+use rawmakase::{
+    catalog::{Catalog, legacy_sidecar},
+    export_settings::ExportOptions,
+    model::recipe::Recipe,
+    presets, storage,
+};
 use std::{fs, path::Path, process::Command};
 
 #[test]
@@ -30,12 +35,17 @@ fn relative_paths_child() -> Result<()> {
         exposure: 0.75,
         ..Default::default()
     };
-    presets::save_preset(Path::new("preset.json"), &recipe)?;
-    assert_eq!(presets::load_preset(Path::new("preset.json"))?, recipe);
-    fs::write("photo.ARW", b"identity fixture")?;
-    storage::save(Path::new("photo.ARW"), &recipe, &ExportOptions::default())?;
+    presets::save_preset(Path::new("preset.json"), &recipe, &Default::default())?;
     assert_eq!(
-        storage::load(Path::new("photo.ARW"))?.unwrap().recipe,
+        presets::load_preset(Path::new("preset.json"))?.recipe,
+        recipe
+    );
+    fs::write("photo.ARW", b"identity fixture")?;
+    legacy_sidecar::save(Path::new("photo.ARW"), &recipe, &ExportOptions::default())?;
+    assert_eq!(
+        legacy_sidecar::load(Path::new("photo.ARW"))?
+            .unwrap()
+            .recipe,
         recipe
     );
     assert_eq!(storage::list_raws(Path::new("photo.ARW"))?.len(), 1);
@@ -56,7 +66,7 @@ fn malformed_legacy_recipes_are_errors_and_original_bytes_survive() -> Result<()
     let raw = dir.path().join("photo.ARW");
     fs::write(&raw, b"identity fixture")?;
     let preset = dir.path().join("preset.json");
-    let sidecar = storage::sidecar_path(&raw);
+    let sidecar = legacy_sidecar::sidecar_path(&raw);
     for version in [1, 2, 3, 4, 999] {
         for recipe in [
             serde_json::Value::Null,
@@ -70,8 +80,10 @@ fn malformed_legacy_recipes_are_errors_and_original_bytes_survive() -> Result<()
             fs::write(&preset, &bytes)?;
             fs::write(&sidecar, &bytes)?;
             assert!(presets::load_preset(&preset).is_err());
-            assert!(storage::load(&raw).is_err());
-            assert!(storage::save(&raw, &Recipe::default(), &ExportOptions::default()).is_err());
+            assert!(legacy_sidecar::load(&raw).is_err());
+            assert!(
+                legacy_sidecar::save(&raw, &Recipe::default(), &ExportOptions::default()).is_err()
+            );
             assert_eq!(fs::read(&sidecar)?, bytes);
         }
     }
@@ -84,7 +96,7 @@ fn invalid_export_defaults_never_replace_saved_edits() -> Result<()> {
     let raw = dir.path().join("photo.ARW");
     fs::write(&raw, b"identity fixture")?;
     let recipe = Recipe::default();
-    let sidecar = storage::save(&raw, &recipe, &ExportOptions::default())?;
+    let sidecar = legacy_sidecar::save(&raw, &recipe, &ExportOptions::default())?;
     let original = fs::read(&sidecar)?;
     let mut catalog = Catalog::create(&dir.path().join("photos.rawmakase"))?;
     catalog.add_folder(dir.path())?;
@@ -110,7 +122,7 @@ fn invalid_export_defaults_never_replace_saved_edits() -> Result<()> {
             max_edge: 30_001,
         },
     ] {
-        assert!(storage::save(&raw, &recipe, &options).is_err());
+        assert!(legacy_sidecar::save(&raw, &recipe, &options).is_err());
         assert_eq!(fs::read(&sidecar)?, original);
         assert!(
             catalog
@@ -127,11 +139,12 @@ fn invalid_export_defaults_never_replace_saved_edits() -> Result<()> {
         assert_eq!(saved.export.quality, 92);
         assert_eq!(saved.export.max_edge, 0);
     }
-    let db = rusqlite::Connection::open(&catalog.path)?;
+    let rawmakase::catalog::CatalogLocation::File(path) = catalog.location().clone();
+    let db = rusqlite::Connection::open(&path)?;
     let corrupt_options = r#"{"quality":0,"max_edge":0}"#;
     db.execute(
         "UPDATE photos SET export_options=? WHERE id=?",
-        rusqlite::params![corrupt_options, id],
+        rusqlite::params![corrupt_options, id.0],
     )?;
     assert!(catalog.load_edit(id, &raw).is_err());
     assert!(
@@ -147,7 +160,7 @@ fn invalid_export_defaults_never_replace_saved_edits() -> Result<()> {
     );
     let preserved: String = db.query_row(
         "SELECT export_options FROM photos WHERE id=?",
-        [id],
+        [id.0],
         |row| row.get(0),
     )?;
     assert_eq!(preserved, corrupt_options);

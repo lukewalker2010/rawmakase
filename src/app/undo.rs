@@ -6,18 +6,13 @@
 use super::Editor;
 use super::history::{Recorded, Step};
 use super::library::{CollectionCommand, DescriptiveCommand, Library, MetadataCommand, Place};
+use crate::app::Module;
+use crate::catalog::PhotoId;
 use anyhow::Result;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Commands kept, as many as History keeps steps.
 const LIMIT: usize = 100;
-
-/// A number that orders commands made in the same frame.
-pub(super) fn sequence() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    NEXT.fetch_add(1, Ordering::Relaxed)
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Command {
@@ -25,7 +20,7 @@ pub(super) enum Command {
     /// open in Develop when it was made there; it is undone there.
     Metadata {
         change: Box<MetadataCommand>,
-        develop: Option<i64>,
+        develop: Option<PhotoId>,
     },
     /// Photos added to or taken out of a collection, e.g. the Quick
     /// Collection; undone in the Library.
@@ -36,12 +31,52 @@ pub(super) enum Command {
     /// A Develop step or History click on `photo` (`None`: a file outside
     /// the catalog), in the History identified by `history`.
     Develop {
-        photo: Option<i64>,
+        photo: Option<PhotoId>,
         history: u64,
         change: Box<Recorded>,
     },
     /// Settings synchronized to several photos at once; undone and redone together.
     Sync(Box<super::sync::SyncCommand>),
+}
+
+impl Command {
+    /// Takes photo `id` out of the command; false when nothing of it is left.
+    fn forget_photo(&mut self, id: PhotoId) -> bool {
+        match self {
+            Command::Metadata { change, develop } => {
+                // Made in Develop on that photo, which is gone: undone in the Library.
+                if *develop == Some(id) {
+                    *develop = None;
+                }
+                change.before.retain(|m| m.0 != id);
+                change.after.retain(|m| m.0 != id);
+                change.place_before.forget_photo(id);
+                change.place_after.forget_photo(id);
+                !change.before.is_empty()
+            }
+            Command::Collection(change) => {
+                change.added.retain(|p| *p != id);
+                change.removed.retain(|p| *p != id);
+                change.place_before.forget_photo(id);
+                change.place_after.forget_photo(id);
+                !(change.added.is_empty() && change.removed.is_empty())
+            }
+            Command::Descriptive(change) => {
+                change.before.retain(|s| s.photo != id);
+                change.after.retain(|s| s.photo != id);
+                change.ratings_before.retain(|m| m.0 != id);
+                change.ratings_after.retain(|m| m.0 != id);
+                change.place_before.forget_photo(id);
+                change.place_after.forget_photo(id);
+                !change.before.is_empty()
+            }
+            Command::Develop { photo, .. } => *photo != Some(id),
+            Command::Sync(sync) => {
+                sync.edits.retain(|e| e.id != id);
+                !sync.edits.is_empty()
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -57,13 +92,13 @@ impl UndoLog {
         self.undo.push_back(command);
         self.redo.clear();
     }
-    /// Drops commands that wrote a photo now removed, so its id, if a new photo gets
-    /// it, is never written by them.
-    pub(super) fn forget_photo(&mut self, id: i64) {
-        let touches =
-            |c: &Command| matches!(c, Command::Sync(s) if s.edits.iter().any(|e| e.id == id));
-        self.undo.retain(|c| !touches(c));
-        self.redo.retain(|c| !touches(c));
+    /// Takes a photo now removed out of every command, Undo's and Redo's alike: the
+    /// catalog can give its id to the next photo added, which no command made
+    /// before may then write. A command with nothing else left is dropped; one that
+    /// also changed other photos keeps undoing and redoing those.
+    pub(super) fn forget_photo(&mut self, id: PhotoId) {
+        self.undo.retain_mut(|c| c.forget_photo(id));
+        self.redo.retain_mut(|c| c.forget_photo(id));
     }
     pub(super) fn clear(&mut self) {
         self.undo.clear();
@@ -92,10 +127,10 @@ impl Editor {
     /// they were made.
     pub(super) fn sync_undo(&mut self) {
         let photo = self.document.catalog_photo;
-        let history = self.document.history.id();
+        let history = self.document.edit.history().id();
         let mut commands: Vec<(u64, Command)> = self
             .document
-            .history
+            .edit
             .take_recorded()
             .into_iter()
             .map(|change| {
@@ -110,7 +145,11 @@ impl Editor {
             })
             .collect();
         if let Some(library) = &mut self.library {
-            let develop = if self.library_mode { None } else { photo };
+            let develop = if self.module == Module::Library {
+                None
+            } else {
+                photo
+            };
             commands.extend(library.take_done().into_iter().map(|change| {
                 (
                     change.sequence,
@@ -141,7 +180,12 @@ impl Editor {
     /// Records a drag still in progress as a step, in the log, so it is undone in
     /// its place; the rest of the drag becomes a step of its own.
     pub(super) fn finish_gesture(&mut self) {
-        self.document.history.finish_gesture(&self.document.recipe);
+        self.document.edit.finish_gesture();
+        self.sync_undo();
+    }
+    /// [`Self::finish_gesture`] for a gesture whose state was just saved.
+    pub(super) fn finish_saved_gesture(&mut self) {
+        self.document.edit.finish_saved_gesture();
         self.sync_undo();
     }
     /// Waits while Sync writes edits, which Undo could otherwise race.
@@ -233,7 +277,7 @@ impl Editor {
                 if !self.flush() {
                     return false;
                 }
-                let Some(library) = &self.library else {
+                let Some(library) = &mut self.library else {
                     return false;
                 };
                 let side = match direction {
@@ -241,8 +285,13 @@ impl Editor {
                     Direction::Redo => super::sync::SyncSide::After,
                 };
                 // Each photo where it is now, after any relink since the Sync.
-                let path = |id: i64| library.photo(id).map(|p| p.path.clone());
-                match super::sync::restore(&library.catalog, &sync.edits, side, path) {
+                let paths: std::collections::HashMap<PhotoId, std::path::PathBuf> = sync
+                    .edits
+                    .iter()
+                    .filter_map(|e| Some((e.id, library.photo(e.id)?.path.clone())))
+                    .collect();
+                let path = |id: PhotoId| paths.get(&id).cloned();
+                match super::sync::restore(&mut library.session.catalog, &sync.edits, side, path) {
                     Ok(()) => {}
                     // Nothing to return to: the command is used up, not retried.
                     Err(e @ super::sync::SyncRestoreError::PhotoRemoved) => {
@@ -257,15 +306,10 @@ impl Editor {
                 if let Some(library) = &mut self.library {
                     library.edits_changed(sync.edits.iter().map(|e| e.id));
                 }
-                // A synchronized photo open here opens again with what was written
-                // back (or with no edit at all), so nothing stale is saved over it.
-                if let Some(open) = self.document.catalog_photo
-                    && sync.edits.iter().any(|e| e.id == open)
-                    && let Some(path) = self.document.path.clone()
-                {
-                    self.document.save.saved();
-                    self.load_raw(path, Some(open));
-                }
+                let changed: Vec<_> = sync.edits.iter().map(|e| e.id).collect();
+                self.refresh_previews(&changed);
+                // Written back, or with no edit at all.
+                self.reopen_synced(&changed);
                 self.status = format!(
                     "{verb} {} ({})",
                     sync.change.name(),
@@ -284,22 +328,21 @@ impl Editor {
                 };
                 // The History that recorded it goes back to the exact state;
                 // the same photo opened again since gets the recipe as a step.
-                let same_history = self.document.history.id() == *history;
+                let same_history = self.document.edit.history().id() == *history;
                 let reopened = photo.is_some()
                     && self.document.catalog_photo == *photo
                     && self.document.path.is_some();
                 if same_history || reopened {
-                    self.library_mode = false;
+                    self.module = Module::Develop;
                     let step = Step::new(verb, "");
-                    let history = &mut self.document.history;
                     if same_history {
-                        history.restore(at, target, &mut self.document.recipe, step);
+                        self.document.edit.restore(at, target, step);
                     } else {
-                        history.set(target, &mut self.document.recipe, step);
+                        self.document.edit.set(target, step);
                     }
                     // Not a change of its own for the log.
-                    self.document.history.take_recorded();
-                    self.document.save.mark_changed();
+                    self.document.edit.take_recorded();
+                    self.document.edit.save_state_mut().mark_changed();
                     self.ensure_upright();
                     self.schedule();
                     self.status = format!("{verb} in Develop");
@@ -315,23 +358,27 @@ impl Editor {
                 if !self.flush() {
                     return false;
                 }
-                let Some(library) = &self.library else {
+                let Some(library) = &mut self.library else {
                     return false;
                 };
                 let Some(path) = library.photo(id).map(|p| p.path.clone()) else {
                     self.status = format!("{verb}: that photo is no longer in the catalog");
                     return true;
                 };
-                let saved = library.catalog.load_edit(id, &path).and_then(|edit| {
-                    let export = edit.map(|e| e.export).unwrap_or_default();
-                    library.catalog.save_edit(
-                        id,
-                        &path,
-                        target,
-                        &export,
-                        crate::catalog::HistoryUpdate::Keep,
-                    )
-                });
+                let saved = library
+                    .session
+                    .catalog
+                    .load_edit(id, &path)
+                    .and_then(|edit| {
+                        let export = edit.map(|e| e.export).unwrap_or_default();
+                        library.session.catalog.save_edit(
+                            id,
+                            &path,
+                            target,
+                            &export,
+                            crate::catalog::HistoryUpdate::Keep,
+                        )
+                    });
                 if let Err(e) = saved {
                     self.status = format!("{verb} failed: {e}");
                     return false;
@@ -349,7 +396,7 @@ impl Editor {
         verb: &str,
         summary: &str,
         place: &Place,
-        develop: Option<i64>,
+        develop: Option<PhotoId>,
         write: impl FnOnce(&mut Library) -> Result<()>,
     ) -> bool {
         // Leaving the open photo saves it first; if that fails, the command
@@ -367,7 +414,7 @@ impl Editor {
         match develop {
             Some(photo) => self.show_in_develop(photo),
             None => {
-                self.library_mode = true;
+                self.module = Module::Library;
                 if let Some(library) = &mut self.library {
                     library.go_to_place(place);
                 }
@@ -381,9 +428,9 @@ impl Editor {
         true
     }
     /// Shows `photo` in Develop, keeping its edit when it is already open.
-    fn show_in_develop(&mut self, photo: i64) {
+    fn show_in_develop(&mut self, photo: PhotoId) {
         if self.document.catalog_photo == Some(photo) && self.document.path.is_some() {
-            self.library_mode = false;
+            self.module = Module::Develop;
             if let Some(library) = &mut self.library {
                 library.make_active(photo);
             }

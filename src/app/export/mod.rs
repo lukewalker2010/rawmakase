@@ -6,16 +6,19 @@
 mod dialog;
 mod watermark_editor;
 
+use crate::app::Module;
+use crate::catalog::PhotoId;
+
 use super::{Editor, worker::Event};
 use crate::app::theme;
 use crate::app::widgets::plural;
 use crate::export::{
-    Existing, ExportSettings,
     assemble::Values,
     batch::{self, BatchPhoto, Edit, Outcome, Unplanned},
     job::Photo,
     queue::Queue,
 };
+use crate::export_settings::{Existing, ExportSettings};
 use eframe::egui::{self, Color32, Sense, Vec2};
 use std::{
     collections::HashMap,
@@ -27,7 +30,7 @@ use std::{
 #[derive(Clone, Debug)]
 struct Chosen {
     /// Its catalog id; `None` for a photo opened without a catalog.
-    id: Option<i64>,
+    id: Option<PhotoId>,
     source: PathBuf,
     name: String,
     /// The photo open in Develop: exported with its edit as shown.
@@ -62,7 +65,7 @@ struct Queued {
     names: Vec<String>,
     left_out: Vec<(String, String)>,
     /// What happens once it is written.
-    after: crate::export::AfterExport,
+    after: crate::export_settings::AfterExport,
 }
 
 /// What finished exports could not do, kept until it is dismissed.
@@ -122,6 +125,14 @@ pub(super) struct Exports {
     watermarks: Vec<crate::watermark::Watermark>,
 }
 
+impl Exports {
+    /// Stops the export queue at exit, cancelling the running batch; its thread,
+    /// to wait for.
+    pub(super) fn close(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.queue.as_mut().and_then(Queue::close)
+    }
+}
+
 impl Editor {
     /// Export…: the dialog for the photos chosen now, starting from the last
     /// export's choices.
@@ -165,7 +176,7 @@ impl Editor {
     fn export_scope(&mut self) -> Option<Scope> {
         let open = self.document.catalog_photo;
         let ids = match &self.library {
-            Some(l) if self.library_mode => l.selected_photos(),
+            Some(l) if self.module == Module::Library => l.selected_photos(),
             Some(l) => match open {
                 Some(open) if l.is_selected(open) => l.selected_photos(),
                 Some(open) => vec![open],
@@ -253,11 +264,11 @@ impl Editor {
             Some("its Lightroom edit is still being applied")
         } else if d.auto.is_running() {
             Some("Auto is still working on it")
-        } else if d.save.is_protected() {
+        } else if d.edit.save_state().is_protected() {
             Some("its edit is protected, as the file changed since it was saved")
         } else if self.importing.is_some() {
             Some("camera profiles are still being imported")
-        } else if d.upright.is_running() || d.recipe.upright.needs_analysis() {
+        } else if d.upright.is_running() || d.edit.recipe().upright.needs_analysis() {
             Some("Upright is still analysing it")
         } else {
             None
@@ -272,21 +283,25 @@ impl Editor {
             .and_then(|id| self.library.as_ref()?.photo(id));
         let values = match (catalog, self.library.as_ref()) {
             (Some(p), Some(library)) => {
-                let read = library.catalog.descriptive(p.id).and_then(|descriptive| {
-                    let keywords = library.catalog.keywords(p.id)?;
-                    Ok(Values {
-                        descriptive,
-                        keywords: keywords
-                            .into_iter()
-                            .map(|k| crate::xmp::write::KeywordPath {
-                                path: k.path,
-                                exported: k.exported,
-                            })
-                            .collect(),
-                        rating: p.rating,
-                        label: p.label.clone(),
-                    })
-                });
+                let read = library
+                    .session
+                    .catalog
+                    .descriptive(p.id)
+                    .and_then(|descriptive| {
+                        let keywords = library.session.catalog.keywords(p.id)?;
+                        Ok(Values {
+                            descriptive,
+                            keywords: keywords
+                                .into_iter()
+                                .map(|k| crate::xmp::write::KeywordPath {
+                                    path: k.path,
+                                    exported: k.exported,
+                                })
+                                .collect(),
+                            rating: p.rating,
+                            label: p.label.clone(),
+                        })
+                    });
                 read.map_err(|e| format!("Metadata could not be read for export: {e}"))
             }
             _ => Ok(Values::default()),
@@ -301,9 +316,10 @@ impl Editor {
         Some(Photo {
             image: self.document.full()?.clone(),
             source: self.document.path.clone()?,
-            recipe: self.document.recipe.clone(),
+            recipe: self.document.edit.recipe().clone(),
             values,
             watermark: None,
+            demosaic: self.demosaic,
         })
     }
 
@@ -354,9 +370,9 @@ impl Editor {
 
     /// The scope's photos as the catalog has them now, read in one transaction.
     fn batch_photos(&self, scope: &Scope, unsaved: bool) -> anyhow::Result<Vec<BatchPhoto>> {
-        let ids: Vec<i64> = scope.photos.iter().filter_map(|p| p.id).collect();
+        let ids: Vec<PhotoId> = scope.photos.iter().filter_map(|p| p.id).collect();
         let mut records = match &self.library {
-            Some(l) if !ids.is_empty() => l.catalog.photo_records(&ids)?.into_iter(),
+            Some(l) if !ids.is_empty() => l.session.catalog.photo_records(&ids)?.into_iter(),
             _ => Vec::new().into_iter(),
         };
         Ok(scope
@@ -370,7 +386,6 @@ impl Editor {
                         chosen.name.clone(),
                     ),
                     None => BatchPhoto {
-                        id: 0,
                         source: chosen.source.clone(),
                         name: chosen.name.clone(),
                         edit: Edit::Catalog(Default::default()),
@@ -382,7 +397,7 @@ impl Editor {
                 photo.place = Some((chosen.place, scope.chosen));
                 if chosen.open {
                     photo.edit = Edit::Shown {
-                        recipe: Box::new(self.document.recipe.clone()),
+                        recipe: Box::new(self.document.edit.recipe().clone()),
                         unsaved,
                         file: self.document.file.clone(),
                     };
@@ -406,6 +421,7 @@ impl Editor {
                     settings: pending.settings,
                     defaults: self.raw_defaults.clone(),
                     watermark: pending.watermark,
+                    demosaic: self.demosaic,
                 };
                 let ticket = self.export_queue().submit(batch);
                 self.exports.queued.insert(
@@ -476,7 +492,7 @@ impl Editor {
             None => summary.line(),
         };
         // After the summary, so a file manager that can't be opened is said.
-        if queued.after == crate::export::AfterExport::Show {
+        if queued.after == crate::export_settings::AfterExport::Show {
             self.show_exported(&exported);
         }
         // Unread reports add up until they are dismissed: a later export that went
@@ -494,6 +510,7 @@ impl Editor {
     /// waiting; after one that could not export everything, what it could not do,
     /// until it is read.
     pub(super) fn export_progress(&mut self, ui: &mut egui::Ui) {
+        let palette = theme::palette(ui.ctx());
         let status = self.exports.queue.as_ref().map(Queue::status);
         let Some((ticket, progress)) = status.as_ref().and_then(|s| s.running) else {
             self.export_summary(ui);
@@ -512,14 +529,14 @@ impl Editor {
             egui::Align2::LEFT_CENTER,
             label,
             egui::FontId::proportional(11.),
-            theme::gray(190),
+            palette.gray(190),
         );
         let fraction = (progress.done as f32 + progress.fraction) / progress.total.max(1) as f32;
         let bar = egui::Rect::from_min_size(
             egui::pos2(rect.left(), rect.top() + 17.),
             Vec2::new(rect.width() - 26., 4.),
         );
-        painter.rect_filled(bar, 2., theme::gray(50));
+        painter.rect_filled(bar, 2., palette.gray(50));
         painter.rect_filled(
             egui::Rect::from_min_size(bar.min, Vec2::new(bar.width() * fraction.min(1.), 4.)),
             2.,
@@ -547,7 +564,7 @@ impl Editor {
         let cancel = ui
             .interact(close, ui.id().with("cancel-export"), Sense::click())
             .on_hover_text("Cancel export");
-        let color = theme::gray(if cancel.hovered() { 235 } else { 150 });
+        let color = palette.gray(if cancel.hovered() { 235 } else { 150 });
         crate::app::icons::paint_at(
             ui.painter(),
             crate::app::icons::Icon::Close,
@@ -560,8 +577,6 @@ impl Editor {
         {
             queue.cancel(ticket);
         }
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(200));
     }
 
     /// The last export's report line, which opens Problem Exporting Files.
@@ -584,6 +599,7 @@ impl Editor {
     /// Lightroom's Problem Exporting Files: the photos not exported, by reason, and
     /// the notes on those that were.
     pub(super) fn export_report(&mut self, ctx: &egui::Context) {
+        let palette = theme::palette(ctx);
         if !self.exports.report {
             return;
         }
@@ -594,20 +610,20 @@ impl Editor {
         let mut close = false;
         let mut dismiss = false;
         let response = egui::Modal::new(egui::Id::new("export-report"))
-            .frame(super::widgets::modal_frame().inner_margin(24))
+            .frame(super::widgets::modal_frame(&palette).inner_margin(24))
             .show(ctx, |ui| {
                 ui.set_width(520.);
                 ui.label(
                     egui::RichText::new("Problem Exporting Files")
                         .size(15.)
-                        .color(theme::gray(236)),
+                        .color(palette.gray(236)),
                 );
                 ui.add_space(6.);
                 if !summary.problems.is_empty() {
                     ui.label(
                         egui::RichText::new("Some export operations were not performed.")
                             .size(12.)
-                            .color(theme::gray(170)),
+                            .color(palette.gray(170)),
                     );
                 }
                 ui.add_space(8.);
@@ -621,12 +637,16 @@ impl Editor {
                             if rows.is_empty() {
                                 continue;
                             }
-                            ui.label(egui::RichText::new(title).size(12.).color(theme::gray(220)));
+                            ui.label(
+                                egui::RichText::new(title)
+                                    .size(12.)
+                                    .color(palette.gray(220)),
+                            );
                             for (name, reason) in rows {
                                 ui.label(
                                     egui::RichText::new(format!("{name}: {reason}"))
                                         .size(12.)
-                                        .color(theme::gray(160)),
+                                        .color(palette.gray(160)),
                                 );
                             }
                             ui.add_space(8.);

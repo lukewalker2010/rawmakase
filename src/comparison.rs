@@ -1,8 +1,6 @@
 //! Reproducible, unscaled comparisons against an externally rendered sRGB reference.
-use crate::{
-    develop::{self, Recipe},
-    raw::Raw,
-};
+use crate::develop;
+use crate::model::recipe::Recipe;
 use anyhow::{Result, ensure};
 use std::{path::Path, sync::atomic::AtomicBool};
 pub fn compare(
@@ -16,17 +14,20 @@ pub fn compare(
         !output.exists(),
         "Comparison output directory already exists"
     );
-    let raw = Raw::open(input)?;
+    let raw = crate::photo::open(input)?;
     let edit = if let Some(p) = recipe {
-        crate::presets::load_preset(p)?
+        crate::presets::load_preset(p)?.recipe
     } else {
         Recipe::with_profiles(
             &raw.metadata,
             &crate::camera_profiles::installed(&raw.metadata).0,
         )
     };
-    let image = raw.develop(crate::raw::Decode::full(), &AtomicBool::new(false))?;
-    let render = develop::render(&image, &edit, 0)?;
+    let image = raw.develop(
+        crate::camera_data::Decode::full(Default::default()),
+        &AtomicBool::new(false),
+    )?;
+    let render = develop::render(&image, &edit.checked()?, 0)?;
     let reference = image::open(reference)?.to_rgb32f();
     ensure!(
         (reference.width(), reference.height()) == (render.width, render.height),
@@ -78,12 +79,12 @@ pub fn compare(
         }
     }
     let mse = squared / n;
-    let report = serde_json::json!({"camera":format!("{} {}",image.metadata.make,image.metadata.model),"engine":edit.engine,"profile":edit.profile.as_ref().map(|p|&p.name),"width":render.width,"height":render.height,"crop":[x,y,size,size],"mean_absolute_error_srgb":absolute/n,"rmse_srgb":mse.sqrt(),"psnr_db":if mse>0.{Some(-10.*mse.log10())}else{None},"notes":"Reference must use sRGB and matching white balance, exposure, geometry and lens corrections. Metrics measure differences, not subjective quality. No alignment or exposure matching is applied."});
+    let report = serde_json::json!({"camera":format!("{} {}",image.metadata.make,image.metadata.model),"profile":edit.profile.as_ref().map(|p|&p.name),"width":render.width,"height":render.height,"crop":[x,y,size,size],"mean_absolute_error_srgb":absolute/n,"rmse_srgb":mse.sqrt(),"psnr_db":if mse>0.{Some(-10.*mse.log10())}else{None},"notes":"Reference must use sRGB and matching white balance, exposure, geometry and lens corrections. Metrics measure differences, not subjective quality. No alignment or exposure matching is applied."});
     std::fs::write(
         output.join("report.json"),
         serde_json::to_vec_pretty(&report)?,
     )?;
-    crate::presets::save_preset(&output.join("recipe.json"), &edit)?;
+    crate::presets::save_preset(&output.join("recipe.json"), &edit, &image.metadata)?;
     println!("Comparison written to {}", output.display());
     Ok(())
 }

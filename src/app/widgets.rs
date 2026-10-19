@@ -1,6 +1,8 @@
 use crate::app::icons::{self, Icon};
 use crate::app::theme;
-use crate::develop::panels::PanelState;
+use crate::develop::effects::EffectsRendering;
+use crate::model::panels::PanelState;
+use crate::model::params::{self, LocalParameterId, ParameterId, format_value};
 use eframe::egui::{self, Color32, Pos2, Rect, Sense, Stroke, Vec2};
 
 pub(super) fn toolbar_divider(ui: &mut egui::Ui) {
@@ -10,7 +12,7 @@ pub(super) fn toolbar_divider(ui: &mut egui::Ui) {
             rect.center_top() + Vec2::new(0., 6.),
             rect.center_bottom() - Vec2::new(0., 6.),
         ],
-        Stroke::new(1., theme::gray(53)),
+        Stroke::new(1., theme::palette(ui.ctx()).gray(53)),
     );
 }
 pub(super) fn toolbar_action(
@@ -21,6 +23,7 @@ pub(super) fn toolbar_action(
     enabled: bool,
     icon: u8,
 ) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(width, 32.),
         if enabled {
@@ -30,7 +33,7 @@ pub(super) fn toolbar_action(
         },
     );
     let hover = enabled && response.hovered();
-    let fill = theme::gray(if selected {
+    let fill = palette.gray(if selected {
         62
     } else if hover {
         48
@@ -38,7 +41,7 @@ pub(super) fn toolbar_action(
         29
     });
     ui.painter().rect_filled(rect, 5., fill);
-    let color = theme::gray(if !enabled {
+    let color = palette.gray(if !enabled {
         85
     } else if selected || hover {
         235
@@ -86,6 +89,18 @@ pub(super) fn adjustment_section(
 pub(super) fn collapsed_sections_id() -> egui::Id {
     egui::Id::new("rawmakase-collapsed-sections")
 }
+/// Where the set of pinned section titles lives in egui memory; the editor
+/// seeds it from the session and saves it back when it changes.
+pub(super) fn pinned_sections_id() -> egui::Id {
+    egui::Id::new("rawmakase-pinned-sections")
+}
+/// Whether the section `title` is pinned above its side's scrolling panels.
+pub(super) fn pinned(ctx: &egui::Context, title: &str) -> bool {
+    ctx.data(|d| {
+        d.get_temp::<std::collections::BTreeSet<String>>(pinned_sections_id())
+            .is_some_and(|set| set.contains(title))
+    })
+}
 /// Where a control names the edit it just made, for the History panel. The
 /// editor takes it at the end of the frame.
 pub(super) fn history_step_id() -> egui::Id {
@@ -131,6 +146,9 @@ pub(super) enum HeaderButton {
     Reset,
     /// Adds an item, as the Snapshots panel's +.
     Add,
+    /// Pins the panel above the side's scrolling panels, or lets it scroll
+    /// with them; see [`pinned`].
+    Pin,
 }
 /// [`section`] with any header button; returns whether it was clicked.
 pub(super) fn section_with(
@@ -271,6 +289,7 @@ fn section_header(
     switch: Option<&mut PanelState>,
     contents: impl FnOnce(&mut egui::Ui),
 ) -> bool {
+    let palette = theme::palette(ui.ctx());
     let resettable = button != HeaderButton::None;
     let id = ui.make_persistent_id(("adjustment-section-v3", title));
     let key = section_key(title);
@@ -287,17 +306,22 @@ fn section_header(
         d.get_temp::<std::collections::BTreeSet<String>>(collapsed_sections_id())
             .is_some_and(|set| set.contains(key))
     });
-    ui.add_space(8.);
+    let sidebar = group == Some(SectionGroup::LibraryLeft.key());
+    // Space parts the panels; the catalog's sidebar lists sources closer.
+    ui.add_space(if sidebar { 8. } else { 14. });
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.), Sense::hover());
-    let reset_rect = Rect::from_center_size(
-        Pos2::new(rect.right() - 16., rect.center().y),
-        Vec2::splat(24.),
-    );
-    let right = if resettable {
-        reset_rect.left()
-    } else {
-        rect.right()
-    };
+    // Outside the catalog's sidebar the chevron keeps the header's right end,
+    // its buttons before it.
+    let chevron_rect = (!sidebar).then(|| {
+        Rect::from_center_size(
+            Pos2::new(rect.right() - 14., rect.center().y),
+            Vec2::splat(24.),
+        )
+    });
+    let end = chevron_rect.map_or(rect.right(), |c| c.left());
+    let reset_rect =
+        Rect::from_center_size(Pos2::new(end - 14., rect.center().y), Vec2::splat(24.));
+    let right = if resettable { reset_rect.left() } else { end };
     let switch_rect =
         Rect::from_center_size(Pos2::new(right - 18., rect.center().y), Vec2::new(26., 20.));
     let toggle_right = if switch.is_some() {
@@ -309,6 +333,10 @@ fn section_header(
     let toggle = ui
         .interact(toggle_rect, id.with("toggle"), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let chevron = chevron_rect.map(|c| {
+        ui.interact(c, id.with("chevron"), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+    });
     let reset = ui.interact(
         reset_rect,
         id.with("reset"),
@@ -321,53 +349,80 @@ fn section_header(
     let reset = match button {
         HeaderButton::Reset => reset.on_hover_text(format!("Reset {title}")),
         HeaderButton::Add => reset.on_hover_text(format!("New {}", title.trim_end_matches('s'))),
+        HeaderButton::Pin if pinned(ui.ctx(), title) => {
+            reset.on_hover_text(format!("Unpin {title}: it scrolls with the panels"))
+        }
+        HeaderButton::Pin => reset.on_hover_text(format!("Pin {title} at the top")),
         HeaderButton::None => reset,
     };
     let enabled = switch.as_deref().is_none_or(|s| *s == PanelState::On);
-    // A filled header band marks each collapsible panel, as in Lightroom.
-    ui.painter().rect_filled(
-        rect,
-        3.,
-        theme::gray(if toggle.hovered() { 60 } else { 51 }),
-    );
-    ui.painter().rect_stroke(
-        rect,
-        3.,
-        Stroke::new(1., theme::gray(if open { 70 } else { 62 })),
-        egui::StrokeKind::Inside,
-    );
-    let c = Pos2::new(rect.left() + 13., rect.center().y);
-    let triangle = if open {
-        vec![
-            c + Vec2::new(-4., -2.),
-            c + Vec2::new(4., -2.),
-            c + Vec2::new(0., 3.),
-        ]
-    } else {
-        vec![
-            c + Vec2::new(-2., -4.),
-            c + Vec2::new(3., 0.),
-            c + Vec2::new(-2., 4.),
-        ]
-    };
-    ui.painter().add(egui::Shape::convex_polygon(
-        triangle,
-        theme::gray(if toggle.hovered() { 235 } else { 190 }),
-        Stroke::NONE,
-    ));
+    let hovered = toggle.hovered() || chevron.as_ref().is_some_and(|c| c.hovered());
+    // Every panel's header is a quiet caption with its chevron on the right.
+    // In the catalog's sidebar both show only while hovered (the chevron also
+    // while folded); elsewhere the header is a band with its chevron always.
+    if !sidebar || hovered {
+        let fill = match (sidebar, hovered) {
+            (true, _) => 32,
+            (false, true) => 44,
+            (false, false) => 38,
+        };
+        ui.painter().rect_filled(rect, 5., palette.gray(fill));
+    }
     ui.painter().text(
-        Pos2::new(rect.left() + 26., rect.center().y),
+        // Over the sidebar rows' text at their 10 px inset; elsewhere at the
+        // contents' 8 px margin.
+        Pos2::new(
+            rect.left() + if sidebar { 10. } else { 8. },
+            rect.center().y,
+        ),
         egui::Align2::LEFT_CENTER,
-        title,
-        egui::FontId::proportional(13.),
-        theme::gray(match (enabled, toggle.hovered()) {
-            (false, _) => 140,
-            (true, true) => 250,
-            (true, false) => 235,
-        }),
+        title.to_uppercase(),
+        egui::FontId::proportional(11.),
+        palette.gray(if enabled { 225 } else { 95 }),
     );
-    if resettable {
-        let color = theme::gray(if reset.hovered() { 240 } else { 150 });
+    if !sidebar || hovered || !open {
+        let chevron = if open {
+            Icon::ChevronDown
+        } else {
+            Icon::ChevronRight
+        };
+        // Ending where the sidebar's counts do, or at the header's right end.
+        let x = chevron_rect.map_or(right - 15.5, |c| c.center().x);
+        let tint = palette.gray(if hovered { 200 } else { 110 });
+        icons::paint_at(
+            ui.painter(),
+            chevron,
+            Pos2::new(x, rect.center().y),
+            12.,
+            tint,
+        );
+    }
+    if button == HeaderButton::Pin {
+        // Lit while pinned; at rest it stays quiet.
+        let on = pinned(ui.ctx(), title);
+        let color = palette.gray(match (reset.hovered(), on) {
+            (true, _) => 240,
+            (false, true) => 200,
+            (false, false) => 105,
+        });
+        let icon = if on && reset.hovered() {
+            Icon::PinOff
+        } else {
+            Icon::Pin
+        };
+        icons::paint_at(ui.painter(), icon, reset_rect.center(), 12., color);
+        if reset.clicked() {
+            ui.ctx().data_mut(|d| {
+                let set = d.get_temp_mut_or_default::<std::collections::BTreeSet<String>>(
+                    pinned_sections_id(),
+                );
+                if !set.remove(title) {
+                    set.insert(title.to_string());
+                }
+            });
+        }
+    } else if resettable {
+        let color = palette.gray(if reset.hovered() { 240 } else { 150 });
         let icon = if button == HeaderButton::Add {
             Icon::Add
         } else {
@@ -404,7 +459,9 @@ fn section_header(
             }
         });
     }
-    if toggle.clicked() && !context_clicked(&toggle) {
+    if (toggle.clicked() && !context_clicked(&toggle))
+        || chevron.as_ref().is_some_and(|c| c.clicked())
+    {
         open = !open;
         set_open(ui, key, open);
         if open && let Some(group) = group.filter(|g| solo(ui, g)) {
@@ -416,12 +473,18 @@ fn section_header(
     }
     if open {
         set_edit_context(ui, title);
+        // The catalog's rows span its sidebar, their own inset making the margin.
+        let side = if group == Some(SectionGroup::LibraryLeft.key()) {
+            0
+        } else {
+            8
+        };
         // Scope ids per section so equal slider labels (e.g. two "Amount"s) never clash.
         ui.push_id(title, |ui| {
             egui::Frame::new()
                 .inner_margin(egui::Margin {
-                    left: 8,
-                    right: 8,
+                    left: side,
+                    right: side,
                     top: 8,
                     bottom: 12,
                 })
@@ -432,12 +495,13 @@ fn section_header(
 }
 /// Lightroom's panel switch: a small track with its knob to the right when on.
 fn paint_switch(painter: &egui::Painter, c: Pos2, state: PanelState, hovered: bool) {
+    let palette = theme::palette(painter.ctx());
     let track = Rect::from_center_size(c, Vec2::new(20., 10.));
     let on = state == PanelState::On;
     painter.rect_filled(
         track,
         5.,
-        theme::gray(match (on, hovered) {
+        palette.gray(match (on, hovered) {
             (true, true) => 175,
             (true, false) => 150,
             (false, true) => 80,
@@ -447,7 +511,7 @@ fn paint_switch(painter: &egui::Painter, c: Pos2, state: PanelState, hovered: bo
     painter.rect_stroke(
         track,
         5.,
-        Stroke::new(1., theme::gray(if on { 120 } else { 95 })),
+        Stroke::new(1., palette.gray(if on { 120 } else { 95 })),
         egui::StrokeKind::Inside,
     );
     let knob = if on {
@@ -455,7 +519,7 @@ fn paint_switch(painter: &egui::Painter, c: Pos2, state: PanelState, hovered: bo
     } else {
         track.left_center() + Vec2::new(5., 0.)
     };
-    painter.circle_filled(knob, 3.5, theme::gray(if on { 235 } else { 140 }));
+    painter.circle_filled(knob, 3.5, palette.gray(if on { 235 } else { 140 }));
 }
 #[derive(Clone, Default)]
 struct CurveInteraction {
@@ -465,8 +529,9 @@ struct CurveInteraction {
 /// Lightroom's curve backdrop: mid-gray field, the image histogram behind the
 /// curve, a quarter grid and a dark frame. `channel` 0 is RGB, 1–3 are R, G, B.
 fn curve_backdrop(ui: &egui::Ui, rect: Rect, histogram: &[[u32; 256]; 3], channel: usize) {
+    let palette = theme::palette(ui.ctx());
     let painter = ui.painter();
-    painter.rect_filled(rect, 0., theme::gray(82));
+    painter.rect_filled(rect, 0., palette.gray(82));
     let bins: Vec<f32> = (0..256)
         .map(|i| match channel {
             1..=3 => histogram[channel - 1][i] as f32,
@@ -479,7 +544,7 @@ fn curve_backdrop(ui: &egui::Ui, rect: Rect, histogram: &[[u32; 256]; 3], channe
         1 => Color32::from_rgb(112, 62, 60),
         2 => Color32::from_rgb(62, 102, 66),
         3 => Color32::from_rgb(62, 78, 118),
-        _ => theme::gray(58),
+        _ => palette.gray(58),
     };
     if bins.iter().any(|v| *v > 0.) {
         let mut mesh = egui::Mesh::default();
@@ -517,16 +582,16 @@ fn curve_backdrop(ui: &egui::Ui, rect: Rect, histogram: &[[u32; 256]; 3], channe
     painter.rect_stroke(
         rect,
         0.,
-        Stroke::new(1., theme::gray(15)),
+        Stroke::new(1., palette.gray(15)),
         egui::StrokeKind::Outside,
     );
 }
-fn curve_color(channel: usize) -> Color32 {
+fn curve_color(palette: &theme::Palette, channel: usize) -> Color32 {
     match channel {
         1 => Color32::from_rgb(240, 110, 100),
         2 => Color32::from_rgb(120, 215, 125),
         3 => Color32::from_rgb(120, 160, 245),
-        _ => theme::gray(255),
+        _ => palette.gray(255),
     }
 }
 /// Read-out under a curve: the input and output values at the pointer.
@@ -538,7 +603,7 @@ fn curve_readout(ui: &mut egui::Ui, value: Option<[f32; 2]>) {
             egui::Align2::CENTER_CENTER,
             format!("{:.0} / {:.0}", x * 255., y * 255.),
             egui::FontId::proportional(11.),
-            theme::gray(170),
+            theme::palette(ui.ctx()).gray(170),
         );
     }
 }
@@ -548,11 +613,11 @@ fn curve_readout(ui: &mut egui::Ui, value: Option<[f32; 2]>) {
 /// moving, which shows as a hovered one does.
 pub(super) fn parametric_curve_ui(
     ui: &mut egui::Ui,
-    effects: &mut crate::develop::effects::Effects,
-    model: crate::develop::parametric::ParametricModel,
+    effects: &mut crate::model::effects::Effects,
     histogram: &[[u32; 256]; 3],
     targeted: Option<usize>,
 ) {
+    let palette = theme::palette(ui.ctx());
     let size = ui.available_width();
     let (outer, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click_and_drag());
     let rect = outer.shrink(4.);
@@ -590,7 +655,7 @@ pub(super) fn parametric_curve_ui(
     {
         effects.parametric[i] = 0.;
     }
-    let pts: Vec<_> = crate::develop::parametric::samples(model, effects, 128)
+    let pts: Vec<_> = crate::develop::parametric::samples(effects, 128)
         .into_iter()
         .enumerate()
         .map(|(i, y)| {
@@ -601,7 +666,7 @@ pub(super) fn parametric_curve_ui(
         })
         .collect();
     ui.painter()
-        .add(egui::Shape::line(pts, Stroke::new(2., theme::gray(255))));
+        .add(egui::Shape::line(pts, Stroke::new(2., palette.gray(255))));
     let name = hovered_region.map(|i| ["Shadows", "Darks", "Lights", "Highlights"][i]);
     response
         .on_hover_cursor(egui::CursorIcon::ResizeVertical)
@@ -614,7 +679,7 @@ pub(super) fn parametric_curve_ui(
     ui.painter().rect_filled(
         Rect::from_x_y_ranges(track.x_range(), track.top() + 2.0..=track.top() + 4.),
         1.,
-        theme::gray(60),
+        palette.gray(60),
     );
     for i in 0..3 {
         let x = track.left() + effects.splits[i] * track.width();
@@ -640,7 +705,7 @@ pub(super) fn parametric_curve_ui(
         if r.double_clicked() {
             effects.splits[i] = [0.25, 0.5, 0.75][i];
         }
-        let color = theme::gray(if r.hovered() || r.dragged() { 240 } else { 175 });
+        let color = palette.gray(if r.hovered() || r.dragged() { 240 } else { 175 });
         let top = Pos2::new(x, track.top() + 3.);
         ui.painter().add(egui::Shape::convex_polygon(
             vec![top, top + Vec2::new(5., 9.), top + Vec2::new(-5., 9.)],
@@ -655,6 +720,7 @@ pub(super) fn tone_curve_ui(
     histogram: &[[u32; 256]; 3],
     channel: usize,
 ) {
+    let palette = theme::palette(ui.ctx());
     let id = ui.make_persistent_id("tone-curve-editor");
     let mut state = ui
         .ctx()
@@ -741,7 +807,7 @@ pub(super) fn tone_curve_ui(
         .collect();
     ui.painter().add(egui::Shape::line(
         pts,
-        Stroke::new(2., curve_color(channel)),
+        Stroke::new(2., curve_color(&palette, channel)),
     ));
     for (i, p) in curve.points.iter().enumerate() {
         let p = screen(*p);
@@ -750,9 +816,9 @@ pub(super) fn tone_curve_ui(
             p,
             if active { 5.5 } else { 4.5 },
             if state.selected == Some(i) {
-                theme::gray(25)
+                palette.gray(25)
             } else {
-                theme::gray(255)
+                palette.gray(255)
             },
         );
         ui.painter().circle_stroke(
@@ -761,9 +827,9 @@ pub(super) fn tone_curve_ui(
             Stroke::new(
                 1.5,
                 if state.selected == Some(i) {
-                    theme::gray(255)
+                    palette.gray(255)
                 } else {
-                    theme::gray(20)
+                    palette.gray(20)
                 },
             ),
         );
@@ -816,7 +882,7 @@ pub(super) fn tone_curve_ui(
     ui.label(
         egui::RichText::new("Click to add · drag to shape · right-click to remove")
             .size(10.)
-            .color(theme::gray(125)),
+            .color(palette.gray(125)),
     );
     ui.ctx().data_mut(|d| d.insert_temp(id, state));
 }
@@ -879,10 +945,138 @@ pub(super) fn slider_with(
     display: Option<(f32, usize)>,
     gradient: Option<(Color32, Color32)>,
 ) -> SliderEvent {
+    let style = SliderStyle {
+        display,
+        gradient,
+        ..SliderStyle::default()
+    };
+    slider_styled(ui, label, value, range, default, style)
+}
+/// How a slider looks and moves beyond its label, range and default.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct SliderStyle {
+    /// Shown scale and decimals, e.g. Sharpening's 0–150; picked from the range
+    /// when `None`.
+    pub display: Option<(f32, usize)>,
+    /// A coloured rail, from its left end to its right.
+    pub gradient: Option<(Color32, Color32)>,
+    /// The rail is even in the value's reciprocal, as Temp moves in mireds.
+    pub reciprocal: bool,
+    /// What dragging snaps to, as Exposure's 0.05 EV; typed values stay exact.
+    pub drag_step: Option<f32>,
+    /// A hue wheel of 0–360° as the rail.
+    pub hue_rail: bool,
+    /// What a typed value may be, `(low, high)`, when wider than the rail: a
+    /// descriptor's valid range, as Exposure's ±8 EV beside its ±5 rail. `None`
+    /// keeps typing to the rail's range.
+    pub typed: Option<(f32, f32)>,
+}
+/// The Temp slider's rail, blue to yellow.
+pub(super) const TEMPERATURE_GRADIENT: (Color32, Color32) = (
+    Color32::from_rgb(74, 123, 182),
+    Color32::from_rgb(194, 169, 93),
+);
+/// The Tint slider's rail, green to magenta.
+pub(super) const TINT_GRADIENT: (Color32, Color32) = (
+    Color32::from_rgb(91, 156, 112),
+    Color32::from_rgb(165, 105, 158),
+);
+/// The slider for a develop setting, as its descriptor describes it.
+pub(super) fn setting_slider(
+    ui: &mut egui::Ui,
+    id: ParameterId,
+    value: &mut f32,
+    default: f32,
+) -> SliderEvent {
+    let gradient = match id {
+        ParameterId::Temperature | ParameterId::IncrementalTemperature => {
+            Some(TEMPERATURE_GRADIENT)
+        }
+        ParameterId::Tint | ParameterId::IncrementalTint | ParameterId::ShadowTint => {
+            Some(TINT_GRADIENT)
+        }
+        _ => None,
+    };
+    descriptor_slider(ui, id.descriptor(), value, default, gradient)
+}
+/// The slider for a mask's adjustment, as its descriptor describes it.
+pub(super) fn local_setting_slider(
+    ui: &mut egui::Ui,
+    id: LocalParameterId,
+    value: &mut f32,
+    default: f32,
+) -> SliderEvent {
+    let gradient = match id {
+        LocalParameterId::Temperature => Some(TEMPERATURE_GRADIENT),
+        LocalParameterId::Tint => Some(TINT_GRADIENT),
+        _ => None,
+    };
+    descriptor_slider(ui, id.descriptor(), value, default, gradient)
+}
+fn descriptor_slider<Id>(
+    ui: &mut egui::Ui,
+    d: &params::Descriptor<Id>,
+    value: &mut f32,
+    default: f32,
+    gradient: Option<(Color32, Color32)>,
+) -> SliderEvent {
+    let style = SliderStyle {
+        display: Some((d.display.scale, d.display.decimals)),
+        gradient,
+        reciprocal: matches!(d.tick, params::Tick::Mireds(_)),
+        drag_step: d.drag_step,
+        hue_rail: false,
+        typed: Some((*d.valid.start(), *d.valid.end())),
+    };
+    slider_styled(ui, d.label, value, d.interactive.clone(), default, style)
+}
+/// How a slider's number field was changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NumberInput {
+    /// Typed and entered: any value the setting may hold.
+    Typed,
+    /// Dragged, or stepped with the arrow keys: relative to the value before.
+    Relative,
+}
+/// The value a number field entry gives, from `before`: a typed value within
+/// `typed`; a relative one as dials and arrow keys move it, within `rail` and never
+/// further out than it was.
+fn number_input(
+    input: NumberInput,
+    before: f32,
+    entered: f32,
+    rail: std::ops::RangeInclusive<f32>,
+    (typed_low, typed_high): (f32, f32),
+) -> f32 {
+    match input {
+        NumberInput::Typed => entered.clamp(typed_low, typed_high),
+        NumberInput::Relative => params::nudged(before, entered - before, rail),
+    }
+}
+pub(super) fn slider_styled(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    default: f32,
+    style: SliderStyle,
+) -> SliderEvent {
+    let palette = theme::palette(ui.ctx());
+    let SliderStyle {
+        display,
+        gradient,
+        reciprocal,
+        drag_step: step,
+        hue_rail,
+        typed,
+    } = style;
     let mut event = SliderEvent::None;
     let start = *range.start();
     let end = *range.end();
     let span = end - start;
+    // Typing takes any value the setting may hold; the rail and dragging the number
+    // stay within the rail.
+    let (typed_low, typed_high) = typed.unwrap_or((start, end));
     let (scale, decimals) = display.unwrap_or(if start >= -1. && end <= 1. {
         (100., 0)
     } else if span >= 100. {
@@ -891,15 +1085,7 @@ pub(super) fn slider_with(
         (1., 2)
     });
     let signed = start < 0. && default == 0.;
-    let origin = fill_origin(
-        start,
-        default,
-        gradient.is_some() || label == "Temp" || label == "Tint",
-    );
-    // Like Lightroom, Temp moves evenly in mireds rather than kelvin.
-    let reciprocal = label == "Temp" && start > 0.;
-    // Dragging Exposure moves in Lightroom's 0.05 EV steps; typed values stay exact.
-    let step = (label == "Exposure").then_some(0.05);
+    let origin = fill_origin(start, default, gradient.is_some());
     let to_rail = move |v: f32, rail: Rect| {
         let t = if reciprocal {
             egui::remap_clamp(1. / v, 1. / start..=1. / end, 0. ..=1.)
@@ -919,14 +1105,17 @@ pub(super) fn slider_with(
     let before = *value;
     ui.push_id(label, |ui| {
         let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.), Sense::hover());
-        let label_rect = Rect::from_min_max(row.min, Pos2::new(row.left() + 83., row.bottom()));
+        let label_rect = Rect::from_min_max(
+            row.min,
+            Pos2::new(row.left() + label_column(ui), row.bottom()),
+        );
         let label_response = ui.interact(label_rect, ui.id().with("label"), Sense::click());
         ui.painter().text(
             label_rect.right_center() - Vec2::new(5., 0.),
             egui::Align2::RIGHT_CENTER,
             label,
             egui::FontId::proportional(11.),
-            theme::gray(190),
+            palette.gray(190),
         );
         if label_response.double_clicked() {
             *value = default.clamp(start, end);
@@ -937,6 +1126,31 @@ pub(super) fn slider_with(
             row.max,
         );
         let mut displayed = *value * scale;
+        // The arrow keys step a focused number; egui's DragValue consumes them while
+        // it draws, so they are read before. A screen reader steps it with
+        // accessibility actions instead, which reach it without focus.
+        let arrows = ui.input(|i| {
+            [
+                egui::Key::ArrowUp,
+                egui::Key::ArrowDown,
+                egui::Key::ArrowLeft,
+                egui::Key::ArrowRight,
+            ]
+            .into_iter()
+            .any(|key| i.key_pressed(key))
+        });
+        let assistive_step = ui.input(|i| {
+            i.events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::Event::AccessKitActionRequest(request)
+                        if matches!(
+                            request.action,
+                            egui::accesskit::Action::Increment | egui::accesskit::Action::Decrement
+                        )
+                )
+            })
+        });
         // A fixed field that fits the widest value ("50000", "+5.00"): typing or
         // dragging never widens it over the rail.
         let value_response = ui
@@ -945,21 +1159,42 @@ pub(super) fn slider_with(
                 let spacing = ui.spacing_mut();
                 spacing.interact_size.x = SLIDER_VALUE_WIDTH;
                 spacing.button_padding.x = 4.;
+                // Set into the dark panels; a disabled field fades further.
+                let widgets = &mut ui.visuals_mut().widgets;
+                for (state, fill) in [(&mut widgets.inactive, 32), (&mut widgets.hovered, 42)] {
+                    state.bg_fill = palette.gray(fill);
+                    state.weak_bg_fill = palette.gray(fill);
+                }
                 ui.place(
                     value_rect,
                     // An imported value beyond the range shows as it is, rather
                     // than being clamped by drawing it.
                     egui::DragValue::new(&mut displayed)
-                        .range(start * scale..=end * scale)
+                        .range(typed_low * scale..=typed_high * scale)
                         .clamp_existing_to_range(false)
                         .speed(span * scale / 500.)
-                        .custom_formatter(move |v, _| slider_text(v, decimals, signed))
+                        .custom_formatter(move |v, _| format_value(v, decimals, signed))
                         .custom_parser(|s| s.trim().trim_start_matches('+').parse().ok()),
                 )
             })
             .inner;
         if value_response.changed() {
-            *value = (displayed / scale).clamp(start, end);
+            // Dragging the number, the arrow keys stepping it while it has focus, or a
+            // screen reader stepping it, move it relative to where it was; anything
+            // else was typed.
+            let stepped = (value_response.has_focus() && arrows) || assistive_step;
+            let input = if value_response.dragged() || stepped {
+                NumberInput::Relative
+            } else {
+                NumberInput::Typed
+            };
+            *value = number_input(
+                input,
+                before,
+                displayed / scale,
+                start..=end,
+                (typed_low, typed_high),
+            );
         }
         let area = Rect::from_min_max(
             Pos2::new(label_rect.right(), row.top()),
@@ -970,18 +1205,7 @@ pub(super) fn slider_with(
             Pos2::new(area.left() + 5., area.center().y - 1.),
             Pos2::new(area.right() - 5., area.center().y + 1.),
         );
-        let gradient = gradient.or(match label {
-            "Temp" => Some((
-                Color32::from_rgb(74, 123, 182),
-                Color32::from_rgb(194, 169, 93),
-            )),
-            "Tint" => Some((
-                Color32::from_rgb(91, 156, 112),
-                Color32::from_rgb(165, 105, 158),
-            )),
-            _ => None,
-        });
-        if label == "Hue" && start == 0. && end == 360. {
+        if hue_rail {
             let mut mesh = egui::Mesh::default();
             for sector in 0..6 {
                 let left = egui::lerp(rail.left()..=rail.right(), sector as f32 / 6.);
@@ -1015,7 +1239,7 @@ pub(super) fn slider_with(
             mesh.add_triangle(0, 2, 3);
             ui.painter().add(mesh);
         } else {
-            ui.painter().rect_filled(rail, 1., theme::gray(83));
+            ui.painter().rect_filled(rail, 1., palette.gray(83));
         }
         // A tick where a centred slider rests, or a coloured one's default (Temp's As
         // Shot); a slider from zero up, like Feather, fills from its left end.
@@ -1026,7 +1250,7 @@ pub(super) fn slider_with(
                     Pos2::new(neutral, area.center().y - 4.),
                     Pos2::new(neutral, area.center().y + 4.),
                 ],
-                Stroke::new(1., theme::gray(115)),
+                Stroke::new(1., palette.gray(115)),
             );
         }
         if response.double_clicked() {
@@ -1042,7 +1266,7 @@ pub(super) fn slider_with(
             // Lightroom's keys over a hovered slider: Up and Down move it by its
             // smallest shown step, ten with Shift.
             let unit = step.unwrap_or(10f32.powi(-(decimals as i32)) / scale);
-            *value = crate::develop::params::nudged(*value, nudge * unit, start..=end);
+            *value = crate::model::params::nudged(*value, nudge * unit, start..=end);
         }
         let x = to_rail(*value, rail);
         if gradient.is_none() {
@@ -1051,7 +1275,7 @@ pub(super) fn slider_with(
                     Pos2::new(neutral, area.center().y),
                     Pos2::new(x, area.center().y),
                 ],
-                Stroke::new(2., theme::gray(153)),
+                Stroke::new(2., palette.gray(153)),
             );
         }
         let center = Pos2::new(x, area.center().y);
@@ -1062,10 +1286,10 @@ pub(super) fn slider_with(
             } else {
                 3.5
             },
-            theme::gray(205),
+            palette.gray(205),
         );
         ui.painter()
-            .circle_stroke(center, 3.5, Stroke::new(1., theme::gray(26)));
+            .circle_stroke(center, 3.5, Stroke::new(1., palette.gray(26)));
         response.on_hover_text(
             "Drag to adjust · double-click to reset. Drag or type the number for precise edits.",
         );
@@ -1082,7 +1306,7 @@ pub(super) fn slider_with(
         } else {
             format!("{context} {label}")
         };
-        let shown = slider_text(f64::from(*value * scale), decimals, signed);
+        let shown = format_value(f64::from(*value * scale), decimals, signed);
         name_history_step(ui, name, shown);
     }
     event
@@ -1110,15 +1334,6 @@ fn hovered_nudge(ui: &egui::Ui, row: Rect) -> Option<f32> {
         nudge
     });
     (nudge != 0.).then_some(nudge)
-}
-/// A slider's number as shown: Lightroom's scale, with a sign when it has one.
-pub(super) fn slider_text(v: f64, decimals: usize, signed: bool) -> String {
-    let text = format!("{v:.decimals$}");
-    if signed && v > 0. && !text.trim_start_matches(['0', '.']).is_empty() {
-        format!("+{text}")
-    } else {
-        text
-    }
 }
 /// Size of a segmented control: the track's height and the label size.
 pub(super) struct SegmentStyle {
@@ -1167,18 +1382,18 @@ fn control_radius(height: f32) -> f32 {
 /// minimum.
 const SEGMENT_PADDING: f32 = 12.;
 const SEGMENT_MIN_PADDING: f32 = 8.;
+/// What the padding gives way to, at the smaller label size, before the
+/// control grows wider than its place (and past the panel holding it).
+const SEGMENT_TIGHT_PADDING: f32 = 3.;
 /// The pill's gap to the track.
 const SEGMENT_INSET: f32 = 2.;
 fn label_widths(ui: &egui::Ui, labels: &[&str], font: f32) -> Vec<f32> {
+    let white = theme::palette(ui.ctx()).gray(255);
     labels
         .iter()
         .map(|label| {
             ui.painter()
-                .layout_no_wrap(
-                    (*label).into(),
-                    egui::FontId::proportional(font),
-                    theme::gray(255),
-                )
+                .layout_no_wrap((*label).into(), egui::FontId::proportional(font), white)
                 .size()
                 .x
         })
@@ -1191,18 +1406,19 @@ fn segments_width(ui: &egui::Ui, labels: &[&str], style: &SegmentStyle) -> f32 {
         .fold(0., f32::max);
     labels.len() as f32 * (widest + 2. * SEGMENT_PADDING) + 2. * SEGMENT_INSET
 }
-/// The narrowest track that keeps the minimum padding: each segment only as
-/// wide as its own label, at the label size one point down.
+/// The narrowest track: each segment only as wide as its own label, at the
+/// label size one point down, with the tightest padding.
 fn tightest_segments_width(ui: &egui::Ui, labels: &[&str], style: &SegmentStyle) -> f32 {
     label_widths(ui, labels, style.font - 1.)
         .into_iter()
-        .map(|width| width + 2. * SEGMENT_MIN_PADDING)
+        .map(|width| width + 2. * SEGMENT_TIGHT_PADDING)
         .sum::<f32>()
         + 2. * SEGMENT_INSET
 }
 /// Segment widths and label size for a track `inner` wide: equal widths when
 /// every label gets its minimum padding, else each label's own width with the
-/// leftover shared out, at a point smaller if even that does not fit.
+/// leftover shared out, at a point smaller if even that does not fit, with
+/// the padding narrowed as far as the tightest.
 fn segment_layout(
     ui: &egui::Ui,
     labels: &[&str],
@@ -1216,13 +1432,13 @@ fn segment_layout(
         if inner / count >= widest + 2. * SEGMENT_MIN_PADDING {
             return (vec![inner / count; labels.len()], font);
         }
-        let needed: f32 = widths.iter().map(|w| w + 2. * SEGMENT_MIN_PADDING).sum();
+        let labels_width: f32 = widths.iter().sum();
+        let needed = labels_width + count * 2. * SEGMENT_MIN_PADDING;
         if needed <= inner || font < style.font {
-            let extra = (inner - needed).max(0.) / count;
-            let widths = widths
-                .iter()
-                .map(|w| w + 2. * SEGMENT_MIN_PADDING + extra)
-                .collect();
+            let padding = ((inner - labels_width) / (2. * count))
+                .clamp(SEGMENT_TIGHT_PADDING, SEGMENT_MIN_PADDING);
+            let extra = (inner - labels_width - count * 2. * padding).max(0.) / count;
+            let widths = widths.iter().map(|w| w + 2. * padding + extra).collect();
             return (widths, font);
         }
     }
@@ -1239,10 +1455,19 @@ fn segment_track(
     selected: Option<usize>,
     style: &SegmentStyle,
 ) -> Vec<egui::Response> {
+    let palette = theme::palette(ui.ctx());
     let inset = SEGMENT_INSET;
     let radius = control_radius(style.height);
     let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width(), style.height));
-    ui.painter().rect_filled(track, radius, theme::gray(21));
+    // Visible on the dark side panels as on lighter surfaces, so the pill
+    // sits inside a track as wide as the control.
+    ui.painter().rect(
+        track,
+        radius,
+        palette.gray(28),
+        Stroke::new(1., palette.gray(42)),
+        egui::StrokeKind::Inside,
+    );
     let (widths, font) = segment_layout(ui, labels, style, track.width() - 2. * inset);
     let starts: Vec<f32> = widths
         .iter()
@@ -1297,15 +1522,15 @@ fn segment_track(
     for (index, response) in responses.iter().enumerate() {
         if selected != Some(index) && enabled && response.hovered() {
             ui.painter()
-                .rect_filled(segment(index as f32), radius - inset, theme::gray(30));
+                .rect_filled(segment(index as f32), radius - inset, palette.gray(38));
         }
     }
     if selected.is_some() {
         ui.painter().rect(
             segment(position),
             radius - inset,
-            theme::gray(44),
-            Stroke::new(1., theme::gray(58)),
+            palette.gray(58),
+            Stroke::new(1., palette.gray(74)),
             egui::StrokeKind::Inside,
         );
     }
@@ -1317,14 +1542,14 @@ fn segment_track(
             None => 0.,
         };
         let color = if enabled {
-            theme::gray(140).lerp_to_gamma(theme::gray(245), weight)
+            palette.gray(160).lerp_to_gamma(palette.gray(245), weight)
         } else {
-            theme::gray(70)
+            palette.gray(70)
         };
         let text = ui.painter().layout_no_wrap(
             (*label).into(),
             egui::FontId::proportional(font),
-            theme::gray(255),
+            palette.gray(255),
         );
         ui.painter()
             .galley_with_override_text_color(rect.center() - text.size() / 2., text, color);
@@ -1340,27 +1565,22 @@ fn segment_track(
         })
         .collect()
 }
-/// What an [`action_button`] does: the main action of its area, or any other.
-#[derive(Clone, Copy, PartialEq)]
-pub(super) enum ButtonKind {
-    Primary,
-    Secondary,
-}
-/// A toolbar button sized to its content: an optional icon and the label
-/// centred together, with the segmented controls' height and rounding.
+/// A primary button sized to its content, in the accent colour: an optional
+/// icon and the label centred together, with the segmented controls' height
+/// and rounding.
 pub(super) fn action_button(
     ui: &mut egui::Ui,
     label: &str,
     icon: Option<Icon>,
-    kind: ButtonKind,
     enabled: bool,
 ) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
     let height = TOOLBAR_SEGMENTS.height;
     let (padding, icon_size, gap) = (12., 14., 6.);
     let text = ui.painter().layout_no_wrap(
         label.into(),
         egui::FontId::proportional(TOOLBAR_SEGMENTS.font),
-        theme::gray(255),
+        palette.gray(255),
     );
     let content = text.size().x + icon.map_or(0., |_| icon_size + gap);
     let (rect, response) = ui.allocate_exact_size(
@@ -1373,28 +1593,18 @@ pub(super) fn action_button(
     );
     let hovered = enabled && response.hovered();
     let pressed = enabled && response.is_pointer_button_down_on();
-    let (fill, stroke, ink) = match (kind, enabled) {
-        (_, false) => (theme::gray(34), theme::gray(44), theme::gray(85)),
-        (ButtonKind::Primary, true) => (
+    let (fill, stroke, ink) = if enabled {
+        (
             if hovered && !pressed {
-                theme::accent_hover()
+                palette.accent_hover()
             } else {
-                theme::accent()
+                palette.accent()
             },
             Color32::TRANSPARENT,
-            theme::on_accent(),
-        ),
-        (ButtonKind::Secondary, true) => (
-            theme::gray(if pressed {
-                36
-            } else if hovered {
-                50
-            } else {
-                42
-            }),
-            theme::gray(60),
-            theme::gray(225),
-        ),
+            palette.on_accent(),
+        )
+    } else {
+        (palette.gray(34), palette.gray(44), palette.gray(85))
     };
     ui.painter().rect(
         rect,
@@ -1458,6 +1668,7 @@ pub(super) fn menu_item(
     enabled: bool,
     checked: bool,
 ) -> bool {
+    let palette = theme::palette(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), 24.),
         if enabled {
@@ -1467,12 +1678,12 @@ pub(super) fn menu_item(
         },
     );
     if enabled && response.hovered() {
-        ui.painter().rect_filled(rect, 3., theme::accent());
+        ui.painter().rect_filled(rect, 3., palette.accent());
     }
     let color = if enabled && response.hovered() {
-        theme::on_accent_text(250)
+        palette.on_accent_text(250)
     } else {
-        theme::gray(if enabled { 215 } else { 100 })
+        palette.gray(if enabled { 215 } else { 100 })
     };
     if checked {
         let c = rect.left_center() + Vec2::new(11., 0.);
@@ -1491,7 +1702,7 @@ pub(super) fn menu_item(
             egui::Align2::RIGHT_CENTER,
             shortcut,
             egui::FontId::proportional(11.),
-            theme::gray(if enabled { 140 } else { 90 }),
+            palette.gray(if enabled { 140 } else { 90 }),
         );
     }
     enabled && response.clicked()
@@ -1500,7 +1711,7 @@ pub(super) fn menu_separator(ui: &mut egui::Ui) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 9.), Sense::hover());
     ui.painter().line_segment(
         [rect.left_center(), rect.right_center()],
-        Stroke::new(1., theme::gray(55)),
+        Stroke::new(1., theme::palette(ui.ctx()).gray(55)),
     );
 }
 /// True for a context-menu click: a right click, or Control-click on macOS.
@@ -1527,6 +1738,7 @@ pub(super) fn context_menu(response: &egui::Response, add: impl FnOnce(&mut egui
 /// Makes egui submenu buttons match `menu_item` rows: same height, text
 /// inset and hover color.
 pub(super) fn submenu_style(ui: &mut egui::Ui) {
+    let palette = theme::palette(ui.ctx());
     let spacing = ui.spacing_mut();
     spacing.item_spacing.y = 0.;
     spacing.button_padding = Vec2::new(22., 4.);
@@ -1537,25 +1749,26 @@ pub(super) fn submenu_style(ui: &mut egui::Ui) {
         &mut visuals.widgets.open,
         &mut visuals.widgets.active,
     ] {
-        widget.weak_bg_fill = theme::accent();
-        widget.bg_fill = theme::accent();
+        widget.weak_bg_fill = palette.accent();
+        widget.bg_fill = palette.accent();
         widget.bg_stroke = Stroke::NONE;
-        widget.fg_stroke = Stroke::new(1., theme::on_accent_text(250));
+        widget.fg_stroke = Stroke::new(1., palette.on_accent_text(250));
     }
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1., theme::gray(215));
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1., palette.gray(215));
 }
 /// The frame of a modal window such as Preferences or Export.
-pub(super) fn modal_frame() -> egui::Frame {
+pub(super) fn modal_frame(palette: &theme::Palette) -> egui::Frame {
     egui::Frame::new()
-        .fill(theme::gray(33))
-        .stroke(Stroke::new(1., theme::gray(52)))
+        .fill(palette.gray(33))
+        .stroke(Stroke::new(1., palette.gray(52)))
         .corner_radius(10.)
 }
 /// The button that confirms a modal window ("Done", "Export").
 pub(super) fn primary_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
     ui.add(
-        egui::Button::new(egui::RichText::new(text).color(theme::on_accent()))
-            .fill(theme::accent())
+        egui::Button::new(egui::RichText::new(text).color(palette.on_accent()))
+            .fill(palette.accent())
             .min_size(Vec2::new(84., 30.)),
     )
 }
@@ -1573,17 +1786,22 @@ pub(super) fn confirm_modal<T: Copy>(
     buttons: &[(&str, T)],
     dismissed: T,
 ) -> Option<T> {
+    let palette = theme::palette(ctx);
     let mut choice = None;
     let response = egui::Modal::new(egui::Id::new(id))
-        .frame(modal_frame().inner_margin(24))
+        .frame(modal_frame(&palette).inner_margin(24))
         .show(ctx, |ui| {
             ui.set_width(420.);
-            ui.label(egui::RichText::new(title).size(15.).color(theme::gray(236)));
+            ui.label(
+                egui::RichText::new(title)
+                    .size(15.)
+                    .color(palette.gray(236)),
+            );
             ui.add_space(6.);
             let detail = egui::Label::new(
                 egui::RichText::new(detail)
                     .size(12.)
-                    .color(theme::gray(150)),
+                    .color(palette.gray(150)),
             );
             ui.add(if truncated { detail.truncate() } else { detail });
             ui.add_space(20.);
@@ -1617,7 +1835,7 @@ pub(super) fn form_row(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mu
             egui::Align2::RIGHT_CENTER,
             label,
             egui::FontId::proportional(13.),
-            theme::gray(150),
+            theme::palette(ui.ctx()).gray(150),
         );
         contents(ui);
     });
@@ -1672,4 +1890,435 @@ mod slider_tests {
             }
         );
     }
+
+    /// Frames of Exposure's slider in a 400 × 40 panel: a click on its number
+    /// field, then `typed` and Return. Returns the value after.
+    fn type_into_exposure(start: f32, typed: &str) -> f32 {
+        let ctx = egui::Context::default();
+        let mut value = start;
+        let field = Pos2::new(400. - SLIDER_VALUE_WIDTH / 2., 12.);
+        let frames = [
+            vec![egui::Event::PointerMoved(field)],
+            vec![egui::Event::PointerButton {
+                pos: field,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            }],
+            vec![egui::Event::PointerButton {
+                pos: field,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+            vec![egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+            vec![egui::Event::Text(typed.into())],
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+            vec![],
+        ];
+        for events in frames {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400., 40.))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |ui| {
+                            setting_slider(ui, ParameterId::Exposure, &mut value, 0.);
+                        });
+                },
+            );
+            output.textures_delta.clear();
+        }
+        value
+    }
+
+    #[test]
+    fn typed_values_take_the_settings_valid_range_beyond_the_rail() {
+        // Exposure's rail spans ±5 EV; a recipe may hold ±8.
+        assert_eq!(type_into_exposure(0., "6"), 6.);
+        assert_eq!(type_into_exposure(0., "-7.5"), -7.5);
+        assert_eq!(type_into_exposure(0., "9"), 8.);
+        assert_eq!(type_into_exposure(0., "1.25"), 1.25);
+    }
+
+    /// Exposure's number field dragged by `dx` points from `start`.
+    fn drag_exposure(start: f32, dx: f32) -> f32 {
+        let ctx = egui::Context::default();
+        let mut value = start;
+        let field = Pos2::new(400. - SLIDER_VALUE_WIDTH / 2., 12.);
+        let to = field + Vec2::new(dx, 0.);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let mut frames = vec![
+            vec![egui::Event::PointerMoved(field)],
+            vec![button(field, true)],
+        ];
+        for step in 1..=10 {
+            frames.push(vec![egui::Event::PointerMoved(
+                field + (to - field) * step as f32 / 10.,
+            )]);
+        }
+        frames.push(vec![button(to, false)]);
+        for events in frames {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400., 40.))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |ui| {
+                            setting_slider(ui, ParameterId::Exposure, &mut value, 0.);
+                        });
+                },
+            );
+            output.textures_delta.clear();
+        }
+        value
+    }
+
+    #[test]
+    fn dragging_the_number_stays_on_the_rail_and_never_pushes_further_out() {
+        assert_eq!(drag_exposure(0., 3000.), 5.);
+        assert_eq!(drag_exposure(0., -3000.), -5.);
+        // An imported 6.5 EV: dragging further out leaves it; back in moves it.
+        assert_eq!(drag_exposure(6.5, 300.), 6.5);
+        let back = drag_exposure(6.5, -30.);
+        assert!(back < 6.5 && back > 5., "{back}");
+    }
+
+    #[test]
+    fn stepping_the_number_is_relative_input_typing_is_not() {
+        let (rail, typed) = (-5. ..=5., (-8., 8.));
+        let relative = |before, entered| {
+            number_input(NumberInput::Relative, before, entered, rail.clone(), typed)
+        };
+        // An arrow key at the rail's end, or on an imported value beyond it, never
+        // pushes further out; stepping back in moves it.
+        assert_eq!(relative(5., 5.1), 5.);
+        assert_eq!(relative(6.5, 6.6), 6.5);
+        assert_eq!(relative(6.5, 6.4), 6.4);
+        assert_eq!(
+            number_input(NumberInput::Typed, 0., 6., rail.clone(), typed),
+            6.
+        );
+        assert_eq!(number_input(NumberInput::Typed, 0., 9., rail, typed), 8.);
+    }
+
+    /// Exposure's slider from `start`, with `tabs` Tab presses to move the focus,
+    /// then Up pressed `ups` times.
+    fn step_exposure(start: f32, tabs: usize, ups: usize) -> f32 {
+        let ctx = egui::Context::default();
+        let mut value = start;
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        let mut frames = vec![vec![]];
+        frames.extend((0..tabs).map(|_| vec![key(egui::Key::Tab)]));
+        frames.extend((0..ups).map(|_| vec![key(egui::Key::ArrowUp)]));
+        frames.push(vec![]);
+        for events in frames {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400., 40.))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default()
+                        .frame(egui::Frame::NONE)
+                        .show(ui, |ui| {
+                            setting_slider(ui, ParameterId::Exposure, &mut value, 0.);
+                        });
+                },
+            );
+            output.textures_delta.clear();
+        }
+        value
+    }
+
+    /// Exposure's slider from `start`, stepped up `steps` times by a screen reader's
+    /// Increment action on its number.
+    fn increment_exposure_assistively(start: f32, steps: usize) -> f32 {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut value = start;
+        let input = |events| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400., 40.))),
+            events,
+            ..Default::default()
+        };
+        let mut run = |events| {
+            let mut output = ctx.run_ui(input(events), |ui| {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::NONE)
+                    .show(ui, |ui| {
+                        setting_slider(ui, ParameterId::Exposure, &mut value, 0.);
+                    });
+            });
+            output.textures_delta.clear();
+            output.platform_output.accesskit_update
+        };
+        let update = run(vec![]).expect("accessibility is on");
+        let (number, _) = update
+            .nodes
+            .iter()
+            .find(|(_, node)| node.role() == egui::accesskit::Role::SpinButton)
+            .expect("the number is a spin button");
+        let number = *number;
+        for _ in 0..steps {
+            run(vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    action: egui::accesskit::Action::Increment,
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    target_node: number,
+                    data: None,
+                },
+            )]);
+        }
+        run(vec![]);
+        value
+    }
+
+    #[test]
+    fn a_screen_reader_steps_the_number_within_the_rail() {
+        assert!(increment_exposure_assistively(0., 1) > 0.);
+        assert_eq!(increment_exposure_assistively(5., 3), 5.);
+        assert_eq!(increment_exposure_assistively(6.5, 3), 6.5);
+    }
+
+    #[test]
+    fn arrow_keys_on_the_focused_number_step_it_within_the_rail() {
+        // Find the Tab press that focuses the number: Up then moves 0 up.
+        let tabs = (1..6)
+            .find(|&tabs| step_exposure(0., tabs, 1) > 0.)
+            .expect("Tab reaches the number field");
+        assert_eq!(step_exposure(5., tabs, 3), 5.);
+        assert_eq!(step_exposure(6.5, tabs, 3), 6.5);
+    }
+}
+
+#[cfg(test)]
+mod segment_tests {
+    use super::*;
+
+    #[test]
+    fn segments_narrow_their_padding_rather_than_outgrow_their_place() {
+        // The Navigator's zoom levels in a narrow panel once grew past it,
+        // where the panel was no longer painted.
+        let options = [
+            (0, "Fit"),
+            (1, "50%"),
+            (2, "100%"),
+            (3, "200%"),
+            (4, "400%"),
+        ];
+        let ctx = egui::Context::default();
+        let mut drawn = None;
+        let mut place = 0.;
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let labels: Vec<&str> = options.iter().map(|(_, l)| *l).collect();
+            let at_min_padding = label_widths(ui, &labels, COMPACT_SEGMENTS.font - 1.)
+                .iter()
+                .map(|w| w + 2. * SEGMENT_MIN_PADDING)
+                .sum::<f32>()
+                + 2. * SEGMENT_INSET;
+            // Narrower than the minimum padding allows, wider than the tightest.
+            place = at_min_padding - 10.;
+            assert!(place >= tightest_segments_width(ui, &labels, &COMPACT_SEGMENTS));
+            ui.allocate_ui(Vec2::new(place, 40.), |ui| {
+                ui.set_max_width(place);
+                let mut value = 0;
+                let before = ui.cursor().left();
+                segmented(ui, &mut value, &options, place);
+                drawn = Some(ui.min_rect().right() - before);
+            });
+        });
+        output.textures_delta.clear();
+        let drawn = drawn.expect("drawn");
+        assert!(drawn <= place + 0.5, "{drawn} wide in {place}");
+    }
+}
+
+/// A spinner `size` points across with a hairline stroke: egui's draws three
+/// points thick at any size, heavy beside the interface's text.
+pub(super) fn spinner(ui: &mut egui::Ui, size: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    paint_spinner(ui, rect, None);
+    response
+}
+/// [`spinner`] painted into `rect`, in `color` or the interface's grey.
+pub(super) fn paint_spinner(ui: &egui::Ui, rect: Rect, color: Option<Color32>) {
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    ui.ctx().request_repaint();
+    let radius = rect.width().min(rect.height()) / 2. - 1.;
+    let time = ui.input(|i| i.time);
+    // egui's sweep: a turn a second, the arc growing and shrinking.
+    let start = time * std::f64::consts::TAU;
+    let end = start + 240f64.to_radians() * time.sin();
+    let points: Vec<Pos2> = (0..=24)
+        .map(|k| {
+            let angle = start + (end - start) * k as f64 / 24.;
+            let (sin, cos) = angle.sin_cos();
+            rect.center() + radius * Vec2::new(cos as f32, sin as f32)
+        })
+        .collect();
+    let color = color.unwrap_or_else(|| theme::palette(ui.ctx()).gray(175));
+    ui.painter()
+        .add(egui::Shape::line(points, Stroke::new(1.5, color)));
+}
+
+/// The slider grid's label column: captions end 5 pt short of it, slider
+/// rails and controls start 5 pt past it.
+const LABEL_COLUMN: f32 = 83.;
+fn label_column_id() -> egui::Id {
+    egui::Id::new("rawmakase-label-column")
+}
+/// The label column's width where `ui` draws: [`LABEL_COLUMN`], or a
+/// narrower one a [`LabelColumn`] set.
+pub(super) fn label_column(ui: &egui::Ui) -> f32 {
+    ui.ctx()
+        .data(|d| d.get_temp::<f32>(label_column_id()))
+        .unwrap_or(LABEL_COLUMN)
+}
+/// While alive, the slider grid's label column is `width` wide: Develop's
+/// tool drawers, whose labels are short, give the controls the room.
+pub(super) struct LabelColumn {
+    ctx: egui::Context,
+    before: Option<f32>,
+}
+impl LabelColumn {
+    pub(super) fn enter(ui: &egui::Ui, width: f32) -> Self {
+        let ctx = ui.ctx().clone();
+        let before = ctx.data_mut(|d| {
+            let before = d.get_temp::<f32>(label_column_id());
+            d.insert_temp(label_column_id(), width);
+            before
+        });
+        Self { ctx, before }
+    }
+}
+impl Drop for LabelColumn {
+    fn drop(&mut self) {
+        self.ctx.data_mut(|d| match self.before {
+            Some(width) => {
+                d.insert_temp(label_column_id(), width);
+            }
+            None => d.remove::<f32>(label_column_id()),
+        });
+    }
+}
+
+/// The caption band at the top of Develop's tab panel, naming what it shows
+/// as the panels' section headers do. Returns the band, for what its right
+/// end holds.
+pub(super) fn panel_caption(ui: &mut egui::Ui, name: &str) -> Rect {
+    let palette = theme::palette(ui.ctx());
+    ui.add_space(8.);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.), Sense::hover());
+    ui.painter().rect_filled(rect, 5., palette.gray(30));
+    ui.painter().text(
+        Pos2::new(rect.left() + 8., rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        name.to_uppercase(),
+        egui::FontId::proportional(11.),
+        palette.gray(145),
+    );
+    rect
+}
+/// A search field: a rounded box with a magnifier, the text and a button that
+/// clears it. Returns the text field's response.
+pub(super) fn search_field(ui: &mut egui::Ui, text: &mut String, hint: &str) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 28.), Sense::hover());
+    let field = rect
+        .with_min_x(rect.left() + 28.)
+        .with_max_x(rect.right() - 26.);
+    // The box goes under the text, its look known once the field is drawn.
+    let backdrop = ui.painter().add(egui::Shape::Noop);
+    let response = ui
+        .scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(field)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(text)
+                        .hint_text(hint)
+                        .frame(egui::Frame::new())
+                        .font(egui::FontId::proportional(12.))
+                        .desired_width(field.width()),
+                )
+            },
+        )
+        .inner;
+    let focused = response.has_focus();
+    ui.painter().set(
+        backdrop,
+        egui::epaint::RectShape::new(
+            rect,
+            6.,
+            palette.gray(if focused { 26 } else { 30 }),
+            Stroke::new(
+                1.,
+                if focused {
+                    palette.accent()
+                } else {
+                    palette.gray(44)
+                },
+            ),
+            egui::StrokeKind::Inside,
+        ),
+    );
+    icons::paint_at(
+        ui.painter(),
+        Icon::Search,
+        Pos2::new(rect.left() + 15., rect.center().y),
+        13.,
+        palette.gray(130),
+    );
+    if !text.is_empty() {
+        let clear = Rect::from_center_size(
+            Pos2::new(rect.right() - 14., rect.center().y),
+            Vec2::splat(20.),
+        );
+        let hit = ui
+            .interact(clear, response.id.with("clear"), Sense::click())
+            .on_hover_text("Clear the search")
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let tint = palette.gray(if hit.hovered() { 230 } else { 140 });
+        icons::paint_at(ui.painter(), Icon::Close, clear.center(), 11., tint);
+        if hit.clicked() {
+            text.clear();
+        }
+    }
+    response
 }

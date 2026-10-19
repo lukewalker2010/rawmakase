@@ -12,6 +12,7 @@ on:
       - '.github/triage.yml'
       - '.github/workflows/triage.yml'
       - '.github/workflows/workflow-lint.yml'
+      - '**.md'
   pull_request:
     paths-ignore:
       - 'website/**'
@@ -22,6 +23,7 @@ on:
       - '.github/triage.yml'
       - '.github/workflows/triage.yml'
       - '.github/workflows/workflow-lint.yml'
+      - '**.md'
   workflow_call:
     inputs:
       source-ref:
@@ -60,7 +62,7 @@ jobs:
       - name: Install dependencies
         run: >-
           pacman -Syu --noconfirm --needed
-          rustup git libraw lcms2 pkgconf desktop-file-utils perl-image-exiftool
+          rustup git pkgconf desktop-file-utils perl-image-exiftool
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.source-ref || github.sha }}
@@ -85,19 +87,22 @@ jobs:
           rustup toolchain install "$msrv" --profile minimal
           cargo +"$msrv" check --locked --all-targets
       - run: cargo fmt --check
-      # The protocol crate and the standalone client build without the app's
-      # native libraries; fmt above covers the whole workspace.
-      - name: Check the control protocol and client
+      # The model, file formats, the catalog, the protocol crate and the standalone
+      # client build without the RAW decoders, wgpu or GUI, and the renderer
+      # without the RAW decoders or GUI; fmt above covers the whole workspace.
+      - name: Check the model, file formats, catalog, renderer, control protocol, remote worker and client
         run: |
-          cargo clippy --locked --all-targets -p rawmakase-protocol -p rawmakase-ctl -- -D warnings
-          cargo test --locked -p rawmakase-protocol -p rawmakase-ctl
-      - run: cargo clippy --all-targets --locked -- -D warnings
+          cargo clippy --locked --all-targets -p rawmakase-tiff -p rawmakase-raw -p rawmakase-model -p rawmakase-interop -p rawmakase-catalog -p rawmakase-engine -p rawmakase-protocol -p rawmakase-remote -p rawmakase-ctl -- -D warnings
+          cargo test --locked -p rawmakase-model --all-features
+          cargo test --locked -p rawmakase-tiff -p rawmakase-raw -p rawmakase-interop -p rawmakase-catalog -p rawmakase-engine
+          cargo test --locked -p rawmakase-protocol -p rawmakase-remote -p rawmakase-ctl
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # Packagers can leave out the usage report (Cargo.toml, `telemetry`).
       - run: cargo clippy --all-targets --locked --no-default-features -- -D warnings
       # Tests that need private RAW files, camera profiles or a GPU are #[ignore]d.
       # exiftool reads exported metadata back as an independent reader; Arch
       # installs it in vendor_perl, outside PATH.
-      - run: PATH="/usr/bin/vendor_perl:$PATH" cargo test --locked
+      - run: PATH="/usr/bin/vendor_perl:$PATH" cargo test --locked -p rawmakase -p rawmakase-decode -p rawmakase-export
         env:
           RAWMAKASE_REQUIRE_EXIFTOOL: "1"
       - name: Validate desktop entry
@@ -105,8 +110,8 @@ jobs:
 
   check-arm64:
     name: Test on aarch64
-    # Arch Linux has no arm64 container image, so this builds LibRaw the way the
-    # aarch64 release does.
+    # Arch Linux has no arm64 container image, so this runs on Ubuntu, as the
+    # aarch64 release builds.
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
@@ -116,23 +121,18 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential autoconf automake libtool pkg-config libjpeg-dev zlib1g-dev libvulkan1 libxkbcommon-dev libwayland-dev
+          sudo apt-get install -y build-essential pkg-config libvulkan1 libxkbcommon-dev libwayland-dev
           rustup toolchain install stable --profile minimal
           rustup default stable
-          bash packaging/native-deps.sh "$RUNNER_TEMP/native"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' && !inputs.source-ref }}
       - name: Test
-        run: |
-          export PKG_CONFIG_PATH="$RUNNER_TEMP/native/lib/pkgconfig"
-          export LD_LIBRARY_PATH="$RUNNER_TEMP/native/lib"
-          export CXXFLAGS="-DCMS_NO_REGISTER_KEYWORD"
-          cargo test --locked
+        run: cargo test --locked --workspace
 
   check-windows:
     name: Test on Windows
-    # MSVC with LibRaw and Little CMS from vcpkg (packaging/windows/deps.ps1).
+    # MSVC, with the C runtime linked statically (.cargo/config.toml).
     runs-on: windows-2025
     timeout-minutes: 60
     steps:
@@ -145,37 +145,31 @@ jobs:
       - name: Windows support in this source
         id: source
         shell: bash
-        run: echo "windows=$(test -f packaging/windows/deps.ps1 && echo true || echo false)" >> "$GITHUB_OUTPUT"
+        run: echo "windows=$(test -f packaging/windows/rawmakase.ico && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - if: steps.source.outputs.windows == 'true'
         name: Rust
         run: |
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
-      # vcpkg's binary cache; release builds (release.yml) start from scratch.
-      # vcpkg's package hashes cover the image's CMake and PowerShell versions,
-      # and runners mix image versions during a rollout, so each image version
-      # keeps its own cache.
-      - if: steps.source.outputs.windows == 'true'
-        id: image
-        shell: bash
-        run: echo "version=$ImageVersion" >> "$GITHUB_OUTPUT"
-      - if: steps.source.outputs.windows == 'true'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~\AppData\Local\vcpkg\archives
-          key: vcpkg-${{ steps.image.outputs.version }}-${{ hashFiles('packaging/windows/deps.ps1', 'packaging/windows/vcpkg-ports/**') }}
-      - if: steps.source.outputs.windows == 'true'
-        name: LibRaw and Little CMS
-        run: packaging/windows/deps.ps1 "$env:RUNNER_TEMP\deps"
       - if: steps.source.outputs.windows == 'true'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' && !inputs.source-ref }}
       - if: steps.source.outputs.windows == 'true'
-        run: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The catalog commits with synchronous=FULL into tempfile directories.
+      # %TEMP% is on C:, the runner's OS disk, where each flush is slow, and
+      # Defender scans every file created there: the catalog and library tests
+      # ran 10 to 20 times slower than on Linux or macOS. RUNNER_TEMP is on D:.
+      - if: steps.source.outputs.windows == 'true'
+        name: Temporary files on D:, outside Defender's scan
+        run: |
+          Add-MpPreference -ExclusionPath "$env:RUNNER_TEMP", "$env:GITHUB_WORKSPACE"
+          "TMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
+          "TEMP=$env:RUNNER_TEMP" >> $env:GITHUB_ENV
       # Tests that need private RAW files, camera profiles or a GPU are #[ignore]d.
       - if: steps.source.outputs.windows == 'true'
-        run: cargo test --locked
+        run: cargo test --locked --workspace
 
   # Without this job the macOS-only code is compiled for the first time by
   # release.yml, after the release commit is already on main, so a macOS-only
@@ -190,37 +184,16 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.source-ref || github.sha }}
-      - name: Dependencies
+      - name: Rust
         run: |
-          brew install autoconf automake libtool pkg-config libomp jpeg-turbo
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
-          # LibRaw and Little CMS are built the way the macOS release builds
-          # them (build.rs wants LibRaw >= 0.22); jpeg-turbo is what LibRaw's
-          # own build links its JPEG decoder against, as macOS has no libjpeg.
-          # build.rs links the OpenMP runtime from LIBOMP_PREFIX.
-          jpeg_prefix=$(brew --prefix jpeg-turbo)
-          {
-            echo "PKG_CONFIG_PATH=$RUNNER_TEMP/native/lib/pkgconfig:$jpeg_prefix/lib/pkgconfig"
-            echo "CPPFLAGS=-I$jpeg_prefix/include"
-            echo "LDFLAGS=-L$jpeg_prefix/lib"
-            echo "LIBOMP_PREFIX=$(brew --prefix libomp)"
-            # LibRaw's decoders are OpenMP-parallel; Little CMS lost its register
-            # keyword to C++17.
-            echo "CXXFLAGS=-DCMS_NO_REGISTER_KEYWORD"
-            # The test binaries load the libraries built above at run time.
-            echo "DYLD_LIBRARY_PATH=$RUNNER_TEMP/native/lib:$(brew --prefix libomp)/lib"
-          } >> "$GITHUB_ENV"
-      # GITHUB_ENV takes effect in the next step, including the JPEG paths
-      # needed by LibRaw's configure script.
-      - name: Build native dependencies
-        run: bash packaging/native-deps.sh "$RUNNER_TEMP/native"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' && !inputs.source-ref }}
-      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # Tests that need private RAW files, camera profiles or a GPU are #[ignore]d.
-      - run: cargo test --locked
+      - run: cargo test --locked --workspace
 
   package:
     name: Build, install and run Arch package
@@ -230,7 +203,7 @@ jobs:
     steps:
       - name: Install dependencies
         run: >-
-          pacman -Syu --noconfirm --needed rust git libraw lcms2 pkgconf namcap
+          pacman -Syu --noconfirm --needed rust git pkgconf namcap
           hicolor-icon-theme libxkbcommon vulkan-icd-loader wayland
           libxkbcommon-x11 libx11 libxcb libxcursor libxi libxrandr libglvnd
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -260,11 +233,17 @@ jobs:
         run: |
           pacman -U --noconfirm packaging/arch/rawmakase-git/*.pkg.tar.zst
           rawmakase --help
+          # The selection runtime is opened lazily, so only loading it shows it works.
+          # Release rehearsals of tags whose recipe predates the runtime skip it.
+          if grep -q '^_ortver=' packaging/arch/rawmakase-git/PKGBUILD; then
+            python -c "import ctypes; ctypes.CDLL('/usr/lib/rawmakase/libonnxruntime.so')"
+          fi
 
   dependencies:
     name: Module dependencies
     # scripts/deps-allowed.txt lists the dependencies between top-level modules;
-    # a new one, or a listed one the code no longer has, fails this job.
+    # a new one, a listed one the code no longer has, a cycle, or a chain that
+    # scripts/deps-closures.txt forbids fails this job.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -272,6 +251,79 @@ jobs:
         with:
           ref: ${{ inputs.source-ref || github.sha }}
       - run: python3 scripts/deps.py check
+      - name: Verify generated Shadows calibration
+        run: python3 scripts/corpus/shadow-context.py --check
+      - name: Camera calibration and comparison checks
+        run: |
+          python3 -m venv /tmp/rawmakase-parity-tests
+          /tmp/rawmakase-parity-tests/bin/pip install numpy pillow
+          /tmp/rawmakase-parity-tests/bin/python -m unittest discover -s scripts/cameras
+          /tmp/rawmakase-parity-tests/bin/python -m unittest discover -s scripts/corpus
+
+  crates:
+    name: Crates without native libraries
+    # The model, file formats, catalog and control protocol depend on no app,
+    # GPU, GUI or native imaging crate, and the renderer on no app, GUI or
+    # native imaging crate; no workspace crate depends on or links a C RAW
+    # library or Little CMS (scripts/crate-closures.sh). They build and test on
+    # a machine with no LibRaw or Little CMS installed, and so does the decoding
+    # crate. The catalog's bundled SQLite is the one C library they build.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
+      - name: No LibRaw or Little CMS here
+        run: |
+          if pkg-config --exists libraw || pkg-config --exists lcms2; then
+            echo "LibRaw or Little CMS is installed; this job must build without them"
+            exit 1
+          fi
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - run: scripts/crate-closures.sh
+      - run: cargo test --locked -p rawmakase-model --all-features
+      - run: cargo test --locked -p rawmakase-tiff -p rawmakase-raw -p rawmakase-interop -p rawmakase-catalog -p rawmakase-engine -p rawmakase-protocol
+      - run: cargo test --locked -p rawmakase-decode
+
+  postgres:
+    name: Portable catalog SQL
+    # The catalog's SQL is written for SQLite and Postgres alike, so a second
+    # backend could be added behind catalog::db (issue #341). Every portable
+    # statement must prepare against schema.postgres.sql: Postgres parses and
+    # type-checks it, with no data and no backend code in the app.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source-ref || github.sha }}
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Write the check
+        run: cargo test --locked -p rawmakase-catalog writes_the_postgres_check -- --ignored
+        env:
+          RAWMAKASE_POSTGRES_CHECK: ${{ runner.temp }}/postgres-check.sql
+      - name: Prepare every portable statement on Postgres
+        run: psql -X -q -f "$RUNNER_TEMP/postgres-check.sql"
+        env:
+          PGHOST: localhost
+          PGUSER: postgres
+          PGPASSWORD: postgres
 
   audit:
     name: Dependency licenses and advisories

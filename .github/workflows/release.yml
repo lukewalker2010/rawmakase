@@ -64,7 +64,7 @@ jobs:
           fi
           mkdir -p "$RUNNER_TEMP/release-notes"
           cp "$notes" "$RUNNER_TEMP/release-notes/notes.md"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: reviewed-notes
           path: ${{ runner.temp }}/release-notes/notes.md
@@ -111,29 +111,18 @@ jobs:
       - name: Build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential autoconf automake libtool pkg-config libjpeg-dev zlib1g-dev patchelf libvulkan1 libxkbcommon-dev libwayland-dev
+          sudo apt-get install -y build-essential pkg-config patchelf libvulkan1 libxkbcommon-dev libwayland-dev
           rustup toolchain install 1.98.1 --profile minimal
           rustup default 1.98.1
           toolchain_bin=$(dirname "$(rustup which --toolchain 1.98.1 rustc)")
           echo "$toolchain_bin" >> "$GITHUB_PATH"
-          bash packaging/native-deps.sh "$RUNNER_TEMP/native"
       - name: Build and stage portable payload
         run: |
-          export PKG_CONFIG_PATH="$RUNNER_TEMP/native/lib/pkgconfig"
-          export LD_LIBRARY_PATH="$RUNNER_TEMP/native/lib"
-          export CXXFLAGS="-DCMS_NO_REGISTER_KEYWORD"
           cargo build --release --locked --manifest-path release-source/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
-          python3 packaging/linux/bundle.py target/release/rawmakase dist/linux-root "$RUNNER_TEMP/native"
+          python3 packaging/linux/bundle.py target/release/rawmakase dist/linux-root
           mkdir -p dist/upload
           tar -C dist/linux-root -czf "dist/upload/rawmakase-$VERSION-$ARCH-linux.tar.gz" usr
-          # Both architectures bundle the same library sources; publish them once.
-          if [[ "$TARGET" = linux-amd64 ]]; then
-            mkdir -p "$RUNNER_TEMP/native-sources/build"
-            cp "$RUNNER_TEMP/native/sources/"* "$RUNNER_TEMP/native-sources/"
-            cp packaging/native-deps.sh "$RUNNER_TEMP/native-sources/build/"
-            tar -C "$RUNNER_TEMP/native-sources" -czf "dist/upload/rawmakase-$VERSION-native-sources.tar.gz" .
-          fi
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.target }}
           path: dist/upload/*
@@ -151,7 +140,7 @@ jobs:
     steps:
       - name: Dependencies
         run: >-
-          pacman -Syu --noconfirm --needed rust git libraw lcms2 pkgconf
+          pacman -Syu --noconfirm --needed rust git pkgconf
           hicolor-icon-theme libxkbcommon vulkan-icd-loader wayland namcap
           libxkbcommon-x11 libx11 libxcb libxcursor libxi libxrandr libglvnd
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -172,12 +161,15 @@ jobs:
           namcap dist/arch/PKGBUILD dist/arch/*.pkg.tar.zst
           pacman -U --noconfirm dist/arch/*.pkg.tar.zst
           rawmakase --version
+          # The selection runtime is opened lazily, so only loading it shows it works.
+          python -c "import ctypes; ctypes.CDLL('/usr/lib/rawmakase/libonnxruntime.so')"
           pacman -R --noconfirm rawmakase
+          test ! -e /usr/lib/rawmakase/libonnxruntime.so
           cp dist/arch/*.pkg.tar.zst dist/upload/
           cp "dist/arch/rawmakase-$VERSION.tar.gz" "dist/upload/rawmakase-$VERSION-source.tar.gz"
           tar -C dist/arch -czf "dist/upload/rawmakase-$VERSION-arch-recipe.tar.gz" PKGBUILD .SRCINFO
           # AUR pushes are intentionally disabled. GitHub is the distribution channel.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-arch
           path: dist/upload/*
@@ -206,7 +198,7 @@ jobs:
             --app-icon RAWmakase --platform macosx --minimum-deployment-target 15.0 \
             --output-partial-info-plist compiled-icon/partial.plist
           test -s compiled-icon/Assets.car
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-icon
           path: compiled-icon/Assets.car
@@ -241,29 +233,62 @@ jobs:
           path: release-source
           persist-credentials: false
       - name: Download the compiled Liquid Glass icon
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: macos-icon
           path: compiled-icon
       - name: Build dependencies and app
         run: |
-          brew install autoconf automake libtool pkg-config libomp jpeg-turbo librsvg
+          # rsvg-convert renders the flat icon; it is not shipped.
+          brew install librsvg
           rustup toolchain install 1.98.1 --profile minimal
           rustup default 1.98.1
           toolchain_bin=$(dirname "$(rustup which --toolchain 1.98.1 rustc)")
           export PATH="$toolchain_bin:$PATH"
-          jpeg_prefix=$(brew --prefix jpeg-turbo)
-          export PKG_CONFIG_PATH="$jpeg_prefix/lib/pkgconfig"
-          export CPPFLAGS="-I$jpeg_prefix/include"
-          export LDFLAGS="-L$jpeg_prefix/lib"
-          bash packaging/native-deps.sh "$RUNNER_TEMP/native"
-          export PKG_CONFIG_PATH="$RUNNER_TEMP/native/lib/pkgconfig:$PKG_CONFIG_PATH"
-          LIBOMP_PREFIX=$(brew --prefix libomp)
-          export LIBOMP_PREFIX
-          export CXXFLAGS="-DCMS_NO_REGISTER_KEYWORD"
           cargo build --release --locked --manifest-path release-source/Cargo.toml --target-dir "$GITHUB_WORKSPACE/target"
-          python3 packaging/macos/bundle.py target/release/rawmakase dist/RAWmakase.app "$VERSION" "$RUNNER_TEMP/native" --minimum-macos "$MACOSX_DEPLOYMENT_TARGET" --icon-assets compiled-icon/Assets.car
-      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1
+          python3 packaging/macos/bundle.py target/release/rawmakase dist/RAWmakase.app "$VERSION" --minimum-macos "$MACOSX_DEPLOYMENT_TARGET" --icon-assets compiled-icon/Assets.car
+          # A tar keeps the bundle's symlinks and permissions through the artifact.
+          tar -C dist -cf "$RUNNER_TEMP/RAWmakase.app.tar" RAWmakase.app
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: macos-app-${{ matrix.target }}
+          path: ${{ runner.temp }}/RAWmakase.app.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  # Signing and notarization are their own job, so re-running a failed
+  # notarization does not rebuild the app (about 30 minutes on Intel).
+  macos-sign:
+    name: macOS sign and notarize (${{ matrix.arch }})
+    needs: [prepare, macos]
+    # Each DMG is verified on its own architecture, including running the CLI.
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            target: macos-arm64
+          - runner: macos-15-intel
+            arch: x86_64
+            target: macos-amd64
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: macos-app-${{ matrix.target }}
+          path: ${{ runner.temp }}/app
+      - name: Unpack the app
+        run: |
+          mkdir -p dist
+          tar -C dist -xf "$RUNNER_TEMP/app/RAWmakase.app.tar"
+      - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1
         with:
           ruby-version: '3.3'
       - name: Sign and notarize DMG
@@ -279,7 +304,7 @@ jobs:
           for key in APPLE_CERTIFICATE_P12 APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_TEAM_ID APPLE_APP_PASSWORD; do
             test -n "${!key}" || { echo "Missing repository secret: $key" >&2; exit 1; }
           done
-          gem install native-packages --version 0.7.0 --no-document
+          gem install native-packages --version 0.10.0 --no-document
           # The cask is rendered later, once both DMGs exist.
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
           export SOURCE_DATE_EPOCH
@@ -290,17 +315,36 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
         run: bash packaging/macos/verify.sh "dist/upload/rawmakase-v$VERSION-macos-$ARCH.dmg" "$ARCH"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-${{ matrix.target }}
           path: dist/upload/*
           if-no-files-found: error
 
   windows:
-    name: Windows installer and archive (x86_64)
+    name: Windows installer and archive (${{ matrix.arch }})
     needs: prepare
-    runs-on: windows-2025
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    # Each architecture builds natively. setup-ruby has no Ruby 3.3 for
+    # Windows on ARM64.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            arch: x86_64
+            target: windows-amd64
+            ruby: '3.3'
+          - runner: windows-11-arm
+            arch: aarch64
+            target: windows-arm64
+            ruby: '3.4'
+    # runs-on is a matrix expression, so name the shell Windows uses by default
+    # (and tell actionlint these steps are PowerShell).
+    defaults:
+      run:
+        shell: pwsh
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
@@ -320,20 +364,20 @@ jobs:
       - name: Windows support in the release source
         id: source
         shell: bash
-        run: echo "windows=$(test -f release-source/packaging/windows/deps.ps1 && echo true || echo false)" >> "$GITHUB_OUTPUT"
+        run: echo "windows=$(test -f release-source/packaging/windows/rawmakase.ico && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - if: steps.source.outputs.windows == 'true'
         name: Build dependencies and app
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           rustup toolchain install 1.98.1 --profile minimal
           rustup default 1.98.1
-          packaging/windows/deps.ps1 "$env:RUNNER_TEMP\deps"
+          packaging/windows/toolchain.ps1
           cargo build --release --locked --manifest-path release-source/Cargo.toml --target-dir "$env:GITHUB_WORKSPACE\target"
-          packaging/windows/stage.ps1 target\release\rawmakase.exe "$env:RUNNER_TEMP\deps" dist\windows
+          packaging/windows/stage.ps1 target\release\rawmakase.exe dist\windows
       - if: steps.source.outputs.windows == 'true'
-        uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1
+        uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1
         with:
-          ruby-version: '3.3'
+          ruby-version: ${{ matrix.ruby }}
       - if: steps.source.outputs.windows == 'true'
         name: Installer and portable archive
         run: |
@@ -341,41 +385,41 @@ jobs:
           if (-not (Get-Command iscc -ErrorAction SilentlyContinue) -and -not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
             choco install innosetup --yes --no-progress
           }
-          gem install native-packages --version 0.7.0 --no-document
+          gem install native-packages --version 0.10.0 --no-document
           $env:SOURCE_DATE_EPOCH = git show -s --format=%ct HEAD
-          native-packages build --version $env:VERSION --target windows-amd64 --defer-recipes --output "$env:RUNNER_TEMP\windows-packages"
+          native-packages build --version $env:VERSION --target ${{ matrix.target }} --defer-recipes --output "$env:RUNNER_TEMP\windows-packages"
           New-Item -ItemType Directory dist\upload | Out-Null
-          Copy-Item "$env:RUNNER_TEMP\windows-packages\packages\windows-amd64\inno\*.exe" dist\upload\
+          Copy-Item "$env:RUNNER_TEMP\windows-packages\packages\${{ matrix.target }}\inno\*.exe" dist\upload\
           # The portable archive has no updater marker: like the Linux archive,
           # it is told about new releases rather than replacing itself.
-          $name = "rawmakase-v$env:VERSION-x86_64-pc-windows-msvc"
+          $name = "rawmakase-v$env:VERSION-${{ matrix.arch }}-pc-windows-msvc"
           Copy-Item dist\windows "dist\$name" -Recurse
           Compress-Archive -Path "dist\$name" -DestinationPath "dist\upload\$name.zip"
       - if: steps.source.outputs.windows == 'true'
         name: Verify the finished download
-        run: packaging/windows/verify.ps1 "dist\upload\rawmakase-v$env:VERSION-x86_64-pc-windows-msvc-setup.exe" $env:VERSION
+        run: packaging/windows/verify.ps1 "dist\upload\rawmakase-v$env:VERSION-${{ matrix.arch }}-pc-windows-msvc-setup.exe" $env:VERSION
       - if: steps.source.outputs.windows == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-windows-amd64
+          name: release-${{ matrix.target }}
           path: dist/upload/*
           if-no-files-found: error
 
-  # native-packages' shared workflow turns the Linux archives into DEB and RPM
-  # packages and renders the Homebrew cask from the notarized DMGs, then checks
-  # the packages install cleanly, all before anything is published.
+  # native-packages' shared workflow turns the Linux archives into DEB, RPM and
+  # AppImage packages and renders the Homebrew cask from the notarized DMGs,
+  # then checks the packages install and run, all before anything is published.
   package-inputs:
     name: Gather packaging inputs
-    needs: [linux, macos]
+    needs: [linux, macos-sign]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: package-inputs
           path: |
@@ -394,7 +438,7 @@ jobs:
 
   publish:
     name: Publish verified packages
-    needs: [prepare, ci, linux, arch, macos, windows, packages]
+    needs: [prepare, ci, linux, arch, macos-sign, windows, packages]
     if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -405,25 +449,28 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: reviewed-notes
           path: release-notes
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: native-packages
           path: native-packages
-      - name: Add the DEB and RPM packages and the Homebrew cask
-        run: cp native-packages/packages/*/deb/*.deb native-packages/packages/*/rpm/*.rpm native-packages/recipes/homebrew/rawmakase.rb dist/
+      - name: Add the DEB, RPM and AppImage packages and the Homebrew cask
+        run: |
+          cp native-packages/packages/*/deb/*.deb native-packages/packages/*/rpm/*.rpm \
+            native-packages/packages/*/appimage/*.AppImage native-packages/packages/*/appimage/*.AppImage.zsync \
+            native-packages/recipes/homebrew/rawmakase.rb dist/
       - name: Final checksums
         working-directory: dist
         run: sha256sum -- * > SHA256SUMS
-      - uses: ruby/setup-ruby@14594264cd68ce8a2345dd349bc3d138a4ef85c8 # v1
+      - uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1
         with:
           ruby-version: '3.3'
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -435,7 +482,7 @@ jobs:
       # checksums.txt and its Ed25519 signature, which the app's updater
       # verifies against assets/update-public-key.hex before installing.
       - name: Sign update manifest
-        uses: crmne/native-packages/.github/actions/sign-release@999768410cf53cdc68c8679c09cb14de1a6bca7b # v0.8.1
+        uses: crmne/native-packages/.github/actions/sign-release@226fb48cb375c7cb309a3e642c7228a6e00e9ebf # v0.10.0
         with:
           directory: dist
           public-key: release-source/assets/update-public-key.hex
@@ -443,7 +490,7 @@ jobs:
         env:
           RAWMAKASE_UPDATE_SIGNING_KEY: ${{ secrets.RAWMAKASE_UPDATE_SIGNING_KEY }}
       - name: Attest packages
-        uses: crmne/native-packages/.github/actions/attest@999768410cf53cdc68c8679c09cb14de1a6bca7b # v0.8.1
+        uses: crmne/native-packages/.github/actions/attest@226fb48cb375c7cb309a3e642c7228a6e00e9ebf # v0.10.0
         with:
           subject-path: dist/*
       # Preserve the exact bytes prepared for upload, including the signed
@@ -464,7 +511,7 @@ jobs:
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "RAWmakase ${RELEASE_TAG#v}" --notes-file release-notes/notes.md
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: expected-checksums
           path: ${{ runner.temp }}/expected-checksums.txt
@@ -478,7 +525,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: expected-checksums
           path: expected

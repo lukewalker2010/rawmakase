@@ -1,13 +1,11 @@
-// Release builds on Windows open no console window beside the app.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// A console subsystem puts the generic console icon on the Windows taskbar.
+// Command output still attaches to the parent console when there is one.
+#![cfg_attr(windows, windows_subsystem = "windows")]
 use anyhow::Result;
 mod mcp;
 use clap::{Parser, Subcommand};
-use rawmakase::{
-    develop::{self, Recipe},
-    export::ExportOptions,
-    raw,
-};
+use rawmakase::model::recipe::Recipe;
+use rawmakase::{camera_data, develop, export_settings::ExportOptions, raw};
 use std::{path::PathBuf, sync::atomic::AtomicBool, time::Instant};
 #[derive(Parser)]
 #[command(version, about = "A personal RAW photo editor")]
@@ -47,6 +45,16 @@ enum Command {
         root: i64,
         folder: PathBuf,
     },
+    /// Find photos added, deleted, moved or renamed outside RAWmakase in a
+    /// catalog folder (by its path on this computer), or in every folder.
+    /// Prints what Synchronize Folder would do; --apply does it, accepting
+    /// what the review ticks by default. Nothing on disk is changed.
+    SyncFolder {
+        catalog: PathBuf,
+        folder: Option<PathBuf>,
+        #[arg(long)]
+        apply: bool,
+    },
     Compare {
         input: PathBuf,
         reference: PathBuf,
@@ -58,6 +66,13 @@ enum Command {
     },
     Inspect {
         input: PathBuf,
+    },
+    /// Render one RAW with several XMP sidecars, developing it once: for comparisons
+    /// with Camera Raw. `jobs` is a JSON list of {"xmp", "output", "max_edge"}; existing
+    /// outputs are skipped.
+    RenderBatch {
+        input: PathBuf,
+        jobs: PathBuf,
     },
     Thumbnail {
         input: PathBuf,
@@ -90,12 +105,53 @@ enum Command {
         /// Apply Auto white balance, as the WB menu's Auto does (before --auto).
         #[arg(long)]
         auto_wb: bool,
+        /// Write the photo at a stage of the pipeline instead, as a 32-bit float TIFF
+        /// of linear ProPhoto RGB at full size (docs/scene-tone-stage.md).
+        #[arg(long, value_enum)]
+        tap: Option<Tap>,
+    },
+    /// Print each file's decode fingerprint as a line of JSON: what opening and
+    /// unpacking it yields, for decode regression checks.
+    Fingerprint {
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
+    },
+    /// Print each file's develop fingerprint as a line of JSON: the image each
+    /// decode mode (full, half) makes, hashed, for decoder regression checks.
+    DecodeDump {
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
+        /// Also write each full decode that is not a mosaic here, as raw floats.
+        #[arg(long)]
+        floats: Option<PathBuf>,
+    },
+    /// Print each file's half-size check as a line of JSON: RAWmakase's
+    /// half-size decode against its full decode reduced (colour, detail) and
+    /// its time over the full develop's.
+    HalfCheck {
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
+        /// The files' reference as JSON (`{"ratio":…,"de_mean":…,"de_p95":…,
+        /// "detail":…}`): LibRaw's half-size decode, recorded, which
+        /// scripts/corpus/dataset-half.py passes. Without one, absolute limits.
+        #[arg(long, value_parser = parse_reference)]
+        reference: Option<rawmakase::half_check::Reference>,
     },
     Benchmark {
         input: PathBuf,
         #[arg(long, default_value_t = 20)]
         iterations: usize,
     },
+}
+/// A half-size check's `--reference`.
+fn parse_reference(json: &str) -> Result<rawmakase::half_check::Reference, String> {
+    serde_json::from_str(json).map_err(|e| e.to_string())
+}
+/// A stage `render --tap` writes.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum Tap {
+    SceneInput,
+    SceneOutput,
 }
 /// A windows-subsystem program starts without a console, so commands run from
 /// a terminal would print nothing. Writes to that terminal instead, unless the
@@ -193,10 +249,16 @@ fn main() -> Result<()> {
             root,
             folder,
         }) => {
-            rawmakase::catalog::Catalog::open(&catalog)?.relink_root(root, &folder)?;
+            rawmakase::catalog::Catalog::open(&catalog)?
+                .relink_root(rawmakase::catalog::RootId(root), &folder)?;
             println!("Root folder relinked");
         }
 
+        Some(Command::SyncFolder {
+            catalog,
+            folder,
+            apply,
+        }) => sync_folder(&catalog, folder.as_deref(), apply)?,
         Some(Command::Compare {
             input,
             reference,
@@ -213,7 +275,7 @@ fn main() -> Result<()> {
             )?;
         }
         Some(Command::Inspect { input }) => {
-            let r = raw::Raw::open(&input)?;
+            let r = rawmakase::photo::open(&input)?;
             let (profiles, errors) = rawmakase::camera_profiles::installed(&r.metadata);
             eprintln!(
                 "Profile folders: {:?}\nAvailable profiles: {:?}\nProfile errors: {:?}",
@@ -222,14 +284,64 @@ fn main() -> Result<()> {
                 errors
             );
             println!(
-                "LibRaw {}\n{}",
+                "{}\n{}",
                 raw::version(),
                 serde_json::to_string_pretty(&r.metadata)?
             );
         }
+        Some(Command::RenderBatch { input, jobs }) => {
+            #[derive(serde::Deserialize)]
+            struct Job {
+                xmp: PathBuf,
+                output: PathBuf,
+                #[serde(default)]
+                max_edge: u32,
+            }
+            let jobs: Vec<Job> = serde_json::from_str(&std::fs::read_to_string(&jobs)?)?;
+            let photo = rawmakase::photo::open(&input)?;
+            let im = photo.develop(
+                camera_data::Decode::full(Default::default()),
+                &AtomicBool::new(false),
+            )?;
+            let (profiles, _) = rawmakase::camera_profiles::installed(&im.metadata);
+            let base = Recipe::with_profiles(&im.metadata, &profiles);
+            let camera = rawmakase::exif::read(&input);
+            for job in jobs.iter().filter(|j| !j.output.exists()) {
+                let rendered = (|| -> Result<()> {
+                    let preset =
+                        rawmakase::xmp::parse(&job.xmp, &std::fs::read_to_string(&job.xmp)?)?;
+                    let edit = preset.apply(
+                        &base,
+                        &im.metadata,
+                        &profiles,
+                        Some(&rawmakase::develop::Measures(&im)),
+                    )?;
+                    let out = develop::render(&im, &edit.checked()?, job.max_edge)?;
+                    rawmakase::export::export_with(
+                        &job.output,
+                        &input,
+                        &out,
+                        &im.metadata,
+                        &ExportOptions {
+                            max_edge: job.max_edge,
+                            ..Default::default()
+                        },
+                        &rawmakase::export::Embed {
+                            camera: camera.clone(),
+                            ..Default::default()
+                        },
+                        rawmakase::export::Replace::NoClobber,
+                    )?;
+                    Ok(())
+                })();
+                if let Err(e) = rendered {
+                    eprintln!("{}: {e:#}", job.output.display());
+                }
+            }
+        }
         Some(Command::Thumbnail { input, output }) => {
             use std::io::Write;
-            let data = raw::Raw::open(&input)?.thumbnail()?;
+            let data = rawmakase::photo::open(&input)?.thumbnail()?;
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -249,13 +361,14 @@ fn main() -> Result<()> {
             recipe,
             auto,
             auto_wb,
+            tap,
         }) => {
             let t = Instant::now();
-            let r = raw::Raw::open(&input)?;
+            let r = rawmakase::photo::open(&input)?;
             let mut edit = if let Some(p) = recipe {
-                rawmakase::presets::load_preset(&p)?
+                rawmakase::presets::load_preset(&p)?.recipe
             } else {
-                rawmakase::storage::load(&input)?
+                rawmakase::catalog::legacy_sidecar::load(&input)?
                     .map(|s| s.recipe)
                     .unwrap_or_else(|| {
                         Recipe::with_profiles(
@@ -271,24 +384,25 @@ fn main() -> Result<()> {
                 edit.profile = Some(rawmakase::camera_profiles::load(&p, &r.metadata)?);
                 // A chosen profile starts at 100%, as in the app.
                 edit.profile_amount = 1.;
-                edit.engine = edit.engine.max(3);
-                edit.profile_tone = true;
-                edit.reference_curves = true;
-                edit.wide_gamut_curves = true;
                 edit.use_camera_baseline(&r.metadata);
                 edit.sync_white_balance_controls(&r.metadata);
             }
             edit.validate()?;
             let decode = if fast {
-                raw::Decode::Half
+                camera_data::Decode::Half
             } else {
-                raw::Decode::full()
+                camera_data::Decode::full(Default::default())
             };
             let im = r.develop(decode, &AtomicBool::new(false))?;
             if let Some(path) = xmp {
                 let preset = rawmakase::xmp::parse(&path, &std::fs::read_to_string(&path)?)?;
                 let (profiles, _) = rawmakase::camera_profiles::installed(&im.metadata);
-                edit = preset.apply(&edit, &im.metadata, &profiles, Some(&im))?;
+                edit = preset.apply(
+                    &edit,
+                    &im.metadata,
+                    &profiles,
+                    Some(&rawmakase::develop::Measures(&im)),
+                )?;
                 if let Some(e) = exposure {
                     edit.exposure = e;
                 }
@@ -321,10 +435,20 @@ fn main() -> Result<()> {
             }
             if let Some(path) = save_recipe {
                 anyhow::ensure!(!path.exists(), "Recipe output already exists");
-                rawmakase::presets::save_preset(&path, &edit)?;
+                rawmakase::presets::save_preset(&path, &edit, &im.metadata)?;
+            }
+            if let Some(tap) = tap {
+                let stage = match tap {
+                    Tap::SceneInput => develop::quality::Stage::SceneInput,
+                    Tap::SceneOutput => develop::quality::Stage::SceneOutput,
+                };
+                let out =
+                    develop::quality::render_stage(&im, &edit, stage, &AtomicBool::new(false))?;
+                save_stage(&output, &input, out, overwrite)?;
+                return Ok(());
             }
             let developed = t.elapsed();
-            let out = develop::render(&im, &edit, max_edge)?;
+            let out = develop::render(&im, &edit.checked()?, max_edge)?;
             let rendered = t.elapsed() - developed;
             rawmakase::export::export_with(
                 &output,
@@ -358,14 +482,34 @@ fn main() -> Result<()> {
                 im.scale_clipped
             );
         }
+        Some(Command::Fingerprint { files }) => {
+            for path in &files {
+                let line = serde_json::to_string(&rawmakase::fingerprint::fingerprint(path))?;
+                println!("{line}");
+            }
+        }
+        Some(Command::DecodeDump { files, floats }) => {
+            for path in &files {
+                let dump = rawmakase::decode_dump::dump(path, floats.as_deref());
+                println!("{}", serde_json::to_string(&dump)?);
+            }
+        }
+        Some(Command::HalfCheck { files, reference }) => {
+            for path in &files {
+                let check = rawmakase::half_check::check(path, reference);
+                println!("{}", serde_json::to_string(&check)?);
+            }
+        }
         Some(Command::Benchmark { input, iterations }) => {
             anyhow::ensure!(
                 (1..=1000).contains(&iterations),
                 "Iterations must be 1–1000"
             );
             let t = Instant::now();
-            let im =
-                raw::Raw::open(&input)?.develop(raw::Decode::full(), &AtomicBool::new(false))?;
+            let im = rawmakase::photo::open(&input)?.develop(
+                camera_data::Decode::full(Default::default()),
+                &AtomicBool::new(false),
+            )?;
             let decode = t.elapsed();
             let small = develop::preview(&im, 1600);
             let mut r = Recipe::for_metadata(&im.metadata);
@@ -373,7 +517,7 @@ fn main() -> Result<()> {
             for i in 0..iterations {
                 r.exposure = (i % 8) as f32 / 8.;
                 let t = Instant::now();
-                std::hint::black_box(develop::render(&small, &r, 1600)?);
+                std::hint::black_box(develop::render(&small, &r.checked()?, 1600)?);
                 times.push(t.elapsed().as_secs_f64() * 1000.);
             }
             times.sort_by(f64::total_cmp);
@@ -393,4 +537,192 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `rawmakase sync-folder`: scans, prints the plan, and applies it with
+/// `apply`.
+fn sync_folder(
+    catalog: &std::path::Path,
+    folder: Option<&std::path::Path>,
+    apply: bool,
+) -> Result<()> {
+    use rawmakase::catalog::folder_sync::{SyncScope, scan};
+    let mut c = rawmakase::catalog::Catalog::open(catalog)?;
+    let scope = match folder {
+        None => SyncScope::All,
+        Some(path) => {
+            let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let found = c
+                .folders()?
+                .into_iter()
+                .find(|f| f.path == path)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("{} is not a catalog folder here", path.display())
+                })?;
+            SyncScope::Folder(found.id)
+        }
+    };
+    let inputs = c.sync_inputs(scope)?;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let online = |path: &std::path::Path| rawmakase::volume_mounted(path);
+    let plan = scan(&inputs, &online, &cancel, &|_| {})?;
+    let shown = |p: &std::path::Path| p.display().to_string();
+    for m in &plan.moves {
+        let how = if m.verified {
+            "moved"
+        } else {
+            "probably moved"
+        };
+        println!("{how}: {} → {}", shown(&m.from), shown(&m.to));
+    }
+    for choice in &plan.choices {
+        println!("needs a choice:");
+        for m in &choice.options {
+            println!("  {} → {}", shown(&m.from), shown(&m.to));
+        }
+    }
+    for a in &plan.additions {
+        if a.copy_of.is_empty() {
+            println!("new: {}", shown(&a.file));
+        } else {
+            println!("copy of a photo in the catalog: {}", shown(&a.file));
+        }
+    }
+    for m in &plan.missing {
+        println!("missing: {}", shown(&m.path));
+    }
+    for n in &plan.not_checked {
+        println!("not checked: {} ({})", shown(&n.path), n.reason);
+    }
+    for c in &plan.conflicts {
+        println!("not added: {}", c.message());
+    }
+    for d in &plan.ambiguous {
+        println!(
+            "not added, more than one catalog folder could be it: {}",
+            shown(d)
+        );
+    }
+    if !apply {
+        println!("Dry run: nothing changed. Run again with --apply to apply.");
+        return Ok(());
+    }
+    let applied = c.apply_folder_sync(
+        &plan,
+        &plan.default_accepted(),
+        &online,
+        None,
+        &rawmakase::catalog::MetadataDefaults::load(),
+    )?;
+    for s in &applied.skipped {
+        println!("skipped: {} ({})", shown(&s.path), s.reason);
+    }
+    println!(
+        "Synchronized · {} updated · {} added · {} still missing",
+        applied.moved.len(),
+        applied.added,
+        plan.missing.len()
+    );
+    if let Some(e) = applied.add_error {
+        anyhow::bail!("Adding the new files failed: {e:#}");
+    }
+    Ok(())
+}
+
+/// Writes a stage tap as a 32-bit float TIFF at `output`, with an export's
+/// protections: never over a RAW file or the `input` it was rendered from, never over
+/// an existing file unless `overwrite`, and encoded beside it before being put in
+/// place, so a failed write leaves the destination as it was.
+fn save_stage(
+    output: &std::path::Path,
+    input: &std::path::Path,
+    out: rawmakase::rendered::Rendered,
+    overwrite: bool,
+) -> Result<()> {
+    use rawmakase::storage::{RasterFormat, Replace, is_raw, write_atomic};
+    anyhow::ensure!(!is_raw(output), "A stage tap cannot overwrite a RAW file");
+    anyhow::ensure!(
+        RasterFormat::of(output) == Some(RasterFormat::Tiff),
+        "A stage tap is a TIFF: name the output .tif or .tiff"
+    );
+    if output.exists() {
+        anyhow::ensure!(
+            std::fs::canonicalize(output)? != std::fs::canonicalize(input)?,
+            "Cannot overwrite the source"
+        );
+        anyhow::ensure!(overwrite, "Output already exists");
+    }
+    let image = image::Rgb32FImage::from_raw(
+        out.width,
+        out.height,
+        out.pixels.into_iter().flatten().collect(),
+    )
+    .ok_or_else(|| anyhow::anyhow!("Stage image has the wrong size"))?;
+    let replace = if overwrite {
+        Replace::Overwrite
+    } else {
+        Replace::NoClobber
+    };
+    write_atomic(output, replace, |file| {
+        // Flushed here, so a failed last write fails the tap instead of being lost when
+        // the writer is dropped.
+        let mut writer = std::io::BufWriter::new(file);
+        image.write_to(&mut writer, image::ImageFormat::Tiff)?;
+        std::io::Write::flush(&mut writer)?;
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tap() -> rawmakase::rendered::Rendered {
+        rawmakase::rendered::Rendered {
+            width: 2,
+            height: 1,
+            pixels: vec![[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+        }
+    }
+
+    #[test]
+    fn stage_taps_never_replace_raws_their_source_or_unasked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("photo.dng");
+        std::fs::write(&raw, b"raw bytes").unwrap();
+        // Over the RAW it was rendered from, with or without --overwrite.
+        for overwrite in [false, true] {
+            assert!(save_stage(&raw, &raw, tap(), overwrite).is_err());
+            assert_eq!(std::fs::read(&raw).unwrap(), b"raw bytes");
+        }
+        // Over the source under a non-RAW name.
+        let source = dir.path().join("source.tif");
+        std::fs::write(&source, b"source").unwrap();
+        assert!(save_stage(&source, &source, tap(), true).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), b"source");
+        // An existing file only with --overwrite.
+        let output = dir.path().join("tap.tif");
+        std::fs::write(&output, b"old").unwrap();
+        assert!(save_stage(&output, &raw, tap(), false).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), b"old");
+        save_stage(&output, &raw, tap(), true).unwrap();
+        let written = image::open(&output).unwrap().to_rgb32f();
+        assert_eq!(written.dimensions(), (2, 1));
+        assert_eq!(written.get_pixel(1, 0).0, [0.4, 0.5, 0.6]);
+    }
+
+    #[test]
+    fn a_stage_tap_is_only_written_under_a_tiff_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("photo.dng");
+        for name in ["tap.jpg", "tap.png", "tap.exr", "tap"] {
+            let output = dir.path().join(name);
+            let refused = save_stage(&output, &source, tap(), false).unwrap_err();
+            assert!(refused.to_string().contains(".tif"), "{name}: {refused}");
+            assert!(!output.exists(), "{name}");
+        }
+        for name in ["tap.tif", "tap.TIFF"] {
+            save_stage(&dir.path().join(name), &source, tap(), false).unwrap();
+        }
+    }
 }

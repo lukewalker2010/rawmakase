@@ -5,7 +5,8 @@ use super::Editor;
 use super::dialogs::{CatalogDialog, FileDialog};
 use super::widgets::{form_row, modal_frame, plural, pretty_path, primary_button};
 use crate::app::theme;
-use crate::raw::Demosaic;
+use crate::catalog::CatalogLocation;
+use crate::catalog::preview_cache::{PreviewCache, PreviewKind};
 use eframe::egui::{self, Color32, Sense, Stroke, Vec2};
 use std::path::{Path, PathBuf};
 
@@ -47,7 +48,9 @@ struct Usage {
     camera_profiles: usize,
     lens_profiles: usize,
     decode_cache: (usize, u64),
+    /// The preview cache's file, and what each kind of preview holds of it.
     previews: u64,
+    preview_kinds: Option<crate::catalog::preview_cache::PreviewUsage>,
     catalog: Option<u64>,
     folders: Option<usize>,
 }
@@ -147,14 +150,19 @@ impl Editor {
         self.measure_raw_defaults();
     }
     fn measure_usage(&mut self) {
-        let catalog = self.library.as_ref().map(|l| &l.catalog);
+        let catalog = self.library.as_ref().map(|l| &l.session.catalog);
         self.preferences.usage = Usage {
             camera_profiles: files(&camera_profiles_dir(), &["dcp", "xmp"]).0,
             lens_profiles: files(&lens_profiles_dir(), &["lcp"]).0,
             decode_cache: files(&decode_cache_dir(), &["decoded"]),
-            previews: std::fs::metadata(crate::catalog::preview_cache::PreviewCache::path())
-                .map_or(0, |m| m.len()),
-            catalog: catalog.and_then(|c| std::fs::metadata(&c.path).ok().map(|m| m.len())),
+            previews: std::fs::metadata(PreviewCache::path()).map_or(0, |m| m.len()),
+            preview_kinds: PreviewCache::open(&PreviewCache::path())
+                .and_then(|cache| cache.usage())
+                .ok(),
+            catalog: catalog.and_then(|c| {
+                let CatalogLocation::File(path) = c.location();
+                std::fs::metadata(path).ok().map(|m| m.len())
+            }),
             folders: catalog.and_then(|c| c.folders().ok().map(|f| f.len())),
         };
         self.preferences.stale = self.activity.is_dialog();
@@ -188,6 +196,7 @@ impl Editor {
         }
     }
     pub(super) fn preferences_window(&mut self, ctx: &egui::Context) {
+        let palette = theme::palette(ctx);
         let closing = ctx.input(|i| i.viewport().close_requested());
         if !self.preferences.open || self.preferences.tab != Tab::Catalog || closing {
             self.save_defaults();
@@ -201,7 +210,7 @@ impl Editor {
         }
         let response = egui::Modal::new(egui::Id::new("preferences"))
             .backdrop_color(Color32::from_black_alpha(140))
-            .frame(modal_frame())
+            .frame(modal_frame(&palette))
             .show(ctx, |ui| {
                 let (rect, _) = ui.allocate_exact_size(Vec2::new(WIDTH, HEIGHT), Sense::hover());
                 let sidebar = egui::Rect::from_min_size(rect.min, Vec2::new(SIDEBAR, HEIGHT));
@@ -213,12 +222,12 @@ impl Editor {
                         ne: 0,
                         se: 0,
                     },
-                    theme::gray(27),
+                    palette.gray(27),
                 );
                 ui.painter().vline(
                     sidebar.right(),
                     sidebar.y_range(),
-                    Stroke::new(1., theme::gray(45)),
+                    Stroke::new(1., palette.gray(45)),
                 );
                 let mut side = ui.new_child(
                     egui::UiBuilder::new().max_rect(sidebar.shrink2(Vec2::new(12., 20.))),
@@ -236,7 +245,7 @@ impl Editor {
                 content.label(
                     egui::RichText::new(self.preferences.tab.title())
                         .size(18.)
-                        .color(theme::gray(236)),
+                        .color(palette.gray(236)),
                 );
                 content.add_space(10.);
                 match self.preferences.tab {
@@ -271,7 +280,7 @@ impl Editor {
                 ui.painter().hline(
                     (sidebar.right() + 1.)..=rect.right(),
                     rect.bottom() - 64.,
-                    Stroke::new(1., theme::gray(45)),
+                    Stroke::new(1., palette.gray(45)),
                 );
                 let mut bar = ui.new_child(
                     egui::UiBuilder::new()
@@ -287,7 +296,7 @@ impl Editor {
                         egui::Label::new(
                             egui::RichText::new(&self.status)
                                 .size(12.)
-                                .color(theme::gray(160)),
+                                .color(palette.gray(160)),
                         )
                         .truncate(),
                     );
@@ -299,11 +308,12 @@ impl Editor {
         }
     }
     fn preferences_tabs(&mut self, ui: &mut egui::Ui) {
+        let palette = theme::palette(ui.ctx());
         ui.spacing_mut().item_spacing.y = 2.;
         ui.label(
             egui::RichText::new("Preferences")
                 .size(11.)
-                .color(theme::gray(130)),
+                .color(palette.gray(130)),
         );
         ui.add_space(8.);
         for tab in Tab::ALL {
@@ -311,9 +321,9 @@ impl Editor {
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 32.), Sense::click());
             let selected = self.preferences.tab == tab;
             if selected {
-                ui.painter().rect_filled(rect, 5., theme::accent());
+                ui.painter().rect_filled(rect, 5., palette.accent());
             } else if response.hovered() {
-                ui.painter().rect_filled(rect, 5., theme::gray(40));
+                ui.painter().rect_filled(rect, 5., palette.gray(40));
             }
             ui.painter().text(
                 rect.left_center() + Vec2::new(12., 0.),
@@ -321,9 +331,9 @@ impl Editor {
                 tab.title(),
                 egui::FontId::proportional(13.),
                 if selected {
-                    theme::on_accent_text(250)
+                    palette.on_accent_text(250)
                 } else {
-                    theme::gray(205)
+                    palette.gray(205)
                 },
             );
             if response.clicked() && !selected {
@@ -340,7 +350,7 @@ impl Editor {
             ui.add_space(8.);
             self.update_status(ui);
         });
-        form_row(ui, "LibRaw", |ui| {
+        form_row(ui, "RAW decoder", |ui| {
             value(ui, &crate::raw::version());
         });
         form_row(ui, "Updates", |ui| self.automatic_updates_checkbox(ui));
@@ -361,7 +371,7 @@ impl Editor {
                 self.view.shortcuts = true;
                 self.preferences.open = false;
             }
-            if ui.button("Setup Assistant…").clicked() {
+            if ui.button("Import from Lightroom").clicked() {
                 self.preferences.open = false;
                 self.open_onboarding();
             }
@@ -371,16 +381,16 @@ impl Editor {
     fn catalog_page(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let usage = &self.preferences.usage;
+        let (mut paused, mut pause_changed) = (self.checksums_paused, false);
         if let Some(library) = &self.library {
-            let path = library.catalog.path.clone();
+            let location = library.session.catalog.location().clone();
             group(ui, "Current catalog");
-            form_row(ui, "Name", |ui| {
-                value(ui, &path.file_stem().unwrap_or_default().to_string_lossy());
-            });
+            form_row(ui, "Name", |ui| value(ui, &location.name()));
+            let CatalogLocation::File(path) = location;
             form_row(ui, "Location", |ui| path_value(ui, &path));
             form_row(ui, "", |ui| reveal_button(ui, &path));
             form_row(ui, "Photos", |ui| {
-                value(ui, &library.photos.len().to_string());
+                value(ui, &library.session.photos.len().to_string());
             });
             form_row(ui, "Folders", |ui| {
                 value(ui, &usage.folders.map_or("–".into(), |n| n.to_string()));
@@ -388,14 +398,164 @@ impl Editor {
             form_row(ui, "Catalog size", |ui| {
                 value(ui, &usage.catalog.map_or("–".into(), bytes));
             });
+            let (read, masters) = library.session.checksum_count();
+            form_row(ui, "Checksums", |ui| {
+                value(ui, &format!("{read} of {masters} photos"));
+            });
+            form_row(ui, "", |ui| {
+                pause_changed = ui
+                    .checkbox(&mut paused, "Pause reading checksums")
+                    .changed();
+            });
+            form_row(ui, "", |ui| {
+                hint(
+                    ui,
+                    "Read in the background, to find photos moved or renamed outside RAWmakase.",
+                );
+            });
         } else {
             group(ui, "Current catalog");
             form_row(ui, "", |ui| {
                 value(ui, "No catalog is open.");
             });
         }
+        if pause_changed {
+            self.checksums_paused = paused;
+            let _ = self.save_session();
+        }
         form_row(ui, "Previews", |ui| {
             value(ui, &bytes(usage.previews));
+        });
+        let preview_kinds = usage.preview_kinds;
+        if let Some(kinds) = preview_kinds {
+            form_row(ui, "", |ui| {
+                hint(
+                    ui,
+                    &format!(
+                        "Thumbnails {} · Standard {} · 1:1 {}",
+                        bytes(kinds.thumbnails),
+                        bytes(kinds.standard),
+                        bytes(kinds.one_to_one)
+                    ),
+                );
+            });
+        }
+        let mut size = self.preview_builds.standard_size;
+        form_row(ui, "Standard Preview Size", |ui| {
+            egui::ComboBox::from_id_salt("standard-preview-size")
+                .width(120.)
+                .selected_text(format!("{size} pixels"))
+                .show_ui(ui, |ui| {
+                    for choice in crate::app::preview_build::STANDARD_SIZES {
+                        ui.selectable_value(&mut size, choice, format!("{choice} pixels"));
+                    }
+                });
+        });
+        if size != self.preview_builds.standard_size {
+            self.preview_builds.standard_size = size;
+            let _ = self.save_session();
+        }
+        let mut discard = self.preview_builds.discard_one_to_one_after;
+        form_row(ui, "Discard 1:1 Previews", |ui| {
+            let name = |days| {
+                crate::app::preview_build::DISCARD_CHOICES
+                    .iter()
+                    .find(|(d, _)| *d == days)
+                    .map_or("", |(_, name)| name)
+            };
+            egui::ComboBox::from_id_salt("discard-one-to-one")
+                .width(160.)
+                .selected_text(name(discard))
+                .show_ui(ui, |ui| {
+                    for (days, title) in crate::app::preview_build::DISCARD_CHOICES {
+                        ui.selectable_value(&mut discard, days, title);
+                    }
+                });
+        });
+        if discard != self.preview_builds.discard_one_to_one_after {
+            self.preview_builds.discard_one_to_one_after = discard;
+            let _ = self.save_session();
+            self.expire_previews();
+        }
+        let mut clear = None;
+        form_row(ui, "", |ui| {
+            if ui
+                .add_enabled(
+                    preview_kinds.is_some_and(|k| k.standard > 0),
+                    egui::Button::new("Clear Standard Previews"),
+                )
+                .clicked()
+            {
+                clear = Some(PreviewKind::Standard);
+            }
+            if ui
+                .add_enabled(
+                    preview_kinds.is_some_and(|k| k.one_to_one > 0),
+                    egui::Button::new("Clear 1:1 Previews"),
+                )
+                .clicked()
+            {
+                clear = Some(PreviewKind::OneToOne);
+            }
+        });
+        form_row(ui, "", |ui| {
+            hint(
+                ui,
+                "Build previews from a photo's menu. Develop shows Standard previews while a photo opens; 1:1 previews let an offline photo be zoomed to 100% in the Loupe.",
+            );
+        });
+        if let Some(kind) = clear {
+            self.clear_previews(kind);
+            self.status = match kind {
+                PreviewKind::Standard => "Standard previews cleared",
+                PreviewKind::OneToOne => "1:1 previews cleared",
+            }
+            .into();
+            self.preferences.usage.preview_kinds = preview_kinds.map(|kinds| match kind {
+                PreviewKind::Standard => crate::catalog::preview_cache::PreviewUsage {
+                    standard: 0,
+                    ..kinds
+                },
+                PreviewKind::OneToOne => crate::catalog::preview_cache::PreviewUsage {
+                    one_to_one: 0,
+                    ..kinds
+                },
+            });
+        }
+        gap(ui);
+        group(ui, "Decoded images");
+        let mut cache_size = (self.decode_cache.limit() >> 30) as u32;
+        let mut field = None;
+        form_row(ui, "Cache size limit", |ui| {
+            // A typed size applies once entered, so a cache write while typing
+            // 128 never trims to 1 GiB.
+            field = Some(
+                ui.add(
+                    egui::DragValue::new(&mut cache_size)
+                        .range(super::session::DECODED_CACHE_SIZE_RANGE)
+                        .suffix(" GiB")
+                        .update_while_editing(false),
+                ),
+            );
+        });
+        if u64::from(cache_size) << 30 != self.decode_cache.limit() {
+            self.decode_cache.set_limit(u64::from(cache_size) << 30);
+        }
+        // A drag changes the size every frame; the session is written once it ends.
+        if field.is_some_and(|r| r.drag_stopped() || (r.changed() && !r.dragged())) {
+            let _ = self.save_session();
+        }
+        form_row(ui, "", |ui| {
+            hint(
+                ui,
+                "Keeps decoded RAWs for faster reopening. Shared by all catalogs; default 4 GiB.",
+            );
+        });
+        form_row(ui, "", |ui| {
+            hint(
+                ui,
+                "A smaller limit removes older entries on the next cache write.",
+            );
         });
         gap(ui);
         self.folder_locations_block(ui);
@@ -512,47 +672,6 @@ impl Editor {
     }
 
     fn performance_page(&mut self, ui: &mut egui::Ui) {
-        group(ui, "Demosaic");
-        let current = crate::raw::demosaic();
-        let mut picked = None;
-        for (choice, label, note) in [
-            (
-                Demosaic::Rawmakase,
-                "RAWmakase",
-                "Faster, with equal or better detail.",
-            ),
-            (
-                Demosaic::Libraw,
-                "LibRaw",
-                "AHD for Bayer sensors, Markesteijn for X-Trans.",
-            ),
-        ] {
-            form_row(
-                ui,
-                if choice == Demosaic::Rawmakase {
-                    "Engine"
-                } else {
-                    ""
-                },
-                |ui| {
-                    if ui.radio(current == choice, label).clicked() && current != choice {
-                        picked = Some(choice);
-                    }
-                    hint(ui, note);
-                },
-            );
-        }
-        if let Some(choice) = picked {
-            crate::raw::set_demosaic(choice);
-            let _ = self.save_session();
-            // Takes effect on the next full-size decode, so the open photo is
-            // reopened.
-            if let Some(path) = self.document.path.clone() {
-                let photo = self.document.catalog_photo;
-                self.open_raw(path, photo);
-            }
-        }
-        gap(ui);
         group(ui, "Decoded photo cache");
         let (entries, size) = self.preferences.usage.decode_cache;
         let dir = decode_cache_dir();
@@ -619,13 +738,16 @@ impl Editor {
                         ui.selectable_value(&mut chosen, Some(file.clone()), label);
                     }
                 });
-            reveal_button(ui, &super::theme::Themes::folder());
+        });
+        // On its own row: beside the picker it is wider than the page.
+        form_row(ui, "", |ui| {
+            reveal_button(ui, &super::theme::Themes::folder())
         });
         form_row(ui, "", |ui| {
             hint(
                 ui,
                 &self.themes.status().unwrap_or_else(|| {
-                    "Palette files in the themes folder are listed here. On Omarchy the desktop's theme is followed until you choose another. The photo's backdrop stays neutral grey.".into()
+                    "Palette files in the themes folder are listed here. On Omarchy the desktop's theme is followed until you choose another.".into()
                 }),
             );
         });
@@ -655,7 +777,11 @@ impl Editor {
         form_row(ui, "", |ui| {
             hint(
                 ui,
-                "Photos are shown in this profile. Choose your display's calibrated ICC profile, or keep sRGB.",
+                if cfg!(target_os = "macos") {
+                    "Keep sRGB to let macOS match colors to the current display automatically. A custom profile overrides this with manual monitor conversion."
+                } else {
+                    "Photos are shown in this profile. Choose your display's calibrated ICC profile, or keep sRGB."
+                },
             );
         });
         if choose {
@@ -674,23 +800,36 @@ pub(super) fn group(ui: &mut egui::Ui, title: &str) {
         egui::RichText::new(title)
             .size(12.)
             .strong()
-            .color(theme::gray(175)),
+            .color(theme::palette(ui.ctx()).gray(175)),
     );
 }
 pub(super) fn gap(ui: &mut egui::Ui) {
     ui.add_space(14.);
 }
 fn value(ui: &mut egui::Ui, text: &str) {
-    ui.add(egui::Label::new(egui::RichText::new(text).color(theme::gray(225))).truncate());
+    ui.add(
+        egui::Label::new(egui::RichText::new(text).color(theme::palette(ui.ctx()).gray(225)))
+            .truncate(),
+    );
 }
 fn path_value(ui: &mut egui::Ui, path: &Path) {
     ui.add(
-        egui::Label::new(egui::RichText::new(pretty_path(path)).color(theme::gray(225))).truncate(),
+        egui::Label::new(
+            egui::RichText::new(pretty_path(path)).color(theme::palette(ui.ctx()).gray(225)),
+        )
+        .truncate(),
     )
     .on_hover_text(path.display().to_string());
 }
 pub(super) fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.add(egui::Label::new(egui::RichText::new(text).size(12.).color(theme::gray(135))).wrap());
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text)
+                .size(12.)
+                .color(theme::palette(ui.ctx()).gray(135)),
+        )
+        .wrap(),
+    );
 }
 fn reveal_button(ui: &mut egui::Ui, path: &Path) {
     let exists = path.exists();
@@ -703,11 +842,12 @@ fn reveal_button(ui: &mut egui::Ui, path: &Path) {
 }
 /// The workspace bar's Preferences button: a gear in a 28 px slot.
 pub(super) fn gear_button(ui: &mut egui::Ui) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(28.), Sense::click());
     if response.hovered() {
-        ui.painter().rect_filled(rect, 4., theme::gray(38));
+        ui.painter().rect_filled(rect, 4., palette.gray(38));
     }
-    let color = theme::gray(if response.hovered() { 235 } else { 175 });
+    let color = palette.gray(if response.hovered() { 235 } else { 175 });
     super::icons::paint_at(
         ui.painter(),
         super::icons::Icon::Settings,
@@ -716,4 +856,157 @@ pub(super) fn gear_button(ui: &mut egui::Ui) -> egui::Response {
         color,
     );
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_cache_preference_is_loaded_and_saved_with_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let session = crate::app::session::Session {
+            decoded_cache_size_gib: Some(32),
+            ..Default::default()
+        };
+        let mut e = Editor::with_context(&egui::Context::default(), None, session, None);
+        e.session_file = Some(path.clone());
+        assert_eq!(e.decode_cache.limit(), 32 << 30);
+        e.decode_cache.set_limit(1 << 50);
+        e.save_session().unwrap();
+        let saved: crate::app::session::Session =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved.decoded_cache_size_gib(), 1_048_576);
+    }
+
+    #[test]
+    fn a_cache_size_applies_once_entered_and_is_saved_once_a_drag_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let ctx = egui::Context::default();
+        let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
+        e.session_file = Some(path.clone());
+        e.onboarding.visible = false;
+        e.preferences.open = true;
+        e.preferences.tab = Tab::Catalog;
+        let frame = |e: &mut Editor, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(1600., 1000.),
+                )),
+                events,
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| e.preferences_window(ui.ctx()));
+            out.textures_delta.clear();
+            out.shapes
+        };
+        let saved = || {
+            std::fs::read(&path).ok().map(|bytes| {
+                serde_json::from_slice::<crate::app::session::Session>(&bytes)
+                    .unwrap()
+                    .decoded_cache_size_gib()
+            })
+        };
+        let mut field = None;
+        for _ in 0..3 {
+            field = frame(&mut e, vec![])
+                .into_iter()
+                .find_map(|s| match s.shape {
+                    egui::Shape::Text(t) if t.galley.text().contains("GiB") => {
+                        Some(t.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                });
+        }
+        let pos = field.expect("the cache size field is shown");
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        frame(&mut e, vec![egui::Event::PointerMoved(pos), button(true)]);
+        frame(&mut e, vec![button(false)]);
+        frame(&mut e, vec![]);
+        // Part way through typing 128, neither 1 GiB nor 12 GiB evicts or is saved.
+        for text in ["1", "2"] {
+            frame(&mut e, vec![egui::Event::Text(text.into())]);
+            assert_eq!(e.decode_cache.limit(), 4 << 30);
+            assert!(saved().is_none_or(|size| size == 4));
+        }
+        frame(&mut e, vec![egui::Event::Text("8".into())]);
+        frame(
+            &mut e,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            }],
+        );
+        frame(&mut e, vec![]);
+        assert_eq!(e.decode_cache.limit(), 128 << 30);
+        assert_eq!(saved(), Some(128));
+        // A drag applies as it goes and is saved when released.
+        frame(&mut e, vec![egui::Event::PointerMoved(pos), button(true)]);
+        for x in 1..=10 {
+            let to = pos + Vec2::new(x as f32 * 5., 0.);
+            frame(&mut e, vec![egui::Event::PointerMoved(to)]);
+        }
+        let dragged = e.decode_cache.limit() >> 30;
+        assert!(dragged > 128);
+        assert_eq!(saved(), Some(128));
+        frame(
+            &mut e,
+            vec![egui::Event::PointerButton {
+                pos: pos + Vec2::new(50., 0.),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }],
+        );
+        assert_eq!(saved(), Some(dragged as u32));
+    }
+
+    /// What a page paints past the right edge it is clipped to: text or
+    /// controls cut off by the window.
+    fn cut_off(tab: Tab) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
+        e.onboarding.visible = false;
+        e.preferences.open = true;
+        e.preferences.tab = tab;
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                Vec2::new(1600., 1000.),
+            )),
+            ..Default::default()
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..3 {
+            let mut out = ctx.run_ui(input(), |ui| e.preferences_window(ui.ctx()));
+            out.textures_delta.clear();
+            shapes = out.shapes;
+        }
+        shapes
+            .into_iter()
+            .filter(|s| s.shape.visual_bounding_rect().right() > s.clip_rect.right() + 0.5)
+            .map(|s| match s.shape {
+                egui::Shape::Text(text) => text.galley.text().to_string(),
+                shape => format!("{:?}", shape.visual_bounding_rect()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn no_preferences_page_cuts_off_its_contents() {
+        for tab in Tab::ALL {
+            assert_eq!(cut_off(tab), Vec::<String>::new(), "{}", tab.title());
+        }
+    }
 }

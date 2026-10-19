@@ -2,7 +2,7 @@
 //! menu, for presets in the user library's "User Presets" folder only.
 use super::widgets::{modal_frame, primary_button};
 use super::{Editor, settings_transfer::PresetForm, theme};
-use crate::develop::settings_groups::GroupSelection;
+use crate::model::settings_groups::GroupSelection;
 use crate::presets::user::UserPresets;
 use crate::xmp::preset_write::PresetInfo;
 use eframe::egui::{self, Color32, Vec2};
@@ -40,12 +40,13 @@ impl Editor {
         self.document.full().is_some() && !self.load.is_running()
     }
     fn create_preset_in(&mut self, user: &UserPresets, form: &PresetForm, groups: &GroupSelection) {
-        if !self.settings_ready() {
+        let shown = self.document.full().map(|im| im.metadata.clone());
+        let (true, Some(shown)) = (self.settings_ready(), shown) else {
             self.status = "Preset not created: no photo is open".into();
             return;
-        }
+        };
         let info = PresetInfo::new(&form.name, &form.group);
-        match user.create(&self.document.recipe, &info, groups) {
+        match user.create(self.document.edit.recipe(), &shown, &info, groups) {
             Ok(_) => {
                 self.status = format!("Preset {} created in {}", info.name, info.group);
                 self.reload_presets(&self.context.clone());
@@ -62,10 +63,16 @@ impl Editor {
                 self.status = "Preset not updated: no photo is open".into();
                 return;
             }
-            PresetAction::Update(i) => library.presets.get(i).map(|p| {
-                user.update(p, &self.document.recipe)
-                    .map(|()| format!("Preset {} updated", p.name))
-            }),
+            PresetAction::Update(i) => {
+                library
+                    .presets
+                    .get(i)
+                    .zip(self.document.full())
+                    .map(|(p, im)| {
+                        user.update(p, self.document.edit.recipe(), &im.metadata)
+                            .map(|()| format!("Preset {} updated", p.name))
+                    })
+            }
             PresetAction::Delete(i) => library.presets.get(i).map(|p| {
                 user.delete(p).map(|()| {
                     // A new preset later saved at the same place starts unfavored.
@@ -78,10 +85,10 @@ impl Editor {
             }),
             PresetAction::StartRename(i) => {
                 if let Some(p) = library.presets.get(i) {
-                    self.preset_rename = Some(PresetRename {
+                    self.modal = Some(super::Modal::RenamePreset(PresetRename {
                         path: p.path.clone(),
                         name: p.name.clone(),
-                    });
+                    }));
                 }
                 return;
             }
@@ -97,19 +104,20 @@ impl Editor {
     }
     /// The Rename Preset window, while one is being renamed.
     pub(super) fn preset_rename_window(&mut self, ctx: &egui::Context) {
-        let Some(rename) = &mut self.preset_rename else {
+        let palette = theme::palette(ctx);
+        let Some(super::Modal::RenamePreset(rename)) = &mut self.modal else {
             return;
         };
         let mut choice = None;
         let response = egui::Modal::new(egui::Id::new("rename-preset"))
             .backdrop_color(Color32::from_black_alpha(140))
-            .frame(modal_frame().inner_margin(egui::Margin::symmetric(28, 22)))
+            .frame(modal_frame(&palette).inner_margin(egui::Margin::symmetric(28, 22)))
             .show(ctx, |ui| {
                 ui.set_width(380.);
                 ui.label(
                     egui::RichText::new("Rename Preset")
                         .size(17.)
-                        .color(theme::gray(235)),
+                        .color(palette.gray(235)),
                 );
                 ui.add_space(12.);
                 let field = ui
@@ -136,7 +144,9 @@ impl Editor {
         let Some(choice) = choice else {
             return;
         };
-        let rename = self.preset_rename.take().expect("open above");
+        let Some(super::Modal::RenamePreset(rename)) = self.modal.take() else {
+            unreachable!("open above");
+        };
         if choice == RenameChoice::Cancel {
             return;
         }
@@ -172,12 +182,12 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::develop::settings_groups::{GroupInclusion, SettingGroup};
+    use crate::model::settings_groups::{GroupInclusion, SettingGroup};
 
     #[test]
     fn new_develop_preset_writes_the_chosen_settings_to_the_user_library() {
         let ctx = egui::Context::default();
-        let mut e = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+        let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
         let d = tempfile::tempdir().unwrap();
         let user = UserPresets {
             dir: d.path().join("User Presets"),
@@ -190,7 +200,7 @@ mod tests {
         e.create_preset_in(&user, &form, &GroupSelection::all());
         assert!(e.status.contains("no photo"), "{}", e.status);
         e.document
-            .set_image(std::sync::Arc::new(crate::raw::CameraImage {
+            .set_image(std::sync::Arc::new(crate::camera_data::CameraImage {
                 recovered: Default::default(),
                 width: 4,
                 height: 4,
@@ -200,7 +210,7 @@ mod tests {
                 scale_factor: 1.,
                 scale_clipped: 0,
             }));
-        e.document.recipe.exposure = 0.7;
+        e.document.edit.setup_mut().exposure = 0.7;
         let mut groups = GroupSelection::none();
         groups.set(SettingGroup::Exposure, GroupInclusion::Included);
         e.create_preset_in(&user, &form, &groups);
@@ -216,12 +226,15 @@ mod tests {
     #[test]
     fn a_preset_s_groups_leave_the_copy_and_sync_choice_alone() {
         let ctx = egui::Context::default();
-        let mut e = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+        let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
         let before = e.copy_groups.clone();
         e.open_copy_dialog(super::super::settings_transfer::Transfer::NewPreset);
         let mut narrow = GroupSelection::none();
         narrow.set(SettingGroup::Exposure, GroupInclusion::Included);
-        e.copy_dialog.as_mut().unwrap().groups = narrow;
+        let Some(super::super::Modal::CopySettings(dialog)) = &mut e.modal else {
+            panic!("Copy Settings is open");
+        };
+        dialog.groups = narrow;
         e.close_copy_dialog(super::super::settings_transfer::CopyChoice::Confirm);
         assert_eq!(e.copy_groups, before);
     }
@@ -229,11 +242,12 @@ mod tests {
     #[test]
     fn an_older_preset_scan_never_replaces_a_newer_one() {
         let ctx = egui::Context::default();
-        let mut e = Editor::with_context(&ctx, None, crate::storage::Session::default(), None);
+        let mut e = Editor::with_context(&ctx, None, crate::app::session::Session::default(), None);
         let library = |name: &str| {
             let info = PresetInfo::new(name, "Mine");
             let text = crate::xmp::preset_write::preset(
-                &crate::develop::Recipe::default(),
+                &crate::model::recipe::Recipe::default(),
+                &Default::default(),
                 &info,
                 &GroupSelection::all(),
             );

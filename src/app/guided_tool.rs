@@ -2,9 +2,9 @@
 //! guides drawn along edges that should be vertical or horizontal, each end movable,
 //! with a loupe while an end is placed and an optional grid. Every gesture is one
 //! History step, and the correction is solved again after it (docs/transform.md).
-use super::Editor;
-use super::state::Tool;
-use crate::develop::{Geometry, UprightGuide, UprightMode, guided};
+use super::{Editor, state::Tool};
+use crate::develop::{Geometry, guided};
+use crate::model::transform::{UprightGuide, UprightMode};
 use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
 
 /// Shortest guide drawn on screen, in points: a click or a slip is not a guide.
@@ -72,7 +72,7 @@ fn released(
     let mut out = guides.to_vec();
     match drag {
         GuideDrag::New { from, to } => {
-            if from.distance(to) < MIN_DRAWN || out.len() >= guided::MAX_GUIDES {
+            if from.distance(to) < MIN_DRAWN || out.len() >= crate::model::transform::MAX_GUIDES {
                 return None;
             }
             out.push(UprightGuide {
@@ -96,10 +96,6 @@ impl Editor {
     /// Opens or closes the Guided tool (Shift+T). Opening it chooses Guided Upright,
     /// as in Lightroom.
     pub(super) fn toggle_guided_tool(&mut self) {
-        if !self.view.is(Tool::Guided) && self.document.recipe.engine < 4 {
-            self.status = "Update the process in Calibration to use Transform".into();
-            return;
-        }
         self.view.toggle(Tool::Guided);
         if self.view.is(Tool::Guided) {
             self.choose_guided();
@@ -108,13 +104,13 @@ impl Editor {
     /// Chooses Guided Upright, analysing the photo first if it hasn't been, so the
     /// guides drawn have their correction at once.
     pub(super) fn choose_guided(&mut self) {
-        let u = &mut self.document.recipe.upright;
-        if u.mode != UprightMode::Guided {
-            u.mode = UprightMode::Guided;
+        if self.document.edit.recipe().upright.mode != UprightMode::Guided {
+            self.document.edit.recipe_mut().upright.mode = UprightMode::Guided;
             self.document
-                .history
-                .label(super::history::Step::new("Upright", "Guided"));
+                .edit
+                .name_next_step(super::history::Step::new("Upright", "Guided"));
         }
+        let u = &self.document.edit.recipe().upright;
         if u.guides.is_empty() {
             self.status = guided::Issue::TooFew.message().into();
         }
@@ -126,7 +122,7 @@ impl Editor {
     /// when they correct less than they might.
     pub(super) fn set_guides(&mut self, guides: Vec<UprightGuide>, step: &str) {
         let im = self.document.full().cloned();
-        let r = &mut self.document.recipe;
+        let r = self.document.edit.recipe_mut();
         r.upright.mode = UprightMode::Guided;
         r.upright.guides = guides;
         let count = r.upright.guides.len();
@@ -151,15 +147,15 @@ impl Editor {
             n => format!("{n} guides"),
         };
         self.document
-            .history
-            .label(super::history::Step::new(step, value));
+            .edit
+            .name_next_step(super::history::Step::new(step, value));
     }
     /// Deletes the selected guide (Delete).
     pub(super) fn delete_guide(&mut self) {
         let Some(i) = self.view.guided.selected.take() else {
             return;
         };
-        let mut guides = self.document.recipe.upright.guides.clone();
+        let mut guides = self.document.edit.recipe().upright.guides.clone();
         if i < guides.len() {
             guides.remove(i);
             self.set_guides(guides, "Delete Guide");
@@ -196,7 +192,7 @@ impl Editor {
             let q = (p - rect.min) / rect.size();
             g.upright_frame(q.x, q.y)
         };
-        let guides = self.document.recipe.upright.guides.clone();
+        let guides = self.document.edit.recipe().upright.guides.clone();
         let ends: Vec<[Pos2; 2]> = guides
             .iter()
             .map(|g| [to_screen(g.a), to_screen(g.b)])
@@ -240,7 +236,7 @@ impl Editor {
                         to: origin,
                     })
                 }
-                _ if guides.len() >= guided::MAX_GUIDES => {
+                _ if guides.len() >= crate::model::transform::MAX_GUIDES => {
                     self.status =
                         "Guided Upright takes four guides; delete one to draw another".into();
                     None
@@ -382,7 +378,7 @@ fn magnifier(ui: &egui::Ui, texture: egui::TextureId, photo: Rect, at: Pos2, are
         Pos2::new(centre.x + half.x, centre.y + half.y),
     );
     painter.rect_filled(frame.expand(2.), 3., Color32::from_black_alpha(200));
-    painter.rect_filled(frame, 0., super::theme::photo_backdrop());
+    painter.rect_filled(frame, 0., super::theme::palette(ui.ctx()).photo_backdrop());
     painter.image(texture, frame, uv, Color32::WHITE);
     let c = frame.center();
     for d in [Vec2::new(8., 0.), Vec2::new(0., 8.)] {
@@ -449,7 +445,7 @@ mod tests {
                 b: [0.2, 0.8]
             }]
         );
-        let full = [one; guided::MAX_GUIDES];
+        let full = [one; crate::model::transform::MAX_GUIDES];
         let fifth = GuideDrag::New {
             from: Pos2::new(50., 10.),
             to: Pos2::new(52., 90.),

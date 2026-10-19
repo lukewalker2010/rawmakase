@@ -7,16 +7,17 @@
 //!
 //! File formats, persistence and pixel processing belong in the domain modules.
 //! See `docs/code-map.md` for panel, library and worker implementation locations.
-use crate::app::worker::{Event, Latest, LoadJob};
+use crate::app::worker::{Event, Latest};
+use crate::catalog::{CatalogLocation, PhotoId};
 #[cfg(test)]
-use crate::develop::Recipe;
+use crate::model::recipe::Recipe;
 use eframe::egui::{self, Vec2};
 use std::{
     path::PathBuf,
     sync::mpsc::{self, Receiver, Sender},
 };
 
-pub struct Editor {
+pub(crate) struct Editor {
     activity: activity::Activity,
     load: task::Task,
     presets: PresetBrowser,
@@ -26,10 +27,13 @@ pub struct Editor {
     context: egui::Context,
     session_file: Option<PathBuf>,
     library: Option<Box<crate::app::library::Library>>,
-    library_mode: bool,
+    /// The module shown: the Library grid, or Develop.
+    module: Module,
     tx: Sender<Event>,
     rx: Receiver<Event>,
-    loader: Latest<LoadJob>,
+    loader: worker::Loader,
+    /// Shared size policy for Develop, neighbour prefetch and Reference View.
+    decode_cache: crate::decode_cache::DecodeCache,
     renderer: worker::Renderer,
     /// Develop's Reference View, and the worker developing its photo.
     reference: reference::ReferenceView,
@@ -37,17 +41,20 @@ pub struct Editor {
     clipboard: Option<settings_transfer::Clipboard>,
     /// The settings of the photo open before this one, for Paste from Previous.
     previous_settings: Option<settings_transfer::Settings>,
-    /// Copy Settings while open, and the groups it last copied.
-    copy_dialog: Option<settings_transfer::CopyDialog>,
-    copy_groups: crate::develop::settings_groups::GroupSelection,
-    /// A preset made here being renamed.
-    preset_rename: Option<user_presets::PresetRename>,
+    /// The groups Copy Settings last copied.
+    copy_groups: crate::model::settings_groups::GroupSelection,
     /// The Point Curve menu's saved curves and its Save window.
     curves: curve_menu::CurveMenu,
     /// Collapsed panel sections as last saved to the session.
     collapsed: std::collections::BTreeSet<String>,
     /// The sides in Solo Mode as last saved to the session.
     solo: std::collections::BTreeSet<String>,
+    /// Pinned panel sections as last saved to the session.
+    pinned: std::collections::BTreeSet<String>,
+    /// The panels each module shows (Tab, Shift+Tab, F6–F8).
+    panels: panels::WorkspacePanels,
+    /// What the last Tab or Shift+Tab hid, and in which module.
+    tabbed: Option<(Module, panels::Tabbed)>,
     onboarding: onboarding::Onboarding,
     onboarding_done: bool,
     preferences: preferences::Preferences,
@@ -56,52 +63,85 @@ pub struct Editor {
     stats: stats::UsageStats,
     themes: theme::Themes,
     exports: export::Exports,
+    /// Build Standard-Sized Previews, in the background.
+    preview_builds: preview_build::PreviewBuilds,
+    /// Stored Standard previews read for the photo opening and its neighbour.
+    stand_ins: stand_in::StandIns,
     autosave: autosave::Autosave,
     /// Library/Develop position to restore once the session's catalog opens.
-    restore: Option<(String, Option<i64>, bool)>,
-    /// A photo from outside the Library to open once the catalog is ready,
-    /// and whether its folder has already been added.
-    pending_photo: Option<(PathBuf, bool)>,
+    restore: Option<CatalogPlace>,
+    /// A photo from outside the Library to open once the catalog is ready.
+    pending_photo: Option<PendingPhoto>,
+    /// The window's main area this frame (grid, photo or setup), which files
+    /// dragged over the window are dropped into.
+    drop_area: Option<egui::Rect>,
+    /// The catalog or photo the session last named, kept there while it
+    /// can't be opened (a catalog on an unplugged drive): saving the session
+    /// meanwhile must not make the next launch a first one.
+    last_path: Option<PathBuf>,
     /// Cancels the prefetch started for the photo on screen.
     prefetch_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Preferences > Performance's demosaic, for every full-size decode.
+    demosaic: crate::camera_data::Demosaic,
     /// That position as last written to the session.
-    saved_place: (String, Option<i64>, bool),
+    saved_place: CatalogPlace,
     /// How the Library showed its photos, as last written to the session;
     /// returned to whenever the catalog is loaded.
-    saved_layout: crate::storage::LibraryLayout,
+    saved_layout: crate::app::session::LibraryLayout,
     status: String,
     /// What a running catalog import or open is doing.
     catalog_work: Option<String>,
     /// Progress of a running profile or preset import.
-    importing: Option<std::sync::Arc<std::sync::Mutex<String>>>,
+    importing: Option<std::sync::Arc<bulk_import::ImportProgress>>,
     close_confirm: bool,
-    /// The virtual copy waiting for the user to confirm its removal.
-    remove_copy: Option<i64>,
-    /// Photos waiting for the user to confirm Read Metadata from Files.
-    read_metadata: Option<Vec<i64>>,
+    /// The close was refused only to let work finish (an export, Sync Settings, a
+    /// folder change, a command output): it is asked for again once that is done.
+    close_after_work: bool,
+    /// When quitting must be done by, set as the close guard lets a close through,
+    /// so the save it made and the exit hook share one deadline.
+    quit_by: Option<std::time::Instant>,
+    /// The next close goes ahead without waiting for a folder change or a command
+    /// output, as the user chose; the exit hook still waits for them, under its
+    /// deadline.
+    close_anyway: bool,
+    /// The dialog blocking the editor, if one is open.
+    modal: Option<Modal>,
     /// A photo Develop could not open and why, until the user dismisses it.
+    /// Its own field: a photo dropped on the window can be refused while
+    /// a `modal` is open.
     not_editable: Option<(String, String)>,
-    /// A folder change waiting for the user's answer.
-    folder_question: Option<folder_locations::FolderQuestion>,
     /// Cmd+Z across Library and Develop.
     undo_log: undo::UndoLog,
+    /// Select Subject and Select Background: the running selection, the selection
+    /// model's install and what the drawer asks.
+    selection: subject_mask::Selection,
     /// Photo > Auto Advance, saved in the session.
     auto_advance: bool,
+    /// Synchronize Folder: the scan under way or the plan waiting for review.
+    folder_sync: folder_sync::FolderSync,
+    /// The photo open in Develop when a synchronization was applied, and its
+    /// file's new path if it was found moved: the reload that follows keeps
+    /// the document, unsaved edit included, following the file (see
+    /// `catalog_ready`).
+    relink_open: Option<(crate::catalog::PhotoId, Option<PathBuf>)>,
+    /// Preferences > Catalog: the user paused reading checksums, saved in
+    /// the session.
+    checksums_paused: bool,
     /// Preferences: whether converting to black & white applies the Auto mix to a
     /// mix never set, as Lightroom's preference of that name (on by default).
     first_conversion: treatment::FirstConversion,
     /// The RAW the Loupe last started loading, so one that fails is not
     /// loaded again every frame.
-    loupe_tried: Option<i64>,
+    loupe_tried: Option<PhotoId>,
     /// Preferences > Raw Defaults, ready to apply; shared with the loader and the
     /// Library's previews.
-    raw_defaults: std::sync::Arc<crate::develop::defaults::DevelopDefaults>,
+    raw_defaults: std::sync::Arc<crate::raw_defaults::DevelopDefaults>,
     /// Shared automation queue and independently configured input adapters.
     controls: automation::Hub,
     automation: commands::Automation,
 }
 impl Editor {
-    pub fn new(
+    pub(crate) fn new(
         cc: &eframe::CreationContext<'_>,
         path: Option<PathBuf>,
         launch: crate::updates::Launch,
@@ -114,14 +154,20 @@ impl Editor {
         }
         install_fonts(&cc.egui_ctx, &text);
         icons::install(&cc.egui_ctx);
+        // The desktop's text size (Omarchy's, GNOME's Large Text) zooms the
+        // interface, now and when it changes. The whole interface zooms rather
+        // than only its fonts, so panels sized for their labels grow with them.
+        follow_text_scale(&cc.egui_ctx);
         let mut editor = Self::with_backend(
             &cc.egui_ctx,
             path,
-            crate::storage::load_session(),
+            crate::app::session::load_session(),
             Some(crate::storage::data_dir().join("session.json")),
             worker::RenderBackend::Gpu(cc.wgpu_render_state.clone()),
         );
         editor.controls = automation::Hub::start(&cc.egui_ctx);
+        // 1:1 previews left unused past the chosen time go, as in Lightroom.
+        editor.expire_previews();
         editor.updates.launched(launch, &mut editor.status);
         cc.egui_ctx
             .all_styles_mut(|style| text.apply_to_visuals(&mut style.visuals));
@@ -133,7 +179,7 @@ impl Editor {
     fn with_context(
         ctx: &egui::Context,
         path: Option<PathBuf>,
-        session: crate::storage::Session,
+        session: crate::app::session::Session,
         session_file: Option<PathBuf>,
     ) -> Self {
         Self::with_backend(ctx, path, session, session_file, worker::RenderBackend::Cpu)
@@ -141,11 +187,10 @@ impl Editor {
     fn with_backend(
         ctx: &egui::Context,
         path: Option<PathBuf>,
-        session: crate::storage::Session,
+        session: crate::app::session::Session,
         session_file: Option<PathBuf>,
         backend: worker::RenderBackend,
     ) -> Self {
-        crate::raw::set_demosaic(session.demosaic);
         theme::apply(
             ctx,
             theme::Palette::DEFAULT,
@@ -156,6 +201,7 @@ impl Editor {
         ctx.data_mut(|d| {
             d.insert_temp(widgets::collapsed_sections_id(), session.collapsed.clone());
             d.insert_temp(widgets::solo_sections_id(), session.solo.clone());
+            d.insert_temp(widgets::pinned_sections_id(), session.pinned.clone());
         });
         ctx.all_styles_mut(|style| {
             style.spacing.item_spacing = Vec2::new(8., 5.);
@@ -172,7 +218,14 @@ impl Editor {
                 .insert(egui::TextStyle::Small, egui::FontId::proportional(11.));
         });
         // Only a real session (not an isolated test) shows first-run setup.
-        let show_onboarding = !session.onboarding_done && session_file.is_some();
+        // Shown on a first launch only to bring over Lightroom's catalog,
+        // profiles and presets, when there are some; otherwise first-run
+        // setup is done, and the empty Library says how to add photos.
+        let show_onboarding =
+            !session.onboarding_done && session_file.is_some() && onboarding::lightroom_here();
+        let onboarding_done =
+            session.onboarding_done || (session_file.is_some() && !show_onboarding);
+        let place = CatalogPlace::of(&session);
         // Only a real session checks GitHub, not an isolated test.
         let updates = updates::Updates::new(&session, session_file.is_some().then_some(ctx));
         #[cfg(feature = "telemetry")]
@@ -189,10 +242,23 @@ impl Editor {
                 .map(|dir| (dir.to_path_buf(), ctx)),
         );
         let last = session.last_path.clone().filter(|p| p.exists());
+        // A first launch opens the default catalog. A catalog used before that
+        // is missing now (an unplugged drive) is not replaced by it.
+        let first_catalog = session.last_path.is_none() && session_file.is_some();
         let (tx, rx) = mpsc::channel();
-        let loader = worker::loader(tx.clone(), ctx.clone());
+        let decode_cache = crate::decode_cache::DecodeCache::default();
+        decode_cache.set_limit(u64::from(session.decoded_cache_size_gib()) << 30);
+        let loader = worker::Loader::new(tx.clone(), ctx.clone(), decode_cache.clone());
         let renderer = worker::renderer_with_backend(tx.clone(), ctx.clone(), backend);
-        let reference_loader = worker::reference_loader(tx.clone(), ctx.clone());
+        let reference_loader =
+            worker::reference_loader(tx.clone(), ctx.clone(), decode_cache.clone());
+        let standard_preview_size = session.standard_preview_size();
+        let discard_one_to_one_after = session.discard_one_to_one_after();
+        let stand_ins = stand_in::StandIns::new(
+            tx.clone(),
+            ctx.clone(),
+            crate::catalog::preview_cache::PreviewCache::path(),
+        );
         let mut app = Self {
             activity: Default::default(),
             load: Default::default(),
@@ -210,23 +276,25 @@ impl Editor {
             context: ctx.clone(),
             session_file,
             library: None,
-            library_mode: false,
+            module: Module::Develop,
             tx,
             rx,
             loader,
+            decode_cache,
             renderer,
             reference: Default::default(),
             reference_loader,
             clipboard: None,
             previous_settings: None,
-            copy_dialog: None,
-            preset_rename: None,
             curves: Default::default(),
             copy_groups: session.copy_groups.clone().unwrap_or_default(),
             collapsed: session.collapsed.clone(),
             solo: session.solo.clone(),
+            pinned: session.pinned.clone(),
+            panels: session.panels,
+            tabbed: None,
             onboarding: onboarding::Onboarding::new(show_onboarding),
-            onboarding_done: session.onboarding_done,
+            onboarding_done,
             preferences: Default::default(),
             updates,
             #[cfg(feature = "telemetry")]
@@ -238,37 +306,42 @@ impl Editor {
                 fastframe_text::TextRendering::platform_default(),
             ),
             exports: Default::default(),
-            autosave: Default::default(),
-            restore: Some((
-                session.library_source.clone(),
-                session.selected_photo,
-                session.develop,
-            )),
-            saved_place: (
-                session.library_source.clone(),
-                session.selected_photo,
-                session.develop,
+            preview_builds: preview_build::PreviewBuilds::new(
+                standard_preview_size,
+                discard_one_to_one_after,
             ),
+            stand_ins,
+            autosave: Default::default(),
+            restore: Some(place.clone()),
+            saved_place: place,
             saved_layout: session.library_layout.clone(),
             pending_photo: None,
+            drop_area: None,
+            last_path: session.last_path.clone(),
             prefetch_cancel: Default::default(),
+            demosaic: session.demosaic,
             status: "Pick a photo in the Library to begin".into(),
             catalog_work: None,
             importing: None,
             close_confirm: false,
-            remove_copy: None,
-            read_metadata: None,
+            close_after_work: false,
+            quit_by: None,
+            close_anyway: false,
+            modal: None,
             not_editable: None,
-            folder_question: None,
             undo_log: Default::default(),
+            selection: Default::default(),
             auto_advance: session.auto_advance,
+            folder_sync: Default::default(),
+            relink_open: None,
+            checksums_paused: session.pause_checksums,
             first_conversion: if session.no_auto_black_white_mix {
                 treatment::FirstConversion::KeepMix
             } else {
                 treatment::FirstConversion::AutoMix
             },
             loupe_tried: None,
-            raw_defaults: std::sync::Arc::new(crate::develop::defaults::DevelopDefaults::load(
+            raw_defaults: std::sync::Arc::new(crate::raw_defaults::DevelopDefaults::load(
                 session.raw_defaults.clone(),
             )),
             controls: automation::Hub::inactive(),
@@ -282,6 +355,8 @@ impl Editor {
             path => {
                 if let Some(last) = last {
                     app.open(last);
+                } else if first_catalog {
+                    app.open_default_catalog(ctx);
                 }
                 if let Some(path) = path {
                     app.open(path);
@@ -295,16 +370,18 @@ impl Editor {
         if let Some(path) = &self.session_file {
             crate::storage::atomic_json(
                 path,
-                &crate::storage::Session {
+                &crate::app::session::Session {
                     last_path: self.session_path(),
                     monitor: self.view.monitor.clone(),
                     collapsed: self.collapsed.clone(),
                     solo: self.solo.clone(),
+                    pinned: self.pinned.clone(),
+                    panels: self.panels,
                     onboarding_done: self.onboarding_done,
-                    library_source: self.saved_place.0.clone(),
-                    selected_photo: self.saved_place.1,
-                    develop: self.saved_place.2,
-                    demosaic: crate::raw::demosaic(),
+                    library_source: self.saved_place.source.clone(),
+                    selected_photo: self.saved_place.photo,
+                    develop: self.saved_place.module == Module::Develop,
+                    demosaic: self.demosaic,
                     no_update_checks: !self.updates.automatic,
                     skipped_version: self.updates.skipped.clone(),
                     theme: self.themes.chosen().flatten(),
@@ -312,54 +389,184 @@ impl Editor {
                     auto_advance: self.auto_advance,
                     no_auto_black_white_mix: self.first_conversion
                         == treatment::FirstConversion::KeepMix,
+                    pause_checksums: self.checksums_paused,
                     library_layout: self.saved_layout.clone(),
                     copy_groups: Some(self.copy_groups.clone()),
                     crop_guides: self.view.crop_guides.to_session(),
                     raw_defaults: self.raw_defaults.settings().clone(),
+                    standard_preview_size: Some(self.preview_builds.standard_size),
+                    decoded_cache_size_gib: Some((self.decode_cache.limit() >> 30) as u32),
+                    one_to_one_discard_days: Some(
+                        self.preview_builds.discard_one_to_one_after.unwrap_or(0),
+                    ),
                 },
             )?;
         }
         Ok(())
     }
     /// The Library folder, selected photo and module, as saved in the session.
-    fn current_place(&self) -> (String, Option<i64>, bool) {
+    fn current_place(&self) -> CatalogPlace {
         let Some(library) = &self.library else {
-            return Default::default();
+            return CatalogPlace::default();
         };
-        let develop = !self.library_mode && self.document.catalog_photo.is_some();
-        let photo = if develop {
-            self.document.catalog_photo
-        } else {
-            library.selected()
-        };
-        (library.source_key(), photo, develop)
+        let develop = self.module == Module::Develop && self.document.catalog_photo.is_some();
+        CatalogPlace {
+            source: library.source_key(),
+            photo: if develop {
+                self.document.catalog_photo
+            } else {
+                library.selected()
+            },
+            module: if develop {
+                Module::Develop
+            } else {
+                Module::Library
+            },
+        }
     }
     fn session_path(&self) -> Option<PathBuf> {
         self.library
             .as_ref()
-            .map(|l| l.catalog.path.clone())
+            .map(|l| {
+                // session.json names a file catalog by its path, as before.
+                let CatalogLocation::File(path) = l.session.catalog.location();
+                path.clone()
+            })
             .or_else(|| self.document.path.clone())
+            .or_else(|| self.last_path.clone())
     }
+}
+/// Where the Library was: its folder or collection, the photo selected (or open
+/// in Develop) and the module shown. Saved in the session and restored on launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CatalogPlace {
+    source: String,
+    photo: Option<PhotoId>,
+    module: Module,
+}
+impl Default for CatalogPlace {
+    fn default() -> Self {
+        Self {
+            source: String::new(),
+            photo: None,
+            module: Module::Library,
+        }
+    }
+}
+impl CatalogPlace {
+    fn of(session: &session::Session) -> Self {
+        Self {
+            source: session.library_source.clone(),
+            photo: session.selected_photo,
+            module: if session.develop {
+                Module::Develop
+            } else {
+                Module::Library
+            },
+        }
+    }
+}
+/// A photo from outside the Library, to open once the catalog is ready.
+struct PendingPhoto {
+    path: PathBuf,
+    /// Its folder has been added to the catalog already; if the photo is still
+    /// not there, it could not be added.
+    folder_added: bool,
+}
+/// The dialog that blocks the editor, one at a time, kept in `Editor::modal`.
+/// Dialogs owned by a subsystem (Preferences, Export, Shortcuts, onboarding,
+/// Save Curve) keep their state there instead.
+enum Modal {
+    /// Copy, Synchronize or New Preset settings, and the groups being chosen.
+    CopySettings(settings_transfer::CopyDialog),
+    /// A preset made here being renamed.
+    RenamePreset(user_presets::PresetRename),
+    /// The virtual copy waiting for the user to confirm its removal.
+    RemoveCopy(PhotoId),
+    /// The folder waiting for the user to confirm its removal from the catalog.
+    RemoveFolder(library::FolderRemoval),
+    /// Photos waiting for the user to confirm Read Metadata from Files.
+    ReadMetadata(Vec<PhotoId>),
+    /// A folder change waiting for the user's answer.
+    FolderQuestion(folder_locations::FolderQuestion),
 }
 impl eframe::App for Editor {
     /// What shows where no panel paints, e.g. behind the Library grid: the
     /// theme's darkest grey rather than eframe's near-black.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        theme::gray(12).to_normalized_gamma_f32()
+        // eframe gives no context here; the palette last applied to it.
+        self.themes.applied().gray(12).to_normalized_gamma_f32()
     }
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         // AppKit moves the traffic lights back during layout passes.
-        fastframe_macos::align_traffic_lights(frame, ui.ctx(), workspace::BAR_HEIGHT);
+        fastframe_titlebar::align_traffic_lights(frame, ui.ctx(), workspace::BAR_HEIGHT);
+        #[cfg(windows)]
+        crate::platform::taskbar_icon(frame);
         self.draw(ui);
+        display::paint(ui, frame, self.view.monitor.is_some());
+    }
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        workspace::clipboard_shortcut_keys(ctx, raw_input);
+    }
+    // fastframe-titlebar turns on eframe's glow feature, which adds the context.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.exit();
     }
 }
+/// The largest PNG stored in an ICO directory. RAWmakase's Windows icon is a
+/// set of PNG images, and the window wants the 256×256 one.
+#[cfg(windows)]
+pub(crate) fn largest_png_in_ico(ico: &[u8]) -> Option<&[u8]> {
+    if ico.len() < 6 {
+        return None;
+    }
+    let count = u16::from_le_bytes(ico[4..6].try_into().ok()?) as usize;
+    let mut best: Option<(u32, &[u8])> = None;
+    for index in 0..count {
+        let entry = ico.get(6 + index * 16..6 + (index + 1) * 16)?;
+        let width = match entry[0] {
+            0 => 256,
+            width => u32::from(width),
+        };
+        let size = u32::from_le_bytes(entry[8..12].try_into().ok()?) as usize;
+        let offset = u32::from_le_bytes(entry[12..16].try_into().ok()?) as usize;
+        let bytes = ico.get(offset..offset.checked_add(size)?)?;
+        if bytes.starts_with(b"\x89PNG") && best.is_none_or(|(chosen, _)| width > chosen) {
+            best = Some((width, bytes));
+        }
+    }
+    best.map(|(_, bytes)| bytes)
+}
+
+fn window_icon() -> egui::IconData {
+    #[cfg(windows)]
+    if let Some(icon) = windows_window_icon() {
+        return icon;
+    }
+    egui::IconData::default()
+}
+
+#[cfg(windows)]
+fn windows_window_icon() -> Option<egui::IconData> {
+    let png = largest_png_in_ico(include_bytes!("../../packaging/windows/rawmakase.ico"))?;
+    let image = image::load_from_memory(png).ok()?.into_rgba8();
+    let (width, height) = (image.width(), image.height());
+    Some(egui::IconData {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
+}
+
 pub fn run(path: Option<PathBuf>, launch: crate::updates::Launch) -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("RAWmakase")
-            // An empty icon keeps the bundle's and desktop entry's icon;
-            // otherwise eframe replaces it with egui's logo while running.
-            .with_icon(egui::IconData::default())
+            // An empty icon keeps the macOS bundle's and Linux desktop entry's
+            // icon; otherwise eframe replaces it with egui's logo while running.
+            // On Windows that empty value leaves the title bar blank, so the
+            // window gets the same artwork embedded in the executable.
+            .with_icon(window_icon())
             .with_inner_size([1440., 960.])
             .with_min_inner_size([900., 650.])
             // On macOS the workspace bar is the title bar, under the traffic
@@ -367,7 +574,7 @@ pub fn run(path: Option<PathBuf>, launch: crate::updates::Launch) -> anyhow::Res
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
             .with_title_shown(false),
-        // fastframe-macos turns on eframe's glow renderer too; previews
+        // fastframe-titlebar turns on eframe's glow renderer too; previews
         // share the UI's wgpu device.
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: wgpu_options(),
@@ -382,7 +589,11 @@ pub fn run(path: Option<PathBuf>, launch: crate::updates::Launch) -> anyhow::Res
     let mut app = SurfaceGate(eframe::create_native(
         "RAWmakase",
         options,
-        Box::new(move |cc| Ok(Box::new(Editor::new(cc, path, launch)))),
+        Box::new(move |cc| {
+            // The event loop has built the app menu by now.
+            crate::platform::quit::through_close_guard(cc);
+            Ok(Box::new(Editor::new(cc, path, launch)))
+        }),
         &event_loop,
     ));
     event_loop.run_app_on_demand(&mut app)?;
@@ -483,11 +694,30 @@ impl winit::application::ApplicationHandler<eframe::UserEvent> for SurfaceGate<'
     }
 }
 /// The UI's wgpu device also renders previews (see `develop::gpu`): prefer the
-/// discrete GPU and ask for the storage limits full-resolution regions need.
+/// discrete GPU (egui's default, unless `WGPU_POWER_PREF` says otherwise) and ask
+/// for the storage limits full-resolution regions need. On Linux the window's GPU
+/// is the one the system lists first; see [`display_adapter`].
 fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
     let mut options = eframe::egui_wgpu::WgpuConfiguration::default();
     if let eframe::egui_wgpu::WgpuSetup::CreateNew(setup) = &mut options.wgpu_setup {
-        setup.power_preference = wgpu::PowerPreference::HighPerformance;
+        #[cfg(target_os = "linux")]
+        {
+            setup.native_adapter_selector = Some(std::sync::Arc::new(|adapters, surface| {
+                let usable: Vec<_> = adapters
+                    .iter()
+                    .filter(|adapter| surface.is_none_or(|s| adapter.is_surface_supported(s)))
+                    .collect();
+                let infos: Vec<_> = usable.iter().map(|adapter| adapter.get_info()).collect();
+                let listed: Vec<_> = infos
+                    .iter()
+                    .map(|info| (info.name.as_str(), info.device_type))
+                    .collect();
+                let name = std::env::var("WGPU_ADAPTER_NAME").ok();
+                display_adapter(&listed, wgpu::PowerPreference::from_env(), name.as_deref())
+                    .map(|i| usable[i].clone())
+                    .ok_or_else(|| "No graphics adapter can draw the window".to_owned())
+            }));
+        }
         let default = setup.device_descriptor.clone();
         setup.device_descriptor = std::sync::Arc::new(move |adapter| {
             let mut descriptor = default(adapter);
@@ -507,6 +737,40 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
         _ => default(status),
     });
     options
+}
+
+/// Which of the adapters able to draw the window, in the system's order, the UI
+/// uses. Ranking a discrete GPU first breaks hybrid laptops whose discrete GPU only
+/// renders for the one driving the display: NVIDIA's driver claims it can present
+/// to the window, then fails to configure the surface (#375). The system's order
+/// already puts the display's GPU first (Mesa's device-select layer), or the
+/// discrete one under `prime-run` or `DRI_PRIME=1`. `preference` and `name` come
+/// from `WGPU_POWER_PREF` and `WGPU_ADAPTER_NAME`; software rendering comes last.
+#[cfg(target_os = "linux")]
+fn display_adapter(
+    adapters: &[(&str, wgpu::DeviceType)],
+    preference: Option<wgpu::PowerPreference>,
+    name: Option<&str>,
+) -> Option<usize> {
+    use wgpu::{DeviceType, PowerPreference};
+    if let Some(name) = name.map(str::to_lowercase) {
+        let named = adapters
+            .iter()
+            .position(|(adapter, _)| adapter.to_lowercase().contains(&name));
+        if named.is_some() {
+            return named;
+        }
+    }
+    let rank = |device_type| match (device_type, preference) {
+        (DeviceType::DiscreteGpu, Some(PowerPreference::LowPower)) => 1,
+        (DeviceType::IntegratedGpu, Some(PowerPreference::HighPerformance)) => 1,
+        (DeviceType::DiscreteGpu | DeviceType::IntegratedGpu, _) => 0,
+        (DeviceType::Other, _) => 2,
+        (DeviceType::VirtualGpu, _) => 3,
+        (DeviceType::Cpu, _) => 4,
+    };
+    // The first of the best-ranked, keeping the system's order.
+    (0..adapters.len()).min_by_key(|&i| rank(adapters[i].1))
 }
 
 /// wgpu panics on uncaptured errors by default. Reconfiguring the window's
@@ -535,42 +799,52 @@ mod commands;
 mod crop_tool;
 mod curve_menu;
 mod dialogs;
+mod display;
 mod export;
 pub(crate) mod folder_locations;
+mod folder_sync;
 mod guided_tool;
+mod history_panel;
 mod inspector;
-pub mod library;
+pub(crate) mod library;
 mod mask_tool;
 mod navigator;
 mod onboarding;
 mod overlay;
+mod panels;
 mod photo_metadata;
 mod point_color_panel;
 mod preferences;
 mod presets;
+mod preview_build;
 mod raw_defaults;
 mod readout;
 mod red_eye_tool;
 mod reference;
 mod retouch_tool;
+mod side_tabs;
+mod stand_in;
 #[cfg(feature = "telemetry")]
 mod stats;
 mod stroke_outline;
+mod subject_mask;
 mod targeted_tool;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod ui_snapshot;
 mod undo;
 mod upright;
 mod viewport;
 mod widgets;
-pub mod worker;
+pub(crate) mod worker;
 mod workflow;
 mod workspace;
 
 mod state;
+use crate::edit_session::{history, save_state};
+use library::Module;
 use state::{Document, PresetBrowser, PreviewState, ViewState};
-
-mod history;
 
 mod icons;
 
@@ -579,9 +853,10 @@ mod task;
 mod activity;
 
 mod autosave;
-mod save_state;
+pub(crate) mod session;
 
 mod editing;
+mod exit;
 mod settings_transfer;
 mod shortcuts;
 mod snapshots;
@@ -594,6 +869,21 @@ mod updates;
 mod user_presets;
 
 mod events;
+
+/// Zooms the interface to the desktop's text size, read through the portal
+/// under Wayland (1 elsewhere), and follows its changes on fastframe-text's
+/// watch thread, which lives as long as the process.
+fn follow_text_scale(ctx: &egui::Context) {
+    let scale = fastframe_text::text_scale();
+    ctx.set_zoom_factor(scale);
+    let watched = ctx.clone();
+    match fastframe_text::watch::watch_text_scale(scale, move |scale| {
+        watched.set_zoom_factor(scale);
+    }) {
+        Ok(()) | Err(fastframe_text::watch::WatchError::Unsupported) => {}
+        Err(error) => eprintln!("RAWmakase: not following the desktop's text size: {error}"),
+    }
+}
 
 /// Inter, with tabular figures so values keep their width as they change,
 /// and an installed face for every script and symbol it lacks (fastframe-fonts),

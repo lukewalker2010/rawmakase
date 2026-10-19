@@ -1,0 +1,42 @@
+name: GPU parity
+
+# The GPU port must keep matching the CPU renderer. Its tests need a hardware
+# compute adapter, so CI's test jobs skip them (#[ignore]); this lane runs them
+# weekly, and on demand, against main. It never gates a pull request: a
+# failure here is a parity regression to look at, not a merge blocker.
+on:
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-parity
+  cancel-in-progress: true
+
+jobs:
+  parity:
+    name: GPU matches CPU
+    # Apple Silicon runners expose a Metal device to the virtual machine.
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      # Its own cache, kept between weekly runs so each builds only what changed.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Show the GPU
+        run: system_profiler SPDisplaysDataType
+      # Only the GPU tests: the other ignored tests need private RAW files,
+      # catalogs or camera profiles. The workspace build, not `-p rawmakase-engine`:
+      # the engine alone builds wgpu without a platform backend (its dependency
+      # graph has no `metal`), and the tests panic at instance creation. The
+      # app crate's eframe pulls the feature in, and the filter still selects
+      # only develop::gpu.
+      - name: GPU tests
+        run: cargo test --locked --workspace develop::gpu -- --ignored --test-threads=1

@@ -1,0 +1,30 @@
+[package]
+name = "rawmakase-catalog"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "RAWmakase's catalog: photos, folders, collections and edits in SQLite, Lightroom import, and which edit a photo develops with, without the RAW decoders, the renderer or the GUI"
+license = "MIT"
+publish = false
+
+[features]
+# The model's and file formats' fixtures, for tests that share them.
+test-support = ["rawmakase-model/test-support", "rawmakase-interop/test-support"]
+
+[dependencies]
+rawmakase-interop = { path = "../rawmakase-interop", version = "0.1.0" }
+rawmakase-model = { path = "../rawmakase-model", version = "0.1.0" }
+anyhow = "1"
+flate2 = "1"
+getrandom = "0.4"
+image.workspace = true
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+sha2 = "0.11"
+unicode-normalization = "0.1"
+tempfile = "3"
+
+[dev-dependencies]
+rawmakase-interop = { path = "../rawmakase-interop", version = "0.1.0", features = ["test-support"] }
+rawmakase-model = { path = "../rawmakase-model", version = "0.1.0", features = ["test-support"] }

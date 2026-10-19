@@ -7,26 +7,29 @@ use super::selection::{Mark, Selection};
 use super::views::View;
 use super::{Action, Library, cell};
 use crate::app::theme;
-use crate::catalog::Photo;
+use crate::catalog::{Photo, PhotoId};
 use eframe::egui::{self, Color32, Vec2};
 
 /// The strip's height, the same in every view.
-pub const HEIGHT: f32 = 128.;
+pub(crate) const HEIGHT: f32 = 128.;
 /// The id of the strip's panel; its scroll area is salted the same way.
 /// Every view draws the one panel, so the strip keeps its scroll position.
 pub(super) const ID: &str = "filmstrip";
+/// A card's inset in its cell: cards are twice this apart, and the strip
+/// pads its ends by it so the first and last are as far from its edges.
+const CARD_INSET: f32 = 2.;
 
 /// The module the strip is shown in. Both mark the whole selection; the Library lets
 /// the view shown take a click, and Develop marks the photo it has open as active.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Module {
+pub(crate) enum Module {
     Library,
     Develop,
 }
 
 /// What happened in the strip this frame.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Outcome {
+pub(crate) struct Outcome {
     pub pick: Option<Pick>,
     /// A rating, flag or label was changed from the strip.
     pub metadata_changed: bool,
@@ -37,15 +40,17 @@ pub struct Outcome {
 pub(super) struct State {
     /// The photo last brought into view, and where it was then in
     /// `visible`: the strip scrolls again only when either changes.
-    revealed: Option<(i64, usize)>,
+    revealed: Option<(PhotoId, usize)>,
     /// The selection and `shown_version` the strip was last drawn with, to
     /// notice a view drawn after it changing either.
     drawn: (Selection, u64),
+    /// The strip's glide after a trackpad swipe.
+    kinetic: super::kinetic::Kinetic,
 }
 
 /// Draws the frame again before it is shown, as egui allows once a frame
 /// (else on the next frame): for a change made after the strip was drawn.
-pub fn redraw(ctx: &egui::Context, reason: &'static str) {
+pub(crate) fn redraw(ctx: &egui::Context, reason: &'static str) {
     ctx.request_discard(reason);
     if !ctx.will_discard() {
         ctx.request_repaint();
@@ -67,21 +72,21 @@ pub(super) fn in_view(
 
 /// A photo chosen in the filmstrip: clicked, or opened from its menu.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Pick {
-    Show(i64),
-    Develop(i64),
+pub(crate) enum Pick {
+    Show(PhotoId),
+    Develop(PhotoId),
     /// Develop's Set as Reference Photo.
-    Reference(i64),
+    Reference(PhotoId),
 }
 /// A catalog photo dragged from Develop's filmstrip, e.g. onto Reference View.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DraggedPhoto(pub i64);
+pub(crate) struct DraggedPhoto(pub PhotoId);
 
 impl Library {
     /// The Library's strip: brings the views up to date, draws the strip
     /// with the active photo, and carries out a click as the view shown
     /// takes it. Call before the side panels, so it spans the window.
-    pub fn library_filmstrip(&mut self, ui: &mut egui::Ui) -> Action {
+    pub(crate) fn library_filmstrip(&mut self, ui: &mut egui::Ui) -> Action {
         self.prepare(ui.ctx());
         let active = self.selection.active;
         match self.filmstrip_panel(ui, active, Module::Library).pick {
@@ -93,31 +98,31 @@ impl Library {
     /// scroll area serve every view, so the strip stays where it was when
     /// they change. `current` is the photo shown: Develop's, or the active
     /// one.
-    pub fn filmstrip_panel(
+    pub(crate) fn filmstrip_panel(
         &mut self,
         ui: &mut egui::Ui,
-        current: Option<i64>,
+        current: Option<PhotoId>,
         module: Module,
     ) -> Outcome {
         egui::Panel::bottom(ID)
             .exact_size(HEIGHT)
-            .frame(egui::Frame::new().fill(theme::gray(26)))
+            .frame(egui::Frame::new().fill(theme::palette(ui.ctx()).gray(26)))
             .show(ui, |ui| self.filmstrip(ui, current, module))
             .inner
     }
     /// Whether the selection changed after the strip was drawn, as a click
     /// in the grid below does: the strip then needs another frame to mark
     /// it and bring it into view.
-    pub fn filmstrip_behind(&self) -> bool {
+    pub(crate) fn filmstrip_behind(&self) -> bool {
         self.strip.drawn.0 != self.selection || self.strip.drawn.1 != self.shown_version
     }
     /// A filmstrip click in Develop with Cmd or Shift: the photo joins or leaves the
     /// selection, or a range does, as in the grid, while the photo open stays active.
     /// Returns whether it was taken here; a plain click opens the photo instead.
-    pub fn develop_select(
+    pub(crate) fn develop_select(
         &mut self,
-        id: i64,
-        open: Option<i64>,
+        id: PhotoId,
+        open: Option<PhotoId>,
         modifiers: egui::Modifiers,
     ) -> bool {
         if !modifiers.command && !modifiers.shift {
@@ -137,6 +142,16 @@ impl Library {
             self.selection.anchor = Some(open);
         }
         true
+    }
+    /// Lightroom's Cmd+A in Develop's filmstrip: selects every shown photo, so Sync
+    /// reaches them all, keeping the open photo active.
+    pub(crate) fn develop_select_all(&mut self, open: Option<PhotoId>) {
+        self.select_all();
+        if let Some(open) = open {
+            self.selection.selected.insert(open);
+            self.selection.active = Some(open);
+            self.selection.anchor = Some(open);
+        }
     }
     /// A filmstrip click in the Library, as the view shown takes it: Grid,
     /// Loupe and Survey select as the grid does (Cmd and Shift add), Compare
@@ -164,9 +179,10 @@ impl Library {
     pub(super) fn filmstrip(
         &mut self,
         ui: &mut egui::Ui,
-        current: Option<i64>,
+        current: Option<PhotoId>,
         module: Module,
     ) -> Outcome {
+        let palette = theme::palette(ui.ctx());
         let mut target = None;
         let mut changed = false;
         let library = module == Module::Library;
@@ -177,49 +193,73 @@ impl Library {
         let position = current.and_then(|current| {
             self.visible
                 .iter()
-                .position(|i| self.photos[*i].id == current)
+                .position(|i| self.session.photos[*i].id == current)
         });
         // The grid's edits cover its selection; elsewhere the photo shown.
         let whole_selection = library && self.view() == View::Grid;
         let mut remeasured = false;
+        // In Develop on the photo area's margin, so its ends line up with the
+        // toolbar's; in the Library with its view bar's.
+        let inset = if library {
+            10
+        } else {
+            crate::app::workspace::PHOTO_MARGIN as i8
+        };
         egui::Frame::new()
-            .inner_margin(egui::Margin::symmetric(10, 3))
+            .inner_margin(egui::Margin::symmetric(inset, 3))
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(self.source_name())
-                            .size(11.)
-                            .color(theme::gray(200)),
-                    );
-                    let selected = self.selection.selected.len();
-                    ui.label(filter_caption(&match position {
-                        Some(_) if selected > 1 => {
-                            format!("{} of {} photos selected", selected, self.visible.len())
+                // As tall as the rating and label controls on the right, so
+                // the captions placed before them centre on the same line,
+                // and the cells below keep their size whether a photo is open
+                // and the controls shown or not.
+                ui.allocate_ui_with_layout(
+                    Vec2::new(
+                        ui.available_width(),
+                        crate::app::photo_metadata::controls_height(ui),
+                    ),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(self.source_name())
+                                .size(11.)
+                                .color(palette.gray(200)),
+                        );
+                        let selected = self.selection.selected.len();
+                        ui.label(filter_caption(
+                            &palette,
+                            &match position {
+                                Some(_) if selected > 1 => {
+                                    format!(
+                                        "{} of {} photos selected",
+                                        selected,
+                                        self.visible.len()
+                                    )
+                                }
+                                Some(at) => format!("{} of {} photos", at + 1, self.visible.len()),
+                                None => format!("{} photos", self.visible.len()),
+                            },
+                        ));
+                        if let Some(p) = &photo {
+                            ui.label(filter_caption(
+                                &palette,
+                                &format!("{}{}", p.filename, cell::copy_suffix(p)),
+                            ));
+                            // Right-aligned by the width the controls took last frame, so
+                            // the row never runs past the window and widens the strip.
+                            let width_id = ui.id().with("controls-width");
+                            let width = ui.data(|d| d.get_temp::<f32>(width_id)).unwrap_or(250.);
+                            ui.add_space((ui.available_width() - width).max(8.));
+                            let start = ui.cursor().left();
+                            changed = self.metadata_controls(ui, p.id, whole_selection);
+                            let taken = ui.min_rect().right() - start;
+                            if (taken - width).abs() > 0.5 {
+                                ui.data_mut(|d| d.insert_temp(width_id, taken));
+                                ui.ctx().request_repaint();
+                                remeasured = true;
+                            }
                         }
-                        Some(at) => format!("{} of {} photos", at + 1, self.visible.len()),
-                        None => format!("{} photos", self.visible.len()),
-                    }));
-                    if let Some(p) = &photo {
-                        ui.label(filter_caption(&format!(
-                            "{}{}",
-                            p.filename,
-                            cell::copy_suffix(p)
-                        )));
-                        // Right-aligned by the width the controls took last frame, so
-                        // the row never runs past the window and widens the strip.
-                        let width_id = ui.id().with("controls-width");
-                        let width = ui.data(|d| d.get_temp::<f32>(width_id)).unwrap_or(250.);
-                        ui.add_space((ui.available_width() - width).max(8.));
-                        let start = ui.cursor().left();
-                        changed = self.metadata_controls(ui, p.id, whole_selection);
-                        let taken = ui.min_rect().right() - start;
-                        if (taken - width).abs() > 0.5 {
-                            ui.data_mut(|d| d.insert_temp(width_id, taken));
-                            ui.ctx().request_repaint();
-                            remeasured = true;
-                        }
-                    }
-                });
+                    },
+                );
             });
         // Scroll only to bring a newly shown photo into view, or one a sort
         // or filter moved: a photo already visible, e.g. one just clicked,
@@ -238,14 +278,21 @@ impl Library {
         }
         let height = ui.available_height().max(40.);
         let size = Vec2::new(height * 1.25, height);
+        if reveal.is_some() {
+            self.strip.kinetic.stop();
+        }
+        let glide = self.strip.kinetic.begin(ui);
         egui::ScrollArea::horizontal()
             .id_salt(ID)
             .auto_shrink(false)
             .show_viewport(ui, |ui, viewport| {
                 // Only the cells in view are laid out and drawn, however
                 // many photos the source has.
-                ui.set_min_size(Vec2::new(size.x * self.visible.len() as f32, height));
-                let origin = ui.max_rect().min;
+                ui.set_min_size(Vec2::new(
+                    size.x * self.visible.len() as f32 + 2. * CARD_INSET,
+                    height,
+                ));
+                let origin = ui.max_rect().min + Vec2::new(CARD_INSET, 0.);
                 let at = |n: usize| {
                     egui::Rect::from_min_size(origin + Vec2::new(size.x * n as f32, 0.), size)
                 };
@@ -255,12 +302,16 @@ impl Library {
                         ui.scroll_to_rect(rect, None);
                     }
                 }
-                let (cells, past_end) = in_view(viewport, size.x, self.visible.len());
+                let (cells, past_end) = in_view(
+                    viewport.translate(Vec2::new(-CARD_INSET, 0.)),
+                    size.x,
+                    self.visible.len(),
+                );
                 if past_end {
                     redraw(ui.ctx(), "filmstrip scrolled past a shorter list");
                 }
                 for n in cells {
-                    let photo = self.photos[self.visible[n]].clone();
+                    let photo = self.session.photos[self.visible[n]].clone();
                     let mark = if current == Some(photo.id) {
                         Mark::Active
                     } else if self.selection.selected.contains(&photo.id) {
@@ -278,6 +329,7 @@ impl Library {
                     }
                 }
             });
+        self.strip.kinetic.end(ui, glide);
         Outcome {
             pick: target,
             metadata_changed: changed,
@@ -301,8 +353,10 @@ impl Library {
         };
         let response = ui.interact(rect, ui.id().with(photo.id), sense);
         self.request_previews(photo, ui.ctx());
+        // One palette read per cell, shared by everything the cell paints.
         paint_cell(
             ui.painter(),
+            &theme::palette(ui.ctx()),
             rect,
             photo,
             self.texture(photo),
@@ -356,6 +410,7 @@ impl Library {
 /// its label, with the same cues as the grid.
 fn paint_cell(
     painter: &egui::Painter,
+    palette: &theme::Palette,
     rect: egui::Rect,
     photo: &Photo,
     texture: Option<&egui::TextureHandle>,
@@ -363,16 +418,17 @@ fn paint_cell(
     hovered: bool,
 ) {
     let active = mark == Mark::Active;
-    let cell = rect.shrink(2.);
-    let base = theme::gray(match mark {
+    let cell = rect.shrink(CARD_INSET);
+    let base = palette.gray(match mark {
         Mark::Active => 120,
         Mark::Selected => 78,
         Mark::None if hovered => 58,
         Mark::None => 40,
     });
-    let fill = crate::app::photo_metadata::label_color(&photo.label).map_or(base, |label| {
-        base.lerp_to_gamma(label, if mark == Mark::None { 0.25 } else { 0.35 })
-    });
+    let fill = crate::app::photo_metadata::label_color(palette, &photo.label)
+        .map_or(base, |label| {
+            base.lerp_to_gamma(label, if mark == Mark::None { 0.25 } else { 0.35 })
+        });
     painter.rect_filled(cell, 2., fill);
     let strip = 14.;
     if let Some(texture) = texture {
@@ -390,13 +446,19 @@ fn paint_cell(
             Color32::WHITE,
         );
         if photo.master.is_some() {
-            cell::copy_badge(painter, image, fill);
+            cell::copy_badge(painter, palette, image, fill);
         }
     }
     let y = cell.bottom() - strip / 2. - 2.;
     let mut x = cell.left() + 6.;
     if photo.flag != 0 {
-        crate::app::photo_metadata::flag_icon(painter, egui::pos2(x + 4., y), photo.flag, active);
+        crate::app::photo_metadata::flag_icon(
+            painter,
+            palette,
+            egui::pos2(x + 4., y),
+            photo.flag,
+            active,
+        );
         x += 13.;
     }
     if photo.rating > 0 {
@@ -405,7 +467,7 @@ fn paint_cell(
             egui::Align2::LEFT_CENTER,
             "★".repeat(photo.rating as usize),
             egui::FontId::proportional(9.),
-            theme::gray(if active { 30 } else { 200 }),
+            palette.gray(if active { 30 } else { 200 }),
         );
     }
 }

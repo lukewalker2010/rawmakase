@@ -95,14 +95,18 @@ pub fn blocked_by_environment() -> Option<&'static str> {
         .find(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty() && v != "0"))
 }
 
-/// How this copy was installed, as fastframe-update finds it to decide
-/// whether it may update itself: the release download it came from, or the
-/// package manager that owns it. Inspecting the install can run the package
-/// manager, so this runs off the UI thread.
+/// How this copy was installed: an AppImage, else as fastframe-update finds
+/// it to decide whether it may update itself: the release download it came
+/// from, or the package manager that owns it. Inspecting the install can run
+/// the package manager, so this runs off the UI thread.
 fn channel() -> &'static str {
     use fastframe_update::{Kind, PackageManager, Unsupported};
+    if runs_from_appimage() {
+        return "linux-appimage";
+    }
     match crate::updates::installation() {
         Ok(installation) => match installation.kind {
+            Kind::AppImage => "linux-appimage",
             Kind::MacBundle => "macos-dmg",
             Kind::WindowsInstaller => "windows-installer",
             Kind::Portable if cfg!(windows) => "windows-zip",
@@ -123,6 +127,21 @@ fn channel() -> &'static str {
             _ => "unknown",
         },
     }
+}
+
+/// The AppImage runtime sets `APPDIR` to where it mounted or extracted the
+/// image. Programs started from the app inherit it, so only an executable
+/// inside that directory is the AppImage itself.
+fn runs_from_appimage() -> bool {
+    let Some(app_dir) = std::env::var_os("APPDIR") else {
+        return false;
+    };
+    std::env::current_exe().is_ok_and(|executable| is_inside(&executable, Path::new(&app_dir)))
+}
+
+/// Whether `executable`, already resolved, is inside `directory`.
+fn is_inside(executable: &Path, directory: &Path) -> bool {
+    std::fs::canonicalize(directory).is_ok_and(|directory| executable.starts_with(directory))
 }
 
 #[cfg(target_os = "macos")]
@@ -226,10 +245,9 @@ fn distro_from(os_release: &str) -> &'static str {
         .unwrap_or("other")
 }
 
-/// winit uses Wayland whenever the session offers it, by either variable.
+/// The display server winit opens windows through.
 fn display() -> &'static str {
-    let set = |name| std::env::var_os(name).is_some_and(|v| !v.is_empty());
-    if set("WAYLAND_DISPLAY") || set("WAYLAND_SOCKET") {
+    if crate::platform::wayland() {
         "wayland"
     } else {
         "x11"
@@ -316,6 +334,17 @@ fn read_state(dir: &Path) -> State {
     crate::storage::read_json_or_default(&state_path(dir))
 }
 
+/// A held lock file, released explicitly when dropped. Closing the file isn't
+/// enough: a process started meanwhile by any thread shares the open file
+/// until it execs, and the lock would stay held until then.
+struct Held(std::fs::File);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// Changes the state file under a short lock, rereading it first, so the
 /// answer and the reported week never overwrite each other.
 fn update_state(dir: &Path, change: impl FnOnce(&mut State)) -> anyhow::Result<()> {
@@ -325,6 +354,7 @@ fn update_state(dir: &Path, change: impl FnOnce(&mut State)) -> anyhow::Result<(
         .write(true)
         .open(dir.join("usage-stats.write.lock"))?;
     lock.lock()?;
+    let _held = Held(lock);
     let mut state = read_state(dir);
     change(&mut state);
     crate::storage::atomic_json(&state_path(dir), &state)
@@ -366,6 +396,7 @@ pub fn report_week(
     if lock.try_lock().is_err() {
         return false;
     }
+    let _held = Held(lock);
     let state = read_state(dir);
     // ISO week strings sort in time order.
     if state
@@ -474,6 +505,20 @@ mod tests {
         assert_eq!(report.os, std::env::consts::OS);
         assert_eq!(report.os == "linux", report.distro != "none");
         assert_eq!(report.os == "linux", report.display != "none");
+    }
+
+    #[test]
+    fn only_an_executable_inside_the_app_dir_is_an_appimage() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("app dir");
+        std::fs::create_dir(&app_dir).unwrap();
+        let app_dir = std::fs::canonicalize(app_dir).unwrap();
+        let inside = app_dir.join("usr/lib/rawmakase/rawmakase");
+        assert!(is_inside(&inside, &app_dir));
+        // A tarball or package copy started from an AppImage inherits APPDIR.
+        let outside = app_dir.with_file_name("app dir2").join("rawmakase");
+        assert!(!is_inside(&outside, &app_dir));
+        assert!(!is_inside(&inside, &dir.path().join("gone")));
     }
 
     #[test]
@@ -638,6 +683,31 @@ mod tests {
             Outcome::Done
         });
         assert_eq!(sent, 1);
+    }
+
+    #[test]
+    fn frees_the_lock_while_other_threads_start_processes() {
+        // A process started elsewhere shares the lock's open file until it
+        // execs, so closing the file alone can leave it locked.
+        let done = Arc::new(AtomicBool::new(false));
+        let spawner = std::thread::spawn({
+            let done = done.clone();
+            move || {
+                while !done.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                }
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let skipped = (0..300)
+            .filter(|n| {
+                let week = format!("2026-W{n:03}");
+                !report_week(dir.path(), &week, "2026-W999", &report(), |_| Outcome::Done)
+            })
+            .count();
+        done.store(true, Ordering::Relaxed);
+        spawner.join().unwrap();
+        assert_eq!(skipped, 0);
     }
 
     #[test]

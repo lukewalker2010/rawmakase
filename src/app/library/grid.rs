@@ -2,13 +2,14 @@
 use super::cell::{self, photo_cell};
 use super::{Action, Library};
 use crate::app::theme;
-use crate::catalog::Photo;
+use crate::catalog::{Photo, PhotoId};
 use eframe::egui::{self, Vec2};
 
 impl Library {
     pub(super) fn grid_toolbar(&mut self, ui: &mut egui::Ui) {
+        let palette = theme::palette(ui.ctx());
         egui::Frame::new()
-            .fill(theme::gray(38))
+            .fill(palette.gray(38))
             .inner_margin(egui::Margin::symmetric(10, 4))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -19,24 +20,29 @@ impl Library {
                     ui.add_space(12.);
                     self.cell_style_menu(ui);
                     ui.add_space(12.);
-                    ui.small(if self.visible.len() == self.photos.len() {
-                        format!("{} photos", self.photos.len())
+                    ui.small(if self.visible.len() == self.session.photos.len() {
+                        format!("{} photos", self.session.photos.len())
                     } else {
-                        format!("{} of {} photos", self.visible.len(), self.photos.len())
+                        format!(
+                            "{} of {} photos",
+                            self.visible.len(),
+                            self.session.photos.len()
+                        )
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().slider_width = 110.;
                         ui.add(
                             egui::Slider::new(&mut self.thumb_size, 110. ..=360.).show_value(false),
                         );
-                        ui.label(filter_caption("Thumbnails"));
+                        ui.label(filter_caption(&palette, "Thumbnails"));
                     });
                 });
             });
     }
     /// Brings the photos up to date before the filmstrip and the view draw
-    /// them, so both show the same order and the same active photo.
-    pub(super) fn prepare(&mut self, ctx: &egui::Context) {
+    /// them, so both show the same order and the same active photo; with the
+    /// filmstrip hidden, before the view alone.
+    pub(crate) fn prepare(&mut self, ctx: &egui::Context) {
         self.poll_previews(ctx);
         // Back from Develop, sorted by edit time: edits made there move
         // their photos.
@@ -76,12 +82,16 @@ impl Library {
         }
         let mut action = Action::None;
         self.filter_bar(ui);
+        // On the photo's backdrop, as the grid above it.
         egui::Panel::bottom("library-grid-toolbar")
-            .frame(egui::Frame::new())
+            .frame(egui::Frame::new().fill(theme::palette(ui.ctx()).photo_backdrop()))
             .show_separator_line(false)
             .show(ui, |ui| self.grid_toolbar(ui));
-        let columns = ((ui.available_width() / self.thumb_size).floor() as usize).max(1);
-        let width = (ui.available_width() / columns as f32).floor().max(80.);
+        // Inset on the photo's backdrop, as the Loupe's photo is.
+        let margin = crate::app::workspace::PHOTO_MARGIN;
+        let inner = ui.available_width() - 2. * margin;
+        let columns = ((inner / self.thumb_size).floor() as usize).max(1);
+        let width = (inner / columns as f32).floor().max(80.);
         let height = self.cell_style.height(width);
         // A new cell style keeps the same row at the top of the view.
         let drawn = std::mem::replace(&mut self.drawn_style, self.cell_style);
@@ -94,87 +104,99 @@ impl Library {
             .auto_shrink(false);
         // A re-sort moved the selected photo: scroll by the rows it moved.
         if drawn != self.cell_style {
+            self.grid_kinetic.stop();
             let row = self.grid_offset / drawn.height(width);
             scroll = scroll.vertical_scroll_offset(row * height);
         }
         if let Some((id, before)) = self.keep_in_place.take()
-            && let Some(after) = self.visible.iter().position(|i| self.photos[*i].id == id)
+            && let Some(after) = self
+                .visible
+                .iter()
+                .position(|i| self.session.photos[*i].id == id)
         {
             let rows = (after / columns) as f32 - (before / columns) as f32;
+            self.grid_kinetic.stop();
             scroll = scroll.vertical_scroll_offset((self.grid_offset + rows * height).max(0.));
         }
-        egui::Frame::new().fill(theme::gray(44)).show(ui, |ui| {
-            // A key moved the active photo: bring its row into view.
-            if std::mem::take(&mut self.scroll_to_active)
-                && let Some(at) = self
-                    .selection
-                    .active
-                    .and_then(|id| self.visible.iter().position(|i| self.photos[*i].id == id))
-            {
-                let top = (at / columns) as f32 * height;
-                let view = ui.available_height();
-                if top < self.grid_offset {
-                    scroll = scroll.vertical_scroll_offset(top);
-                } else if top + height > self.grid_offset + view {
-                    scroll = scroll.vertical_scroll_offset(top + height - view);
-                }
-            }
-            let output = scroll.show_rows(
-                ui,
-                height,
-                self.visible.len().div_ceil(columns),
-                |ui, rows| {
-                    self.grid_shown = rows.start * columns..rows.end * columns;
-                    for row in rows {
-                        ui.horizontal(|ui| {
-                            for col in 0..columns {
-                                let Some(&index) = self.visible.get(row * columns + col) else {
-                                    break;
-                                };
-                                let p = self.photos[index].clone();
-                                let exists = self.is_available(&p.path);
-                                self.request_previews(&p, ui.ctx());
-                                let shown = cell::Shown {
-                                    mark: self.mark(p.id),
-                                    number: row * columns + col + 1,
-                                    available: exists,
-                                    quick: self.in_quick(p.id),
-                                    style: self.cell_style,
-                                    details: if self.cell_style == cell::Style::Expanded {
-                                        self.cell_details(&p)
-                                    } else {
-                                        String::new()
-                                    },
-                                };
-                                let (response, edit) =
-                                    photo_cell(ui, &p, self.texture(&p), shown, width);
-                                let response = if response.hovered() {
-                                    let text = self.hover_text(&p);
-                                    response.on_hover_text(text)
-                                } else {
-                                    response
-                                };
-                                if response.clicked() {
-                                    self.click(p.id, ui.input(|i| i.modifiers));
-                                } else if response.secondary_clicked() {
-                                    // A menu on a selected photo acts on the selection.
-                                    self.make_active(p.id);
-                                }
-                                // As in Lightroom, a double-click opens the Loupe.
-                                if response.double_clicked() {
-                                    self.make_active(p.id);
-                                    self.open_loupe();
-                                }
-                                if let Some(edit) = edit {
-                                    metadata_edit = Some((p.clone(), edit));
-                                }
-                            }
-                        });
+        egui::Frame::new()
+            .fill(theme::palette(ui.ctx()).photo_backdrop())
+            .inner_margin(egui::Margin::same(margin as i8))
+            .show(ui, |ui| {
+                // A key moved the active photo: bring its row into view.
+                if std::mem::take(&mut self.scroll_to_active)
+                    && let Some(at) = self.selection.active.and_then(|id| {
+                        self.visible
+                            .iter()
+                            .position(|i| self.session.photos[*i].id == id)
+                    })
+                {
+                    self.grid_kinetic.stop();
+                    let top = (at / columns) as f32 * height;
+                    let view = ui.available_height();
+                    if top < self.grid_offset {
+                        scroll = scroll.vertical_scroll_offset(top);
+                    } else if top + height > self.grid_offset + view {
+                        scroll = scroll.vertical_scroll_offset(top + height - view);
                     }
-                },
-            );
-            self.grid_offset = output.state.offset.y;
-        });
+                }
+                let glide = self.grid_kinetic.begin(ui);
+                let output = scroll.show_rows(
+                    ui,
+                    height,
+                    self.visible.len().div_ceil(columns),
+                    |ui, rows| {
+                        self.grid_shown = rows.start * columns..rows.end * columns;
+                        for row in rows {
+                            ui.horizontal(|ui| {
+                                for col in 0..columns {
+                                    let Some(&index) = self.visible.get(row * columns + col) else {
+                                        break;
+                                    };
+                                    let p = self.session.photos[index].clone();
+                                    let exists = self.is_available(&p.path);
+                                    self.request_previews(&p, ui.ctx());
+                                    let shown = cell::Shown {
+                                        mark: self.mark(p.id),
+                                        number: row * columns + col + 1,
+                                        available: exists,
+                                        quick: self.in_quick(p.id),
+                                        style: self.cell_style,
+                                        details: if self.cell_style == cell::Style::Expanded {
+                                            self.cell_details(&p)
+                                        } else {
+                                            String::new()
+                                        },
+                                    };
+                                    let (response, edit) =
+                                        photo_cell(ui, &p, self.texture(&p), shown, width);
+                                    let response = if response.hovered() {
+                                        let text = self.hover_text(&p);
+                                        response.on_hover_text(text)
+                                    } else {
+                                        response
+                                    };
+                                    if response.clicked() {
+                                        self.click(p.id, ui.input(|i| i.modifiers));
+                                    } else if response.secondary_clicked() {
+                                        // A menu on a selected photo acts on the selection.
+                                        self.make_active(p.id);
+                                    }
+                                    // As in Lightroom, a double-click opens the Loupe.
+                                    if response.double_clicked() {
+                                        self.make_active(p.id);
+                                        self.open_loupe();
+                                    }
+                                    if let Some(edit) = edit {
+                                        metadata_edit = Some((p.clone(), edit));
+                                    }
+                                }
+                            });
+                        }
+                    },
+                );
+                self.grid_kinetic.end(ui, glide);
+                self.grid_offset = output.state.offset.y;
+            });
         ui.spacing_mut().item_spacing = spacing;
         if let Some((photo, menu)) = metadata_edit
             && let Some(id) = self.photo_action(ui.ctx(), &photo, menu, true)
@@ -192,7 +214,7 @@ impl Library {
         photo: &Photo,
         action: cell::PhotoAction,
         whole_selection: bool,
-    ) -> Option<i64> {
+    ) -> Option<PhotoId> {
         use cell::PhotoAction;
         match action {
             PhotoAction::Develop => return Some(photo.id),
@@ -218,6 +240,20 @@ impl Library {
                 }
             }
             PhotoAction::Copy(copy) => self.copy_request = Some(copy),
+            // The selection when the photo is in it, in the grid and the
+            // filmstrip alike, as Export.
+            PhotoAction::BuildPreviews(kind) => {
+                self.previews_request = Some(super::PreviewsRequest::Build(
+                    self.menu_scope(photo.id),
+                    kind,
+                ));
+            }
+            PhotoAction::DiscardPreviews(kinds) => {
+                self.previews_request = Some(super::PreviewsRequest::Discard(
+                    self.menu_scope(photo.id),
+                    kinds,
+                ));
+            }
             PhotoAction::ReadMetadata => {
                 let ids = if whole_selection && self.selection.selected.contains(&photo.id) {
                     self.selected_ids()
@@ -231,9 +267,18 @@ impl Library {
     }
 }
 impl Library {
+    /// The selection when `id` is part of it, else `id` alone.
+    fn menu_scope(&self, id: PhotoId) -> Vec<PhotoId> {
+        if self.selection.selected.contains(&id) {
+            self.selected_ids()
+        } else {
+            vec![id]
+        }
+    }
     /// Lightroom's Sort: the order from a menu, its direction from the arrow.
     fn sort_menu(&mut self, ui: &mut egui::Ui) {
-        ui.label(filter_caption("Sort"));
+        let palette = theme::palette(ui.ctx());
+        ui.label(filter_caption(&palette, "Sort"));
         let mut changed = false;
         ui.menu_button(
             egui::RichText::new(self.filters.sort.name()).size(11.),
@@ -276,7 +321,7 @@ impl Library {
         ui.menu_button(
             egui::RichText::new(self.cell_style.name())
                 .size(11.)
-                .color(theme::gray(150)),
+                .color(theme::palette(ui.ctx()).gray(150)),
             |ui| {
                 for style in cell::Style::ALL {
                     if ui
@@ -293,6 +338,6 @@ impl Library {
         .on_hover_text(format!("How grid cells show their photos ({keys} cycles)"));
     }
 }
-pub(super) fn filter_caption(text: &str) -> egui::RichText {
-    egui::RichText::new(text).size(11.).color(theme::gray(150))
+pub(super) fn filter_caption(palette: &theme::Palette, text: &str) -> egui::RichText {
+    egui::RichText::new(text).size(11.).color(palette.gray(150))
 }

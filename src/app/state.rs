@@ -1,16 +1,17 @@
 //! State owned by the document, preview, viewport and preset browser.
+use crate::catalog::PhotoId;
 use crate::{
-    develop::Recipe,
-    export::ExportOptions,
-    raw::{CameraImage, Metadata},
+    camera_data::{CameraImage, Metadata},
+    export_settings::ExportOptions,
+    model::recipe::Recipe,
 };
 use eframe::egui::{self, Vec2};
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
 #[derive(Default)]
 pub(super) struct Document {
-    pub(super) save: super::save_state::SaveState,
-    pub(super) history: super::history::History,
+    /// The settings, their History and whether they still need saving.
+    pub(super) edit: crate::edit_session::EditSession,
     pub(super) path: Option<PathBuf>,
     pub(super) metadata: Option<Metadata>,
     image: Option<Arc<CameraImage>>,
@@ -20,9 +21,10 @@ pub(super) struct Document {
     /// A conversion to black & white waiting for the photo to decode, for its
     /// Auto mix.
     pub(super) pending_treatment: Option<PendingTreatment>,
-    pub(super) recipe: Recipe,
     pub(super) export: ExportOptions,
-    pub(super) catalog_photo: Option<i64>,
+    pub(super) catalog_photo: Option<PhotoId>,
+    /// Why opening the photo failed: no image is coming.
+    pub(super) failed: Option<String>,
     pub(super) lightroom_notice: String,
     /// Lightroom's history for the open catalog photo, oldest first.
     pub(super) lightroom_history: Vec<crate::catalog::HistoryStep>,
@@ -41,7 +43,7 @@ pub(super) struct Document {
     pub(super) origin: EditOrigin,
     /// The raw defaults for this photo, once its profiles are known: what Reset
     /// returns to and Before shows.
-    pub(super) defaults: Option<crate::develop::defaults::Resolved>,
+    pub(super) defaults: Option<crate::raw_defaults::Resolved>,
     pub(super) profiles: Vec<Arc<crate::camera_profiles::CameraProfile>>,
     pub(super) profile_errors: Vec<String>,
     /// The Auto estimate for this photo; dropping it with the document cancels it.
@@ -143,6 +145,41 @@ impl From<egui::TextureHandle> for Picture {
         }
     }
 }
+/// What a render was asked for, which its result is shown with.
+#[derive(Clone)]
+pub(super) struct Pending {
+    /// What the pixels are rendered with, Visualize Range included, so a picker
+    /// never takes a gray preview for the photo.
+    pub(super) recipe: Option<Recipe>,
+    pub(super) mode: TextureMode,
+    pub(super) crop: [f32; 4],
+}
+impl Default for Pending {
+    fn default() -> Self {
+        Self {
+            recipe: None,
+            mode: TextureMode::Whole,
+            crop: [0., 0., 1., 1.],
+        }
+    }
+}
+/// The document, photo, region and size a render shows.
+pub(super) struct RenderView {
+    pub(super) image: std::sync::Weak<CameraImage>,
+    pub(super) path: Option<PathBuf>,
+    pub(super) photo: Option<PhotoId>,
+    pub(super) region: Option<[u32; 4]>,
+    pub(super) max_edge: u32,
+}
+impl RenderView {
+    pub(super) fn same(&self, other: &Self) -> bool {
+        self.image.ptr_eq(&other.image)
+            && self.path == other.path
+            && self.photo == other.photo
+            && self.region == other.region
+            && self.max_edge == other.max_edge
+    }
+}
 pub(super) struct PreviewState {
     pub(super) task: super::task::Task,
     /// The last whole-photo render, always drawn so zooming never shows a gap.
@@ -151,28 +188,40 @@ pub(super) struct PreviewState {
     pub(super) region: Option<Picture>,
     /// Small copy of the last whole-photo render for the Navigator.
     pub(super) navigator: Option<Picture>,
-    pub(super) histogram: crate::develop::Histogram,
+    pub(super) histogram: crate::rendered::Histogram,
     /// The shown pixels of `texture` and `region` while the white balance selector
     /// is active, for its loupe.
     pub(super) samples: Option<image::RgbImage>,
     pub(super) region_samples: Option<image::RgbImage>,
-    /// Whether a render with loupe samples was asked for since the selector opened.
+    /// Whether renders keep their samples: while a loupe or the readout reads them.
     pub(super) samples_requested: bool,
-    /// The recipe the shown samples were rendered with, and that of the render in
-    /// flight.
-    pub(super) samples_recipe: Option<crate::develop::Recipe>,
-    pub(super) pending_recipe: Option<crate::develop::Recipe>,
+    /// The recipe the shown samples were rendered with.
+    pub(super) samples_recipe: Option<Recipe>,
+    /// What the latest render was asked for, applied to its result when it lands.
+    pub(super) pending: Pending,
+    /// Earlier renders an edit let finish (see `Task::supersede`), oldest first: those
+    /// the renderer took, as one it replaced before taking it never reports
+    /// (`replaced`).
+    pub(super) overtaken: std::collections::VecDeque<(u64, Pending)>,
+    /// The render whose result is shown, so an earlier one landing late is not.
+    pub(super) shown: u64,
+    /// What the latest render shows: an edit lets the running render finish only
+    /// when it is still the same.
+    pub(super) last_view: Option<RenderView>,
     pub(super) status: String,
     pub(super) last_fit_edge: u32,
     pub(super) last_region: Option<[u32; 4]>,
     pub(super) mode: TextureMode,
-    pub(super) pending_mode: TextureMode,
     /// The crop `texture` was rendered with, when known: until a render for a new
     /// crop lands, the old one is placed where its crop sits instead of stretched.
     pub(super) crop: Option<[f32; 4]>,
-    pub(super) pending_crop: [f32; 4],
     /// Before's render, while it shows beside the edit.
     pub(super) before: super::before_after::BeforePreview,
+    /// The photo's stored Standard preview, shown while it opens until the
+    /// first live render; nothing else reads it.
+    pub(super) stand_in: Option<Picture>,
+    /// `texture` is the camera's embedded JPEG, not a render.
+    pub(super) embedded: bool,
 }
 impl Default for PreviewState {
     fn default() -> Self {
@@ -181,20 +230,23 @@ impl Default for PreviewState {
             texture: None,
             region: None,
             navigator: None,
-            histogram: crate::develop::Histogram::EMPTY,
+            histogram: crate::rendered::Histogram::EMPTY,
             samples: None,
             region_samples: None,
             samples_requested: false,
             samples_recipe: None,
-            pending_recipe: None,
+            pending: Pending::default(),
+            overtaken: Default::default(),
+            shown: 0,
+            last_view: None,
             status: String::new(),
             last_fit_edge: 0,
             last_region: None,
             mode: TextureMode::Whole,
-            pending_mode: TextureMode::Whole,
             crop: None,
-            pending_crop: [0., 0., 1., 1.],
             before: Default::default(),
+            stand_in: None,
+            embedded: false,
         }
     }
 }
@@ -368,7 +420,16 @@ impl PresetBrowser {
 }
 
 impl Document {
-    pub fn reset(&mut self, catalog_photo: Option<i64>) {
+    /// Follows the open photo's file to `path`, where a synchronization
+    /// found it moved and verified, keeping the edit, its History and
+    /// whether it still needs saving; a save that failed on the old path is
+    /// tried again on the new one.
+    pub(super) fn relink(&mut self, path: PathBuf) {
+        self.file = crate::storage::Identity::read(&path).ok();
+        self.path = Some(path);
+        self.edit.save_state_mut().retry_now();
+    }
+    pub(crate) fn reset(&mut self, catalog_photo: Option<PhotoId>) {
         *self = Self {
             catalog_photo,
             ..Default::default()
@@ -376,12 +437,52 @@ impl Document {
     }
 }
 impl PreviewState {
-    pub fn clear_document(&mut self) {
+    /// Starts the render of a change, cancelling the running one; with `edit`, an
+    /// edit of the same view, lets it finish and show on the way.
+    pub(super) fn start(
+        &mut self,
+        edit: bool,
+        pending: Pending,
+    ) -> (u64, Arc<std::sync::atomic::AtomicBool>) {
+        if edit && self.task.is_running() {
+            let earlier = std::mem::replace(&mut self.pending, pending);
+            self.overtaken.push_back((self.task.id(), earlier));
+            self.task.supersede()
+        } else {
+            self.pending = pending;
+            self.overtaken.clear();
+            self.task.start()
+        }
+    }
+    /// What render `id` was asked for, if its result is still to show: the latest
+    /// render's, or an earlier one an edit let finish and not older than the shown.
+    pub(super) fn request(&self, id: u64) -> Option<Pending> {
+        if !self.task.counts(id) || id < self.shown {
+            None
+        } else if id == self.task.id() {
+            Some(self.pending.clone())
+        } else {
+            self.overtaken
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map(|(_, p)| p.clone())
+        }
+    }
+    /// Forgets render `id`, which the renderer replaced before taking it.
+    pub(super) fn replaced(&mut self, id: u64) {
+        self.overtaken.retain(|(i, _)| *i != id);
+    }
+    /// Notes that render `id`'s result is shown: earlier ones no longer are.
+    pub(super) fn showing(&mut self, id: u64) {
+        self.shown = id;
+        self.overtaken.retain(|(i, _)| *i >= id);
+    }
+    pub(crate) fn clear_document(&mut self) {
         self.task.invalidate();
         self.texture = None;
         self.region = None;
         self.navigator = None;
-        self.histogram = crate::develop::Histogram::EMPTY;
+        self.histogram = crate::rendered::Histogram::EMPTY;
         self.status.clear();
         self.last_fit_edge = 0;
         self.last_region = None;
@@ -393,9 +494,51 @@ impl PreviewState {
         self.region_samples = None;
         self.samples_recipe = None;
         self.samples_requested = false;
+        self.stand_in = None;
+        self.embedded = false;
+    }
+    /// Starts keeping the shown pixels, and whether a render must be asked for
+    /// them: not when those kept from an earlier hover still match what is shown,
+    /// with no render landed or on its way since.
+    pub(super) fn ask_for_samples(&mut self) -> bool {
+        if self.samples_requested {
+            return false;
+        }
+        self.samples_requested = true;
+        // A 100% region's render keeps only the region's pixels.
+        let kept = match self.mode {
+            TextureMode::Whole => self.samples.is_some(),
+            TextureMode::Region(_) => self.region_samples.is_some(),
+        };
+        !kept || self.task.is_running()
+    }
+    /// Stops keeping the pixels of later renders. Those shown stay until one lands,
+    /// so pointing back at an unchanged photo needs no render.
+    pub(super) fn stop_asking_for_samples(&mut self) {
+        self.samples_requested = false;
+    }
+    /// Keeps a landed render's pixels while they are asked for. Otherwise drops
+    /// all kept ones, the photo's and its region's, which no longer match it.
+    pub(super) fn keep_samples(&mut self, region: bool, samples: Option<image::RgbImage>) {
+        if !self.samples_requested {
+            self.samples = None;
+            self.region_samples = None;
+        } else if region {
+            self.region_samples = samples;
+        } else {
+            self.samples = samples;
+        }
+    }
+    /// Whether a live render of the photo is shown.
+    pub(crate) fn live(&self) -> bool {
+        self.texture.is_some() && !self.embedded || self.region.is_some()
+    }
+    /// The stored preview is what shows: there is one, and no live render yet.
+    pub(crate) fn standing_in(&self) -> bool {
+        self.stand_in.is_some() && !self.live()
     }
     /// Textures the renderer presented into that the viewport draws.
-    pub fn presented(&self) -> Vec<egui::TextureId> {
+    pub(crate) fn presented(&self) -> Vec<egui::TextureId> {
         [
             &self.texture,
             &self.region,
@@ -411,7 +554,7 @@ impl PreviewState {
     }
     /// Stops drawing textures the renderer presented into, once it has freed them.
     /// Not rendering again at once: a render that keeps failing would repeat.
-    pub fn forget_presented(&mut self) {
+    pub(crate) fn forget_presented(&mut self) {
         let [before, before_region] = self.before.pictures();
         for slot in [
             &mut self.texture,
@@ -427,19 +570,19 @@ impl PreviewState {
     }
 }
 impl ViewState {
-    pub fn is(&self, tool: Tool) -> bool {
+    pub(crate) fn is(&self, tool: Tool) -> bool {
         self.tool == tool
     }
     /// An eyedropper is active: White Balance, the Fringe Color Selector or Point
     /// Color's dropper.
-    pub fn picks_color(&self) -> bool {
+    pub(crate) fn picks_color(&self) -> bool {
         matches!(
             self.tool,
             Tool::WhiteBalance | Tool::Defringe | Tool::PointColor
         )
     }
     /// What the eyedropper's loupe asks for.
-    pub fn loupe_prompt(&self) -> &'static str {
+    pub(crate) fn loupe_prompt(&self) -> &'static str {
         match self.tool {
             Tool::Defringe => "Pick a purple or green fringe",
             Tool::PointColor => "Pick a color to adjust",
@@ -447,7 +590,7 @@ impl ViewState {
         }
     }
     /// Opens `tool`, or closes it when it is already open.
-    pub fn toggle(&mut self, tool: Tool) {
+    pub(crate) fn toggle(&mut self, tool: Tool) {
         self.tool = if self.tool == tool { Tool::None } else { tool };
         if matches!(self.tool, Tool::Crop) {
             self.zoom.on = false;
@@ -456,7 +599,7 @@ impl ViewState {
         self.ruler = Default::default();
         self.guided.drag = None;
     }
-    pub fn clear_document(&mut self) {
+    pub(crate) fn clear_document(&mut self) {
         self.zoom.on = false;
         self.zoom_anim = None;
         self.shown_rect = None;
@@ -481,7 +624,7 @@ impl ViewState {
     }
 }
 impl PresetBrowser {
-    pub fn clear_document(&mut self) {
+    pub(crate) fn clear_document(&mut self) {
         self.revision += 1;
         self.issues.clear();
         self.substitutes.clear();
@@ -493,10 +636,16 @@ impl PresetBrowser {
 }
 
 impl Document {
-    pub fn full(&self) -> Option<&Arc<CameraImage>> {
+    pub(crate) fn full(&self) -> Option<&Arc<CameraImage>> {
         self.image.as_ref()
     }
-    pub fn set_image(&mut self, full: Arc<CameraImage>) {
+    /// What applying XMP or Lightroom settings measures for Auto, on the full-size
+    /// image when it is decoded.
+    pub(crate) fn measures(&self) -> Option<crate::develop::Measures<'_>> {
+        self.full()
+            .map(|image| crate::develop::Measures(image.as_ref()))
+    }
+    pub(crate) fn set_image(&mut self, full: Arc<CameraImage>) {
         self.image = Some(full);
         self.color_spread = Default::default();
     }
@@ -508,7 +657,7 @@ impl Document {
     /// apart so a panel can measure them only when it needs them.
     pub(super) fn recipe_and_colors(&mut self) -> (&mut Recipe, PhotoColorSource<'_>) {
         (
-            &mut self.recipe,
+            self.edit.recipe_mut(),
             PhotoColorSource {
                 image: self.image.as_ref(),
                 spread: &self.color_spread,
@@ -529,7 +678,7 @@ impl Document {
 /// once the recipe changes otherwise (Reset, Undo, a preset), the request lapses.
 #[derive(Clone)]
 pub(super) struct PendingTreatment {
-    pub(super) treatment: crate::develop::Treatment,
+    pub(super) treatment: crate::model::recipe::Treatment,
     pub(super) recipe: Recipe,
 }
 

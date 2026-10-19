@@ -108,6 +108,18 @@ pub(super) fn locked(status: &Mutex<Status>) -> std::sync::MutexGuard<'_, Status
     status.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Changes the connection or problem Preferences shows, waking the interface
+/// only when it changed, so Preferences need not poll.
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn update(status: &Mutex<Status>, ctx: &egui::Context, change: impl FnOnce(&mut Status)) {
+    let mut status = locked(status);
+    let before = (status.connected.clone(), status.problem.clone());
+    change(&mut status);
+    if (status.connected.clone(), status.problem.clone()) != before {
+        ctx.request_repaint();
+    }
+}
+
 /// The epoch is shared outside the bounded input queue, so disconnects cannot
 /// lose their reset signal and queued input from old connections is discarded.
 #[cfg(any(test, target_os = "macos", target_os = "windows"))]
@@ -119,8 +131,8 @@ pub(super) fn reset_connection(status: &Mutex<Status>, ctx: &egui::Context) -> u
 }
 
 /// Listens for the device on a thread of its own, finding it again when it is
-/// plugged back in, until `stop` is set. Where there is no MIDI backend nothing
-/// is ever sent.
+/// plugged back in, until `stop`'s sender is dropped. Where there is no MIDI backend nothing
+/// is ever sent, and no thread starts.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(super) fn listen(
     binding: DeviceConfig,
@@ -128,15 +140,16 @@ pub(super) fn listen(
     tx: Sender<Msg>,
     ctx: egui::Context,
     status: Arc<Mutex<Status>>,
-    stop: Arc<AtomicBool>,
-) {
+    stop: std::sync::mpsc::Receiver<()>,
+) -> Option<std::thread::JoinHandle<()>> {
     use midir::{MidiInput, MidiInputConnection};
+    use std::sync::mpsc::RecvTimeoutError;
     let spawned = std::thread::Builder::new()
         .name("midi".into())
         .spawn(move || {
             let mut connected: Option<(String, String, MidiInputConnection<()>, Lease)> = None;
             let mut last = Instant::now();
-            while !stop.load(Ordering::Relaxed) {
+            loop {
                 // A gap far beyond the poll interval means the Mac slept; the
                 // device comes back as a new endpoint behind the same name.
                 if last.elapsed() > Duration::from_secs(10) {
@@ -164,10 +177,11 @@ pub(super) fn listen(
                                 })
                                 .collect();
                             let selected = select_port(&binding, &available);
-                            locked(&status).problem = selected.as_ref().err().cloned();
+                            let problem = selected.as_ref().err().cloned();
+                            update(&status, &ctx, |s| s.problem = problem);
                             if let Ok(Some(id)) = selected
                                 && let Some(p) = ports.iter().find(|p| p.id() == id)
-                                && let Some(lease) = Lease::claim(id, claims.clone()).or_else(|| { locked(&status).problem=Some("This input is already assigned to another enabled device".into());None })
+                                && let Some(lease) = Lease::claim(id, claims.clone()).or_else(|| { update(&status, &ctx, |s| s.problem = Some("This input is already assigned to another enabled device".into())); None })
                             {
                                 let epoch = reset_connection(&status, &ctx);
                                 let (name, id) = (named(p), p.id());
@@ -205,20 +219,18 @@ pub(super) fn listen(
                         }
                     }
                 }
-                locked(&status).connected = connected.as_ref().map(|(name, ..)| name.clone());
-                // Looked at again in two seconds; a stop is noticed sooner.
-                for _ in 0..8 {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
+                let name = connected.as_ref().map(|(name, ..)| name.clone());
+                update(&status, &ctx, |s| s.connected = name);
+                // Looked at again in two seconds, as no portable event announces a
+                // device plugged in; a stop ends the wait at once.
+                match stop.recv_timeout(Duration::from_secs(2)) {
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
-            locked(&status).connected = None;
+            update(&status, &ctx, |s| s.connected = None);
         });
-    if let Err(e) = spawned {
-        eprintln!("MIDI listener: {e}");
-    }
+    spawned.map_err(|e| eprintln!("MIDI listener: {e}")).ok()
 }
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub(super) fn listen(
@@ -227,6 +239,7 @@ pub(super) fn listen(
     _: Sender<Msg>,
     _: egui::Context,
     _: Arc<Mutex<Status>>,
-    _: Arc<AtomicBool>,
-) {
+    _: std::sync::mpsc::Receiver<()>,
+) -> Option<std::thread::JoinHandle<()>> {
+    None
 }
